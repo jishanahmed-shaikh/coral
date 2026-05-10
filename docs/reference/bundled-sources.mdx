@@ -18,6 +18,7 @@ If the source you need is not available, you can extend Coral by [writing a cust
 | Source | Backend | Description |
 | --- | --- | --- |
 | [clickup](#clickup) | `http` | Query tasks, spaces, folders, lists, goals, time entries, comments, views, tags, custom fields, teams, and users from ClickUp. |
+| [cloudflare](#cloudflare) | `http` | Query zones, DNS records, accounts, members, Workers scripts, R2 buckets, and audit logs from Cloudflare. |
 | [cloudwatch_logs](#cloudwatch_logs) | `http` | Query Amazon CloudWatch Logs groups, streams, and events. |
 | [cloudwatch_metrics](#cloudwatch_metrics) | `http` | Query Amazon CloudWatch metrics and monitoring metadata. |
 | [confluence](#confluence) | `http` | Query spaces, pages, blog posts, comments, attachments, labels, and related metadata from Confluence Cloud. |
@@ -68,6 +69,22 @@ If you're logged in to ClickUp, you can go to
 [App Settings](https://app.clickup.com/settings/apps) to find your token.
 For more details, see the
 [ClickUp authentication guide](https://developer.clickup.com/docs/authentication).
+
+### `cloudflare`
+
+`CLOUDFLARE_API_TOKEN` (required)
+
+Create an API token at dash.cloudflare.com/profile/api-tokens.
+Use the "Read all resources" template or create a custom token with
+Zone:Read, DNS:Read, Account:Read, and Workers Scripts:Read permissions.
+See [Cloudflare API token docs](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/).
+
+`CLOUDFLARE_ACCOUNT_ID` (required)
+
+Your Cloudflare account ID. Find it on the right-hand sidebar of any
+zone overview page, or run:
+  curl -s https://api.cloudflare.com/client/v4/accounts \
+    -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq '.result[0].id'
 
 ### `cloudwatch_logs`
 
