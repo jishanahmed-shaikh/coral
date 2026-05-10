@@ -11,7 +11,9 @@ inputs:
     hint: |
       Create an API token at dash.cloudflare.com/profile/api-tokens.
       Use the "Read all resources" template or create a custom token with
-      Zone:Read, DNS:Read, Account:Read, and Workers Scripts:Read permissions.
+      Zone:Read, DNS:Read, Account:Read, Account Settings:Read,
+      Workers Scripts:Read, Workers R2 Storage:Read, and Audit Logs:Read
+      permissions.
       See [Cloudflare API token docs](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/).
   CLOUDFLARE_ACCOUNT_ID:
     kind: variable
@@ -637,8 +639,8 @@ tables:
     guide: |
       Lists all R2 buckets in the account. Use `name` to identify buckets
       for downstream operations. `location` shows the storage region and
-      `storage_class` shows Standard or InfrequentAccess. Returns empty
-      if R2 is not enabled on the account.
+      `storage_class` shows Standard or InfrequentAccess. Requires R2 to
+      be enabled on the account; returns a 403 error otherwise.
     request:
       method: GET
       path: /accounts/{{input.CLOUDFLARE_ACCOUNT_ID}}/r2/buckets

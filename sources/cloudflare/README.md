@@ -59,8 +59,8 @@ curl -s https://api.cloudflare.com/client/v4/accounts \
 | `accounts` | Accounts accessible to the token | — |
 | `members` | Account members and their roles | — |
 | `workers_scripts` | Workers scripts deployed to the account | — |
-| `r2_buckets` | R2 object storage buckets | — |
-| `audit_logs` | Account audit log entries | — |
+| `r2_buckets` | R2 object storage buckets (requires R2 to be enabled) | — |
+| `audit_logs` | Account audit log entries | `since`, `before` |
 
 ## Quick start
 
@@ -102,11 +102,13 @@ coral sql "
   ORDER BY location, name
 "
 
-# Recent audit log entries
+# Recent audit log entries — since and before are required
 coral sql "
-  SELECT when, actor__email, actor__type, action__type, resource__type, resource__id
+  SELECT action__time, actor__email, actor__type, action__type, action__result, resource__type
   FROM cloudflare.audit_logs
-  ORDER BY when DESC
+  WHERE since = '2026-05-01T00:00:00Z'
+    AND before = '2026-05-11T00:00:00Z'
+  ORDER BY action__time DESC
   LIMIT 25
 "
 
