@@ -729,7 +729,6 @@ tables:
       Each row is one session — a group of traces that belong to the same
       multi-turn conversation or workflow. Use `id` to filter traces by
       session via `WHERE session_id = '<id>'` on the `traces` table.
-      `user_id` identifies the end user across sessions.
     filters:
       - name: environment
         required: false
