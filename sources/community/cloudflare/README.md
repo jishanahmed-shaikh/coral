@@ -43,12 +43,17 @@ New tokens use the `cfut_` prefix format. Classic `Bearer` tokens also work.
 ### Finding your Account ID
 
 Your account ID appears on the right-hand sidebar of any zone overview page in
-the Cloudflare dashboard. You can also retrieve it via the API:
+the Cloudflare dashboard. You can also list all accounts your token can access
+via the API and pick the correct one:
 
 ```bash
 curl -s https://api.cloudflare.com/client/v4/accounts \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq '.result[0].id'
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq '.result[] | {id, name}'
 ```
+
+If your token only has access to one account, the single result is your account
+ID. If it has access to multiple accounts, choose the one you want to query and
+set `CLOUDFLARE_ACCOUNT_ID` to that ID.
 
 ## Tables
 
