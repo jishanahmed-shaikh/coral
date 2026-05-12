@@ -17,11 +17,13 @@ inputs:
       See [Cloudflare API token docs](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/).
   CLOUDFLARE_ACCOUNT_ID:
     kind: variable
+    default: ""
     hint: |
-      Your Cloudflare account ID. Find it on the right-hand sidebar of any
-      zone overview page, or run:
-        curl -s https://api.cloudflare.com/client/v4/accounts \
-          -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq '.result[0].id'
+      Your Cloudflare account ID. Required for account-scoped tables
+      (members, workers_scripts, r2_buckets, audit_logs). Leave blank to
+      install the source first, then discover your account ID by querying
+      cloudflare.accounts, and update with:
+        coral source add --file sources/community/cloudflare/manifest.yaml
 base_url: https://api.cloudflare.com/client/v4
 auth:
   type: HeaderAuth
@@ -226,7 +228,7 @@ tables:
         required: true
     request:
       method: GET
-      path: /zones/{{filter.zone_id}}/dns/records
+      path: /zones/{{filter.zone_id}}/dns_records
     response:
       rows_path:
         - result
@@ -736,15 +738,15 @@ tables:
       allow_404_empty: false
       row_strategy: direct
     pagination:
-      mode: page
-      page_param: page
-      page_start: 1
-      page_step: 1
-      offset_start: 0
+      mode: cursor_query
+      cursor_param: cursor
+      response_cursor_path:
+        - result_info
+        - cursor
       page_size:
         default: 25
-        max: 25
-        query_param: per_page
+        max: 1000
+        query_param: limit
       link_header_require_results: false
     columns:
       - name: id

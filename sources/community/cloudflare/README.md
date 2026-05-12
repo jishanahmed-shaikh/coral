@@ -10,17 +10,18 @@ audit logs from Cloudflare.
 
 ## Authentication
 
-Requires a `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`.
+Requires a `CLOUDFLARE_API_TOKEN`. `CLOUDFLARE_ACCOUNT_ID` is optional at
+install time but required for account-scoped tables.
 
 ```bash
-coral source add --interactive cloudflare
+# Install with just the API token — zones and accounts tables work immediately
+CLOUDFLARE_API_TOKEN=<token> coral source add --file sources/community/cloudflare/manifest.yaml
 ```
 
-Or pass credentials directly:
+Or interactively:
 
 ```bash
-CLOUDFLARE_API_TOKEN=<token> CLOUDFLARE_ACCOUNT_ID=<account_id> \
-  coral source add cloudflare
+CLOUDFLARE_API_TOKEN=<token> coral source add --file sources/community/cloudflare/manifest.yaml --interactive
 ```
 
 ### Creating an API token
@@ -42,9 +43,22 @@ New tokens use the `cfut_` prefix format. Classic `Bearer` tokens also work.
 
 ### Finding your Account ID
 
-Your account ID appears on the right-hand sidebar of any zone overview page in
-the Cloudflare dashboard. You can also list all accounts your token can access
-via the API and pick the correct one:
+`CLOUDFLARE_ACCOUNT_ID` is needed for account-scoped tables (`members`,
+`workers_scripts`, `r2_buckets`, `audit_logs`). You can discover it after
+installing the source by querying `cloudflare.accounts`:
+
+```bash
+coral sql "SELECT id, name FROM cloudflare.accounts"
+```
+
+Then re-add the source with the account ID:
+
+```bash
+CLOUDFLARE_API_TOKEN=<token> CLOUDFLARE_ACCOUNT_ID=<account_id> \
+  coral source add --file sources/community/cloudflare/manifest.yaml
+```
+
+Alternatively, retrieve it before installing via the Cloudflare API:
 
 ```bash
 curl -s https://api.cloudflare.com/client/v4/accounts \
