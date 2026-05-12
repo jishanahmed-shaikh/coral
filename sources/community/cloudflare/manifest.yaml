@@ -648,7 +648,7 @@ tables:
       rows_path:
         - result
         - buckets
-      allow_404_empty: true
+      allow_404_empty: false
       row_strategy: direct
     pagination:
       mode: cursor_query
