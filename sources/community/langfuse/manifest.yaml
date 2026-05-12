@@ -10,9 +10,12 @@ inputs:
     kind: variable
     default: https://cloud.langfuse.com
     hint: |
-      Base URL of your Langfuse instance. Use `https://cloud.langfuse.com`
-      for Langfuse Cloud (US region), `https://eu.cloud.langfuse.com` for
-      EU Cloud, or your self-hosted URL (e.g. `http://localhost:3000`).
+      Base URL of your Langfuse instance.
+      Cloud regions:
+        EU:    https://cloud.langfuse.com  (default)
+        US:    https://us.cloud.langfuse.com
+        Japan: https://jp.cloud.langfuse.com
+      For self-hosted instances use your own URL (e.g. http://localhost:3000).
   LANGFUSE_PUBLIC_KEY:
     kind: secret
     hint: |
@@ -232,36 +235,6 @@ tables:
           kind: path
           path:
             - totalCost
-      - name: input_tokens
-        type: Int64
-        nullable: true
-        virtual: false
-        description: Total input tokens across all observations
-        expr:
-          kind: path
-          path:
-            - usage
-            - input
-      - name: output_tokens
-        type: Int64
-        nullable: true
-        virtual: false
-        description: Total output tokens across all observations
-        expr:
-          kind: path
-          path:
-            - usage
-            - output
-      - name: total_tokens
-        type: Int64
-        nullable: true
-        virtual: false
-        description: Total tokens (input + output) across all observations
-        expr:
-          kind: path
-          path:
-            - usage
-            - total
       - name: project_id
         type: Utf8
         nullable: true
@@ -483,29 +456,29 @@ tables:
         type: Float64
         nullable: true
         virtual: false
-        description: Input cost in USD
+        description: Calculated input cost in USD
         expr:
           kind: path
           path:
-            - inputCost
+            - calculatedInputCost
       - name: output_cost
         type: Float64
         nullable: true
         virtual: false
-        description: Output cost in USD
+        description: Calculated output cost in USD
         expr:
           kind: path
           path:
-            - outputCost
+            - calculatedOutputCost
       - name: total_cost
         type: Float64
         nullable: true
         virtual: false
-        description: Total cost in USD
+        description: Calculated total cost in USD
         expr:
           kind: path
           path:
-            - totalCost
+            - calculatedTotalCost
       - name: level
         type: Utf8
         nullable: true
@@ -581,7 +554,7 @@ tables:
         required: false
     request:
       method: GET
-      path: /api/public/scores
+      path: /api/public/v2/scores
       query:
         - name: traceId
           from: filter

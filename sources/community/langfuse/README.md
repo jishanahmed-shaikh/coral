@@ -15,16 +15,19 @@ key is the password. Both are available in your project settings under
 **Settings → API Keys**.
 
 ```bash
-coral source add --interactive langfuse
+LANGFUSE_BASE_URL=https://cloud.langfuse.com \
+LANGFUSE_PUBLIC_KEY=pk-lf-... \
+LANGFUSE_SECRET_KEY=sk-lf-... \
+  coral source add --file sources/community/langfuse/manifest.yaml
 ```
 
-Or pass credentials directly:
+Or interactively:
 
 ```bash
 LANGFUSE_BASE_URL=https://cloud.langfuse.com \
 LANGFUSE_PUBLIC_KEY=pk-lf-... \
 LANGFUSE_SECRET_KEY=sk-lf-... \
-  coral source add langfuse
+  coral source add --file sources/community/langfuse/manifest.yaml --interactive
 ```
 
 ### Self-hosted
@@ -35,15 +38,16 @@ Set `LANGFUSE_BASE_URL` to your instance URL:
 LANGFUSE_BASE_URL=http://localhost:3000 \
 LANGFUSE_PUBLIC_KEY=pk-lf-... \
 LANGFUSE_SECRET_KEY=sk-lf-... \
-  coral source add langfuse
+  coral source add --file sources/community/langfuse/manifest.yaml
 ```
 
 ### Cloud regions
 
 | Region | Base URL |
 |---|---|
-| US Cloud (default) | `https://cloud.langfuse.com` |
-| EU Cloud | `https://eu.cloud.langfuse.com` |
+| EU Cloud (default) | `https://cloud.langfuse.com` |
+| US Cloud | `https://us.cloud.langfuse.com` |
+| Japan Cloud | `https://jp.cloud.langfuse.com` |
 | Self-hosted | Your instance URL |
 
 ## Tables
