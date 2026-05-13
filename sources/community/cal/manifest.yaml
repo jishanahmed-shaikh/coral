@@ -10,8 +10,8 @@ inputs:
     kind: secret
     hint: |
       Your Cal.com API key. Find it in Settings > Security > API Keys.
-      Test mode keys have the prefix cal_ and live mode keys have the
-      prefix cal_live_.
+      Test mode keys have the prefix cal_test_ and live mode keys have
+      the prefix cal_live_.
       See [Cal.com API docs](https://cal.com/docs/api-reference/v2/introduction).
   CAL_BASE_URL:
     kind: variable
@@ -26,10 +26,6 @@ auth:
     - name: Authorization
       from: template
       template: Bearer {{input.CAL_API_KEY}}
-request_headers:
-  - name: cal-api-version
-    from: literal
-    value: "2024-06-14"
 test_queries:
   - SELECT * FROM cal.me LIMIT 1
   - SELECT * FROM cal.event_types LIMIT 1
@@ -40,9 +36,15 @@ tables:
       Singleton table — always returns one row for the authenticated user.
       Use `id` and `username` to understand which account the API key
       belongs to. `default_schedule_id` links to `cal.schedules`.
+      `organization_id` and `organization_is_platform` are set when the
+      user belongs to an organization.
     request:
       method: GET
       path: /v2/me
+      headers:
+        - name: cal-api-version
+          from: literal
+          value: "2024-08-13"
     response:
       rows_path:
         - data
@@ -54,7 +56,6 @@ tables:
       - name: id
         type: Int64
         nullable: false
-        virtual: false
         description: User ID
         expr:
           kind: path
@@ -63,7 +64,6 @@ tables:
       - name: username
         type: Utf8
         nullable: true
-        virtual: false
         description: Cal.com username
         expr:
           kind: path
@@ -72,7 +72,6 @@ tables:
       - name: email
         type: Utf8
         nullable: true
-        virtual: false
         description: User email address
         expr:
           kind: path
@@ -81,7 +80,6 @@ tables:
       - name: name
         type: Utf8
         nullable: true
-        virtual: false
         description: Display name
         expr:
           kind: path
@@ -90,7 +88,6 @@ tables:
       - name: time_zone
         type: Utf8
         nullable: true
-        virtual: false
         description: User time zone
         expr:
           kind: path
@@ -99,7 +96,6 @@ tables:
       - name: week_start
         type: Utf8
         nullable: true
-        virtual: false
         description: First day of the week for this user
         expr:
           kind: path
@@ -108,7 +104,6 @@ tables:
       - name: time_format
         type: Int64
         nullable: true
-        virtual: false
         description: Time format preference (12 or 24)
         expr:
           kind: path
@@ -117,7 +112,6 @@ tables:
       - name: default_schedule_id
         type: Int64
         nullable: true
-        virtual: false
         description: ID of the user's default availability schedule
         expr:
           kind: path
@@ -126,7 +120,6 @@ tables:
       - name: locale
         type: Utf8
         nullable: true
-        virtual: false
         description: User locale (e.g. en)
         expr:
           kind: path
@@ -135,7 +128,6 @@ tables:
       - name: bio
         type: Utf8
         nullable: true
-        virtual: false
         description: User bio
         expr:
           kind: path
@@ -144,12 +136,20 @@ tables:
       - name: organization_id
         type: Int64
         nullable: true
-        virtual: false
         description: Organization ID if the user belongs to an organization
         expr:
           kind: path
           path:
             - organizationId
+      - name: organization_is_platform
+        type: Boolean
+        nullable: true
+        description: Whether the organization is a platform organization
+        expr:
+          kind: path
+          path:
+            - organization
+            - isPlatform
   - name: event_types
     description: Event types configured by the authenticated user
     guide: |
@@ -157,10 +157,16 @@ tables:
       `id` to join with `bookings.event_type_id`. `slug` is the URL
       identifier used in booking links. `length_in_minutes` is the
       meeting duration. `hidden = true` means the event type is not
-      publicly visible.
+      publicly visible. Results are scoped to the API key owner —
+      individual keys return only their own event types; org-scoped keys
+      return all event types in the organization.
     request:
       method: GET
       path: /v2/event-types
+      headers:
+        - name: cal-api-version
+          from: literal
+          value: "2024-06-14"
     response:
       rows_path:
         - data
@@ -172,7 +178,6 @@ tables:
       - name: id
         type: Int64
         nullable: false
-        virtual: false
         description: Event type ID
         expr:
           kind: path
@@ -181,7 +186,6 @@ tables:
       - name: title
         type: Utf8
         nullable: false
-        virtual: false
         description: Event type title
         expr:
           kind: path
@@ -190,7 +194,6 @@ tables:
       - name: slug
         type: Utf8
         nullable: false
-        virtual: false
         description: URL slug used in booking links
         expr:
           kind: path
@@ -199,7 +202,6 @@ tables:
       - name: description
         type: Utf8
         nullable: true
-        virtual: false
         description: Event type description
         expr:
           kind: path
@@ -208,7 +210,6 @@ tables:
       - name: length_in_minutes
         type: Int64
         nullable: true
-        virtual: false
         description: Default meeting duration in minutes
         expr:
           kind: path
@@ -217,7 +218,6 @@ tables:
       - name: hidden
         type: Boolean
         nullable: true
-        virtual: false
         description: Whether the event type is hidden from the public booking page
         expr:
           kind: path
@@ -226,7 +226,6 @@ tables:
       - name: price
         type: Int64
         nullable: true
-        virtual: false
         description: Price for paid events (in smallest currency unit)
         expr:
           kind: path
@@ -235,7 +234,6 @@ tables:
       - name: currency
         type: Utf8
         nullable: true
-        virtual: false
         description: Currency code for paid events
         expr:
           kind: path
@@ -244,7 +242,6 @@ tables:
       - name: owner_id
         type: Int64
         nullable: true
-        virtual: false
         description: User ID of the event type owner
         expr:
           kind: path
@@ -253,7 +250,6 @@ tables:
       - name: booking_url
         type: Utf8
         nullable: true
-        virtual: false
         description: Full public booking URL for this event type
         expr:
           kind: path
@@ -262,7 +258,6 @@ tables:
       - name: schedule_id
         type: Int64
         nullable: true
-        virtual: false
         description: Availability schedule ID used by this event type
         expr:
           kind: path
@@ -271,7 +266,6 @@ tables:
       - name: minimum_booking_notice
         type: Int64
         nullable: true
-        virtual: false
         description: Minimum notice required before a booking in minutes
         expr:
           kind: path
@@ -280,7 +274,6 @@ tables:
       - name: before_event_buffer
         type: Int64
         nullable: true
-        virtual: false
         description: Buffer time before the event in minutes
         expr:
           kind: path
@@ -289,7 +282,6 @@ tables:
       - name: after_event_buffer
         type: Int64
         nullable: true
-        virtual: false
         description: Buffer time after the event in minutes
         expr:
           kind: path
@@ -298,7 +290,6 @@ tables:
       - name: seats_per_time_slot
         type: Int64
         nullable: true
-        virtual: false
         description: Number of seats per time slot for group events
         expr:
           kind: path
@@ -307,7 +298,6 @@ tables:
       - name: is_instant_event
         type: Boolean
         nullable: true
-        virtual: false
         description: Whether this is an instant meeting event type
         expr:
           kind: path
@@ -316,7 +306,6 @@ tables:
       - name: disable_guests
         type: Boolean
         nullable: true
-        virtual: false
         description: Whether guests are disabled for this event type
         expr:
           kind: path
@@ -325,11 +314,19 @@ tables:
   - name: bookings
     description: Scheduled meetings and their status
     guide: |
-      Each row is one booking. Use `status` to filter by accepted,
-      cancelled, or pending. `event_type_id` joins to `cal.event_types`.
-      `start` and `end` are ISO 8601 timestamps. Filter by `status` to
-      analyse cancellations or by `attendee_email` to look up a specific
-      person's meetings. Results are cursor-paginated newest-first.
+      Each row is one booking. `event_type_id` joins to `cal.event_types`.
+      `start` and `end` are Timestamps — use them for time-based filtering
+      (e.g. WHERE start > NOW() - INTERVAL '7 days').
+
+      The `status` filter and the `status` response column use different
+      vocabularies. Filter values: upcoming, recurring, past, cancelled,
+      unconfirmed. Response values: accepted, cancelled, pending, rejected.
+      The filter accepts at most one value per query — passing multiple
+      values returns 400. To query across statuses, run separate queries
+      and merge results.
+
+      Use `after_start` / `before_end` for time-window queries instead of
+      fetching all bookings and filtering client-side.
     filters:
       - name: status
         required: false
@@ -339,9 +336,21 @@ tables:
         required: false
       - name: event_type_id
         required: false
+      - name: after_start
+        required: false
+      - name: before_end
+        required: false
+      - name: after_created_at
+        required: false
+      - name: before_created_at
+        required: false
     request:
       method: GET
       path: /v2/bookings
+      headers:
+        - name: cal-api-version
+          from: literal
+          value: "2026-05-01"
       query:
         - name: status
           from: filter
@@ -355,6 +364,18 @@ tables:
         - name: eventTypeId
           from: filter
           key: event_type_id
+        - name: afterStart
+          from: filter
+          key: after_start
+        - name: beforeEnd
+          from: filter
+          key: before_end
+        - name: afterCreatedAt
+          from: filter
+          key: after_created_at
+        - name: beforeCreatedAt
+          from: filter
+          key: before_created_at
     response:
       rows_path:
         - data
@@ -367,14 +388,13 @@ tables:
         - pagination
         - nextCursor
       page_size:
-        default: 100
+        default: 50
         max: 100
-        query_param: take
+        query_param: limit
     columns:
       - name: id
         type: Int64
         nullable: true
-        virtual: false
         description: Booking ID
         expr:
           kind: path
@@ -383,7 +403,6 @@ tables:
       - name: uid
         type: Utf8
         nullable: true
-        virtual: false
         description: Unique booking identifier (used in booking URLs)
         expr:
           kind: path
@@ -392,7 +411,6 @@ tables:
       - name: title
         type: Utf8
         nullable: true
-        virtual: false
         description: Booking title
         expr:
           kind: path
@@ -401,7 +419,6 @@ tables:
       - name: description
         type: Utf8
         nullable: true
-        virtual: false
         description: Booking description
         expr:
           kind: path
@@ -410,34 +427,38 @@ tables:
       - name: status
         type: Utf8
         nullable: true
-        virtual: false
-        description: Booking status (accepted, cancelled, pending, or rejected)
+        description: >-
+          Booking status from the response (accepted, cancelled, pending, rejected).
+          Note: the status filter uses different values — see table guide.
         expr:
           kind: path
           path:
             - status
       - name: start
-        type: Utf8
+        type: Timestamp
         nullable: true
-        virtual: false
-        description: Booking start time (ISO 8601)
+        description: Booking start time
         expr:
-          kind: path
-          path:
-            - start
+          kind: format_timestamp
+          input: iso8601
+          expr:
+            kind: path
+            path:
+              - start
       - name: end
-        type: Utf8
+        type: Timestamp
         nullable: true
-        virtual: false
-        description: Booking end time (ISO 8601)
+        description: Booking end time
         expr:
-          kind: path
-          path:
-            - end
+          kind: format_timestamp
+          input: iso8601
+          expr:
+            kind: path
+            path:
+              - end
       - name: duration
         type: Int64
         nullable: true
-        virtual: false
         description: Booking duration in minutes
         expr:
           kind: path
@@ -446,16 +467,14 @@ tables:
       - name: event_type_id
         type: Int64
         nullable: true
-        virtual: false
         description: ID of the event type for this booking
         expr:
           kind: path
           path:
             - eventTypeId
-      - name: event_type__slug
+      - name: event_type_slug
         type: Utf8
         nullable: true
-        virtual: false
         description: Slug of the event type for this booking
         expr:
           kind: path
@@ -465,7 +484,6 @@ tables:
       - name: location
         type: Utf8
         nullable: true
-        virtual: false
         description: Meeting location or video call URL
         expr:
           kind: path
@@ -474,16 +492,14 @@ tables:
       - name: meeting_url
         type: Utf8
         nullable: true
-        virtual: false
         description: Video meeting URL
         expr:
           kind: path
           path:
             - meetingUrl
-      - name: host__id
+      - name: host_id
         type: Int64
         nullable: true
-        virtual: false
         description: Host user ID (first host)
         expr:
           kind: first_array_item_path
@@ -491,10 +507,9 @@ tables:
             - hosts
           item_path:
             - id
-      - name: host__name
+      - name: host_name
         type: Utf8
         nullable: true
-        virtual: false
         description: Host display name (first host)
         expr:
           kind: first_array_item_path
@@ -502,10 +517,9 @@ tables:
             - hosts
           item_path:
             - name
-      - name: host__email
+      - name: host_email
         type: Utf8
         nullable: true
-        virtual: false
         description: Host email address (first host)
         expr:
           kind: first_array_item_path
@@ -513,10 +527,9 @@ tables:
             - hosts
           item_path:
             - email
-      - name: host__time_zone
+      - name: host_time_zone
         type: Utf8
         nullable: true
-        virtual: false
         description: Host time zone (first host)
         expr:
           kind: first_array_item_path
@@ -524,10 +537,39 @@ tables:
             - hosts
           item_path:
             - timeZone
+      - name: attendee_name
+        type: Utf8
+        nullable: true
+        description: Attendee display name (first attendee)
+        expr:
+          kind: first_array_item_path
+          path:
+            - attendees
+          item_path:
+            - name
+      - name: attendee_email
+        type: Utf8
+        nullable: true
+        description: Attendee email address (first attendee)
+        expr:
+          kind: first_array_item_path
+          path:
+            - attendees
+          item_path:
+            - email
+      - name: attendee_time_zone
+        type: Utf8
+        nullable: true
+        description: Attendee time zone (first attendee)
+        expr:
+          kind: first_array_item_path
+          path:
+            - attendees
+          item_path:
+            - timeZone
       - name: absent_host
         type: Boolean
         nullable: true
-        virtual: false
         description: Whether the host was absent for this booking
         expr:
           kind: path
@@ -536,7 +578,6 @@ tables:
       - name: cancellation_reason
         type: Utf8
         nullable: true
-        virtual: false
         description: Reason provided when the booking was cancelled
         expr:
           kind: path
@@ -545,7 +586,6 @@ tables:
       - name: cancelled_by_email
         type: Utf8
         nullable: true
-        virtual: false
         description: Email of the person who cancelled the booking
         expr:
           kind: path
@@ -554,7 +594,6 @@ tables:
       - name: rescheduling_reason
         type: Utf8
         nullable: true
-        virtual: false
         description: Reason provided when the booking was rescheduled
         expr:
           kind: path
@@ -563,7 +602,6 @@ tables:
       - name: rescheduled_from_uid
         type: Utf8
         nullable: true
-        virtual: false
         description: UID of the original booking before rescheduling
         expr:
           kind: path
@@ -572,46 +610,33 @@ tables:
       - name: rating
         type: Int64
         nullable: true
-        virtual: false
         description: Post-meeting rating score
         expr:
           kind: path
           path:
             - rating
       - name: created_at
-        type: Utf8
+        type: Timestamp
         nullable: true
-        virtual: false
         description: Timestamp when the booking was created
         expr:
-          kind: path
-          path:
-            - createdAt
+          kind: format_timestamp
+          input: iso8601
+          expr:
+            kind: path
+            path:
+              - createdAt
       - name: updated_at
-        type: Utf8
+        type: Timestamp
         nullable: true
-        virtual: false
         description: Timestamp when the booking was last updated
         expr:
-          kind: path
-          path:
-            - updatedAt
-      - name: filter_status
-        type: Utf8
-        nullable: true
-        virtual: true
-        description: Echoes the status filter applied to this query
-        expr:
-          kind: from_filter
-          key: status
-      - name: filter_attendee_email
-        type: Utf8
-        nullable: true
-        virtual: true
-        description: Echoes the attendee_email filter applied to this query
-        expr:
-          kind: from_filter
-          key: attendee_email
+          kind: format_timestamp
+          input: iso8601
+          expr:
+            kind: path
+            path:
+              - updatedAt
   - name: schedules
     description: Availability schedules defining when the user can be booked
     guide: |
@@ -623,6 +648,10 @@ tables:
     request:
       method: GET
       path: /v2/schedules
+      headers:
+        - name: cal-api-version
+          from: literal
+          value: "2024-06-11"
     response:
       rows_path:
         - data
@@ -634,7 +663,6 @@ tables:
       - name: id
         type: Int64
         nullable: false
-        virtual: false
         description: Schedule ID
         expr:
           kind: path
@@ -643,7 +671,6 @@ tables:
       - name: name
         type: Utf8
         nullable: false
-        virtual: false
         description: Schedule name
         expr:
           kind: path
@@ -652,7 +679,6 @@ tables:
       - name: time_zone
         type: Utf8
         nullable: true
-        virtual: false
         description: Time zone for this schedule
         expr:
           kind: path
@@ -661,7 +687,6 @@ tables:
       - name: is_default
         type: Boolean
         nullable: true
-        virtual: false
         description: Whether this is the user's default schedule
         expr:
           kind: path
@@ -670,7 +695,6 @@ tables:
       - name: owner_id
         type: Int64
         nullable: true
-        virtual: false
         description: User ID of the schedule owner
         expr:
           kind: path
@@ -679,7 +703,6 @@ tables:
       - name: availability
         type: Utf8
         nullable: true
-        virtual: false
         description: Availability windows as a JSON array (days, startTime, endTime)
         expr:
           kind: path
@@ -688,7 +711,6 @@ tables:
       - name: overrides
         type: Utf8
         nullable: true
-        virtual: false
         description: Date-specific overrides as a JSON array
         expr:
           kind: path
