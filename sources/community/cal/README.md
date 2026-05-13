@@ -97,7 +97,7 @@ coral sql "
 coral sql "
   SELECT uid, title, start, status, attendee_email
   FROM cal.bookings
-  WHERE event_type_id = <your-event-type-id>
+  WHERE event_type_id = 12345
   ORDER BY start DESC
 "
 
