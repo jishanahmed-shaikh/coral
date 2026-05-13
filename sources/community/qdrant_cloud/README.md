@@ -1,6 +1,6 @@
 # Qdrant Cloud
 
-**Version:** 0.1.0
+**Version:** 0.1.1
 **Backend:** HTTP
 **Tables:** 3
 **Base URL:** `https://api.cloud.qdrant.io`
@@ -41,6 +41,13 @@ Then re-add with the account ID:
 QDRANT_CLOUD_API_KEY=<key> QDRANT_ACCOUNT_ID=<account_id> \
   coral source add --file sources/community/qdrant_cloud/manifest.yaml
 ```
+
+## Rate limits
+
+The Qdrant Cloud management API is rate-limited per API key. Avoid running
+large fan-out queries in tight loops. The `clusters` endpoint returns all
+clusters in a single response with no server-side pagination, so filter in
+SQL when working with large accounts.
 
 ## Tables
 
