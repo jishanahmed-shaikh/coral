@@ -1,4 +1,4 @@
-name: qdrant
+name: qdrant_cloud
 version: 0.1.0
 dsl_version: 3
 backend: http
@@ -19,7 +19,7 @@ inputs:
     hint: |
       Your Qdrant Cloud account ID. Required for cluster and backup
       tables. Leave blank to install first, then discover your account
-      ID by querying qdrant.accounts, and re-add with the account ID set.
+      ID by querying qdrant_cloud.accounts, and re-add with the account ID set.
 base_url: https://api.cloud.qdrant.io
 auth:
   type: HeaderAuth
@@ -28,7 +28,7 @@ auth:
       from: template
       template: apikey {{input.QDRANT_CLOUD_API_KEY}}
 test_queries:
-  - SELECT * FROM qdrant.accounts LIMIT 1
+  - SELECT * FROM qdrant_cloud.accounts LIMIT 1
 tables:
   - name: accounts
     description: Qdrant Cloud accounts accessible with the management API key
@@ -235,7 +235,7 @@ tables:
     description: Cluster backups in the account
     guide: |
       Each row is one backup snapshot. `cluster_id` joins to
-      `qdrant.clusters`. `status` shows whether the backup succeeded
+      `qdrant_cloud.clusters`. `status` shows whether the backup succeeded
       (BACKUP_STATUS_SUCCEEDED) or failed. `backup_duration` is the
       time taken to complete the backup. Requires `QDRANT_ACCOUNT_ID`
       to be set.
