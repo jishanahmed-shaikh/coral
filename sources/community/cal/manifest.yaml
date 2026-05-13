@@ -17,8 +17,9 @@ inputs:
     kind: variable
     default: https://api.cal.com
     hint: |
-      Base URL for the Cal.com API. Use the default for Cal.com Cloud.
-      For self-hosted Cal.com instances use your own host URL.
+      Base URL for the Cal.com API. Use the default (https://api.cal.com)
+      for Cal.com Cloud. For self-hosted Cal.com instances use your own
+      host URL.
 base_url: "{{input.CAL_BASE_URL}}"
 auth:
   type: HeaderAuth
@@ -159,7 +160,8 @@ tables:
       meeting duration. `hidden = true` means the event type is not
       publicly visible. Results are scoped to the API key owner —
       individual keys return only their own event types; org-scoped keys
-      return all event types in the organization.
+      return all event types in the organization. Org-scoped keys may
+      return large result sets as this table is not paginated.
     request:
       method: GET
       path: /v2/event-types
@@ -326,7 +328,10 @@ tables:
       and merge results.
 
       Use `after_start` / `before_end` for time-window queries instead of
-      fetching all bookings and filtering client-side.
+      fetching all bookings and filtering client-side. Note that
+      `after_start`, `before_end`, `after_created_at`, and
+      `before_created_at` are filter-only parameters and do not appear
+      as selectable columns in the result.
     filters:
       - name: status
         required: false

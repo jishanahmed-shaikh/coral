@@ -19,7 +19,7 @@ Requires a `CAL_API_KEY`. Find it in **Settings → Security → API Keys**.
 CAL_API_KEY=cal_live_... coral source add --file sources/community/cal/manifest.yaml
 ```
 
-Or interactively:
+Run from the repo root. Or interactively:
 
 ```bash
 CAL_API_KEY=cal_live_... coral source add --file sources/community/cal/manifest.yaml --interactive
