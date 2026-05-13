@@ -315,7 +315,7 @@ tables:
     description: Scheduled meetings and their status
     guide: |
       Each row is one booking. `event_type_id` joins to `cal.event_types`.
-      `start` and `end` are Timestamps — use them for time-based filtering
+      `start` and `end_time` are Timestamps — use them for time-based filtering
       (e.g. WHERE start > NOW() - INTERVAL '7 days').
 
       The `status` filter and the `status` response column use different
