@@ -57,7 +57,6 @@ tables:
       - name: id
         type: Utf8
         nullable: false
-        virtual: false
         description: Project ID
         expr:
           kind: path
@@ -66,7 +65,6 @@ tables:
       - name: name
         type: Utf8
         nullable: false
-        virtual: false
         description: Project name
         expr:
           kind: path
@@ -75,7 +73,6 @@ tables:
       - name: created_at
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the project was created
         expr:
           kind: path
@@ -139,7 +136,6 @@ tables:
       - name: id
         type: Utf8
         nullable: false
-        virtual: false
         description: Trace ID
         expr:
           kind: path
@@ -148,7 +144,6 @@ tables:
       - name: name
         type: Utf8
         nullable: true
-        virtual: false
         description: Trace name (identifies the use case or feature)
         expr:
           kind: path
@@ -157,7 +152,6 @@ tables:
       - name: user_id
         type: Utf8
         nullable: true
-        virtual: false
         description: User ID associated with this trace
         expr:
           kind: path
@@ -166,7 +160,6 @@ tables:
       - name: session_id
         type: Utf8
         nullable: true
-        virtual: false
         description: Session ID for grouping multi-turn conversations
         expr:
           kind: path
@@ -175,7 +168,6 @@ tables:
       - name: environment
         type: Utf8
         nullable: true
-        virtual: false
         description: Deployment environment (e.g. production, staging)
         expr:
           kind: path
@@ -184,7 +176,6 @@ tables:
       - name: release
         type: Utf8
         nullable: true
-        virtual: false
         description: Application release version
         expr:
           kind: path
@@ -193,7 +184,6 @@ tables:
       - name: version
         type: Utf8
         nullable: true
-        virtual: false
         description: Application version
         expr:
           kind: path
@@ -202,7 +192,6 @@ tables:
       - name: tags
         type: Utf8
         nullable: true
-        virtual: false
         description: Tags attached to this trace (JSON array)
         expr:
           kind: path
@@ -211,7 +200,6 @@ tables:
       - name: timestamp
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the trace was recorded
         expr:
           kind: path
@@ -220,7 +208,6 @@ tables:
       - name: latency
         type: Float64
         nullable: true
-        virtual: false
         description: End-to-end latency in seconds
         expr:
           kind: path
@@ -229,7 +216,6 @@ tables:
       - name: total_cost
         type: Float64
         nullable: true
-        virtual: false
         description: Total cost in USD across all observations in this trace
         expr:
           kind: path
@@ -238,7 +224,6 @@ tables:
       - name: project_id
         type: Utf8
         nullable: true
-        virtual: false
         description: Project ID this trace belongs to
         expr:
           kind: path
@@ -247,7 +232,6 @@ tables:
       - name: created_at
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the trace record was created
         expr:
           kind: path
@@ -256,36 +240,11 @@ tables:
       - name: updated_at
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the trace record was last updated
         expr:
           kind: path
           path:
             - updatedAt
-      - name: filter_user_id
-        type: Utf8
-        nullable: true
-        virtual: true
-        description: Echoes the user_id filter applied to this query
-        expr:
-          kind: from_filter
-          key: user_id
-      - name: filter_name
-        type: Utf8
-        nullable: true
-        virtual: true
-        description: Echoes the name filter applied to this query
-        expr:
-          kind: from_filter
-          key: name
-      - name: filter_session_id
-        type: Utf8
-        nullable: true
-        virtual: true
-        description: Echoes the session_id filter applied to this query
-        expr:
-          kind: from_filter
-          key: session_id
   - name: observations
     description: Spans, generations, and events within traces
     guide: |
@@ -344,7 +303,6 @@ tables:
       - name: id
         type: Utf8
         nullable: false
-        virtual: false
         description: Observation ID
         expr:
           kind: path
@@ -353,7 +311,6 @@ tables:
       - name: trace_id
         type: Utf8
         nullable: true
-        virtual: false
         description: Parent trace ID
         expr:
           kind: path
@@ -362,7 +319,6 @@ tables:
       - name: type
         type: Utf8
         nullable: true
-        virtual: false
         description: Observation type (SPAN, GENERATION, or EVENT)
         expr:
           kind: path
@@ -371,7 +327,6 @@ tables:
       - name: name
         type: Utf8
         nullable: true
-        virtual: false
         description: Observation name
         expr:
           kind: path
@@ -380,7 +335,6 @@ tables:
       - name: model
         type: Utf8
         nullable: true
-        virtual: false
         description: Model name used for this generation
         expr:
           kind: path
@@ -389,7 +343,6 @@ tables:
       - name: model_parameters
         type: Utf8
         nullable: true
-        virtual: false
         description: Model parameters as a JSON object
         expr:
           kind: path
@@ -398,7 +351,6 @@ tables:
       - name: start_time
         type: Utf8
         nullable: true
-        virtual: false
         description: Observation start timestamp
         expr:
           kind: path
@@ -407,7 +359,6 @@ tables:
       - name: end_time
         type: Utf8
         nullable: true
-        virtual: false
         description: Observation end timestamp
         expr:
           kind: path
@@ -416,7 +367,6 @@ tables:
       - name: latency
         type: Float64
         nullable: true
-        virtual: false
         description: Observation latency in seconds
         expr:
           kind: path
@@ -425,7 +375,6 @@ tables:
       - name: input_tokens
         type: Int64
         nullable: true
-        virtual: false
         description: Number of input tokens
         expr:
           kind: path
@@ -435,7 +384,6 @@ tables:
       - name: output_tokens
         type: Int64
         nullable: true
-        virtual: false
         description: Number of output tokens
         expr:
           kind: path
@@ -445,7 +393,6 @@ tables:
       - name: total_tokens
         type: Int64
         nullable: true
-        virtual: false
         description: Total tokens (input + output)
         expr:
           kind: path
@@ -455,7 +402,6 @@ tables:
       - name: input_cost
         type: Float64
         nullable: true
-        virtual: false
         description: Calculated input cost in USD
         expr:
           kind: path
@@ -464,7 +410,6 @@ tables:
       - name: output_cost
         type: Float64
         nullable: true
-        virtual: false
         description: Calculated output cost in USD
         expr:
           kind: path
@@ -473,7 +418,6 @@ tables:
       - name: total_cost
         type: Float64
         nullable: true
-        virtual: false
         description: Calculated total cost in USD
         expr:
           kind: path
@@ -482,7 +426,6 @@ tables:
       - name: level
         type: Utf8
         nullable: true
-        virtual: false
         description: Log level (DEBUG, DEFAULT, WARNING, ERROR)
         expr:
           kind: path
@@ -491,7 +434,6 @@ tables:
       - name: status_message
         type: Utf8
         nullable: true
-        virtual: false
         description: Status message or error description
         expr:
           kind: path
@@ -500,7 +442,6 @@ tables:
       - name: version
         type: Utf8
         nullable: true
-        virtual: false
         description: Version tag on this observation
         expr:
           kind: path
@@ -509,7 +450,6 @@ tables:
       - name: environment
         type: Utf8
         nullable: true
-        virtual: false
         description: Deployment environment
         expr:
           kind: path
@@ -518,7 +458,6 @@ tables:
       - name: created_at
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the observation was created
         expr:
           kind: path
@@ -527,7 +466,6 @@ tables:
       - name: updated_at
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the observation was last updated
         expr:
           kind: path
@@ -591,7 +529,6 @@ tables:
       - name: id
         type: Utf8
         nullable: false
-        virtual: false
         description: Score ID
         expr:
           kind: path
@@ -600,7 +537,6 @@ tables:
       - name: trace_id
         type: Utf8
         nullable: true
-        virtual: false
         description: Trace ID this score is attached to
         expr:
           kind: path
@@ -609,7 +545,6 @@ tables:
       - name: observation_id
         type: Utf8
         nullable: true
-        virtual: false
         description: Observation ID this score is attached to (if observation-level)
         expr:
           kind: path
@@ -618,7 +553,6 @@ tables:
       - name: name
         type: Utf8
         nullable: false
-        virtual: false
         description: Score name (e.g. quality, relevance, hallucination)
         expr:
           kind: path
@@ -627,7 +561,6 @@ tables:
       - name: value
         type: Float64
         nullable: true
-        virtual: false
         description: Numeric score value (null for categorical scores)
         expr:
           kind: path
@@ -636,7 +569,6 @@ tables:
       - name: string_value
         type: Utf8
         nullable: true
-        virtual: false
         description: Categorical score label (null for numeric scores)
         expr:
           kind: path
@@ -645,7 +577,6 @@ tables:
       - name: data_type
         type: Utf8
         nullable: true
-        virtual: false
         description: Score data type (NUMERIC, CATEGORICAL, or BOOLEAN)
         expr:
           kind: path
@@ -654,7 +585,6 @@ tables:
       - name: source
         type: Utf8
         nullable: true
-        virtual: false
         description: Score source (API, ANNOTATION, or EVAL)
         expr:
           kind: path
@@ -663,7 +593,6 @@ tables:
       - name: comment
         type: Utf8
         nullable: true
-        virtual: false
         description: Optional comment on the score
         expr:
           kind: path
@@ -672,7 +601,6 @@ tables:
       - name: environment
         type: Utf8
         nullable: true
-        virtual: false
         description: Deployment environment
         expr:
           kind: path
@@ -681,7 +609,6 @@ tables:
       - name: created_at
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the score was created
         expr:
           kind: path
@@ -690,7 +617,6 @@ tables:
       - name: updated_at
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the score was last updated
         expr:
           kind: path
@@ -732,7 +658,6 @@ tables:
       - name: id
         type: Utf8
         nullable: false
-        virtual: false
         description: Session ID
         expr:
           kind: path
@@ -741,7 +666,6 @@ tables:
       - name: created_at
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the session was created
         expr:
           kind: path
@@ -750,7 +674,6 @@ tables:
       - name: updated_at
         type: Utf8
         nullable: true
-        virtual: false
         description: Timestamp when the session was last updated
         expr:
           kind: path
@@ -759,7 +682,6 @@ tables:
       - name: project_id
         type: Utf8
         nullable: true
-        virtual: false
         description: Project ID this session belongs to
         expr:
           kind: path

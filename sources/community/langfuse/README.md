@@ -68,7 +68,7 @@ coral sql "SELECT id, name FROM langfuse.projects"
 
 # Recent traces with cost and latency
 coral sql "
-  SELECT id, name, user_id, latency, total_cost, total_tokens, timestamp
+  SELECT id, name, user_id, latency, total_cost, timestamp
   FROM langfuse.traces
   ORDER BY timestamp DESC
   LIMIT 20
