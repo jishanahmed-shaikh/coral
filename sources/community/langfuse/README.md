@@ -128,7 +128,7 @@ coral sql "
   ORDER BY total_cost_usd DESC
 "
 
-# Sessions with trace counts
+# Sessions ordered by creation time
 coral sql "SELECT id, created_at, project_id FROM langfuse.sessions ORDER BY created_at DESC LIMIT 10"
 ```
 
