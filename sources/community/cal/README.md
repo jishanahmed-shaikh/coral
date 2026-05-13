@@ -69,7 +69,7 @@ coral sql "
 
 # Recent bookings
 coral sql "
-  SELECT id, uid, status, start, duration, host_name, attendee_email
+  SELECT id, uid, status, start, end_time, duration, host_name, attendee_email
   FROM cal.bookings
   ORDER BY start DESC
   LIMIT 20

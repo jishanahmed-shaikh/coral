@@ -445,7 +445,7 @@ tables:
             kind: path
             path:
               - start
-      - name: end
+      - name: end_time
         type: Timestamp
         nullable: true
         description: Booking end time
