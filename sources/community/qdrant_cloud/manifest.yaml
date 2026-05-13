@@ -1,5 +1,5 @@
 name: qdrant_cloud
-version: 0.1.0
+version: 0.1.1
 dsl_version: 3
 backend: http
 description: >-
@@ -49,7 +49,7 @@ tables:
     columns:
       - name: id
         type: Utf8
-        nullable: false
+        nullable: true
         description: Account ID
         expr:
           kind: path
@@ -81,21 +81,27 @@ tables:
             - company
             - name
       - name: created_at
-        type: Utf8
+        type: Timestamp
         nullable: true
-        description: Timestamp when the account was created
+        description: Time when the account was created
         expr:
-          kind: path
-          path:
-            - createdAt
+          kind: format_timestamp
+          input: iso8601
+          expr:
+            kind: path
+            path:
+              - createdAt
       - name: last_modified_at
-        type: Utf8
+        type: Timestamp
         nullable: true
-        description: Timestamp when the account was last modified
+        description: Time when the account was last modified
         expr:
-          kind: path
-          path:
-            - lastModifiedAt
+          kind: format_timestamp
+          input: iso8601
+          expr:
+            kind: path
+            path:
+              - lastModifiedAt
   - name: clusters
     description: Qdrant Cloud clusters in the account
     guide: |
@@ -105,6 +111,8 @@ tables:
       is the REST URL to connect to the cluster database directly.
       `cloud_provider_id` and `cloud_provider_region_id` show where the
       cluster is deployed. Requires `QDRANT_ACCOUNT_ID` to be set.
+      Accounts with a large number of clusters will return all rows in
+      one response; consider filtering in SQL to keep result sets small.
     request:
       method: GET
       path: /api/cluster/v1/accounts/{{input.QDRANT_ACCOUNT_ID}}/clusters
@@ -118,7 +126,7 @@ tables:
     columns:
       - name: id
         type: Utf8
-        nullable: false
+        nullable: true
         description: Cluster ID
         expr:
           kind: path
@@ -224,13 +232,16 @@ tables:
             - endpoint
             - restPort
       - name: created_at
-        type: Utf8
+        type: Timestamp
         nullable: true
-        description: Timestamp when the cluster was created
+        description: Time when the cluster was created
         expr:
-          kind: path
-          path:
-            - createdAt
+          kind: format_timestamp
+          input: iso8601
+          expr:
+            kind: path
+            path:
+              - createdAt
   - name: backups
     description: Cluster backups in the account
     guide: |
@@ -259,7 +270,7 @@ tables:
     columns:
       - name: id
         type: Utf8
-        nullable: false
+        nullable: true
         description: Backup ID
         expr:
           kind: path
@@ -308,10 +319,13 @@ tables:
           path:
             - backupDuration
       - name: created_at
-        type: Utf8
+        type: Timestamp
         nullable: true
-        description: Timestamp when the backup was created
+        description: Time when the backup was created
         expr:
-          kind: path
-          path:
-            - createdAt
+          kind: format_timestamp
+          input: iso8601
+          expr:
+            kind: path
+            path:
+              - createdAt
