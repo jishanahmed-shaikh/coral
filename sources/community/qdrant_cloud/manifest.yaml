@@ -101,7 +101,7 @@ tables:
     guide: |
       Each row is one Qdrant Cloud cluster. Use `id` to identify
       clusters for backup queries. `state_phase` shows cluster health
-      (CLUSTER_PHASE_HEALTHY means fully operational). `state_endpoint`
+      (CLUSTER_PHASE_HEALTHY means fully operational). `endpoint_url`
       is the REST URL to connect to the cluster database directly.
       `cloud_provider_id` and `cloud_provider_region_id` show where the
       cluster is deployed. Requires `QDRANT_ACCOUNT_ID` to be set.
