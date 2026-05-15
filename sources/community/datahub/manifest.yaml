@@ -117,7 +117,7 @@ tables:
         - data
         - search
         - searchResults
-      allow_404_empty: true
+      allow_404_empty: false
       row_strategy: direct
     pagination:
       mode: none
@@ -247,7 +247,7 @@ tables:
         - data
         - search
         - searchResults
-      allow_404_empty: true
+      allow_404_empty: false
       row_strategy: direct
     pagination:
       mode: none
@@ -344,7 +344,7 @@ tables:
         - data
         - search
         - searchResults
-      allow_404_empty: true
+      allow_404_empty: false
       row_strategy: direct
     pagination:
       mode: none
@@ -444,7 +444,7 @@ tables:
         - data
         - search
         - searchResults
-      allow_404_empty: true
+      allow_404_empty: false
       row_strategy: direct
     pagination:
       mode: none
@@ -557,7 +557,7 @@ tables:
         - data
         - search
         - searchResults
-      allow_404_empty: true
+      allow_404_empty: false
       row_strategy: direct
     pagination:
       mode: none
@@ -678,7 +678,7 @@ tables:
         - data
         - search
         - searchResults
-      allow_404_empty: true
+      allow_404_empty: false
       row_strategy: direct
     pagination:
       mode: none
