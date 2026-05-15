@@ -200,9 +200,9 @@ tables:
       QUEUED, RESTARTED, and RETRYING. Filter by `namespace` and `flow_id`
       to scope to a specific flow. `start_date` is required — pass an ISO
       8601 timestamp to set the lower bound for the search window
-      (e.g. WHERE start_date = '2026-01-01T00:00:00Z'). `duration` is in
-      seconds. Join `flow_id` and `namespace` back to `kestra.flows` to get
-      flow metadata.
+      (e.g. WHERE start_date = '2026-01-01T00:00:00Z'). `duration` is an
+      ISO 8601 duration string (e.g. `PT0.94S`). Join `flow_id` and
+      `namespace` back to `kestra.flows` to get flow metadata.
     filters:
       - name: namespace
         required: false
@@ -311,9 +311,11 @@ tables:
               - state
               - endDate
       - name: duration
-        type: Float64
+        type: Utf8
         nullable: true
-        description: Execution duration in seconds. NULL if still running.
+        description: >-
+          Execution duration as an ISO 8601 duration string (e.g. `PT0.94S`).
+          NULL if still running.
         expr:
           kind: path
           path:

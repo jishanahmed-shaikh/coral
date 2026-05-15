@@ -122,7 +122,7 @@ WHERE start_date = '2026-05-01T00:00:00Z'
 | `state` | Utf8 | | Current state: SUCCESS, FAILED, RUNNING, KILLED, WARNING, PAUSED, QUEUED, RESTARTED, RETRYING |
 | `start_date` | Timestamp | ✓ | Execution start time (UTC); also the required filter lower bound |
 | `end_date` | Timestamp | | Execution end time (UTC); NULL if still running |
-| `duration` | Float64 | | Duration in seconds; NULL if still running |
+| `duration` | Utf8 | | Duration as ISO 8601 string (e.g. `PT0.94S`); NULL if still running |
 | `trigger_type` | Utf8 | | What triggered the run: MANUAL, SCHEDULE, WEBHOOK, FLOW |
 | `deleted` | Boolean | | Whether the execution record is soft-deleted |
 | `label_names` | Utf8 | | Comma-joined label keys |
@@ -222,6 +222,7 @@ kestra.namespaces
 - The `level` filter on `logs` is a minimum-level filter (`minLevel`), not an
   exact match. `level = 'WARN'` returns WARN and ERROR entries.
 - `duration` on executions is returned by Kestra as an ISO 8601 duration string
-  (e.g. `PT0.94S`) and is surfaced as a `Float64` seconds value after parsing.
+  (e.g. `PT0.94S`) and is surfaced as a `Utf8` column. Use your SQL client's
+  string functions to parse it if needed.
 - For Kestra Cloud or Enterprise with SSO, Basic Auth may not be available.
   Check your instance's authentication settings.
