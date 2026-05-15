@@ -14,7 +14,7 @@ Works with DataHub OSS (local Docker quickstart) and any self-hosted deployment.
 
 ## Authentication
 
-DataHub OSS running locally is unauthenticated by default â€” set `DATAHUB_TOKEN`
+DataHub OSS running locally is unauthenticated by default — set `DATAHUB_TOKEN`
 to any non-empty placeholder value and the connector works without a real token.
 
 For authenticated deployments, generate a Personal Access Token in the DataHub
