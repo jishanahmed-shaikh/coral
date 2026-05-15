@@ -14,15 +14,15 @@ inputs:
       Base URL of your DataHub GMS (Generalized Metadata Service) instance.
       For a local Docker quickstart use http://localhost:8080.
       For a remote deployment use its full base URL
-      (e.g. https://datahub.example.com). Do not include /api/graphql —
+      (e.g. https://datahub.example.com). Do not include /api/graphql â€”
       that path is appended automatically.
       See https://datahubproject.io/docs/quickstart for setup.
   DATAHUB_TOKEN:
     kind: secret
     hint: >-
       Personal Access Token for authenticated DataHub deployments.
-      Generate one in DataHub UI → Settings → Access Tokens.
-      For local unauthenticated OSS instances leave this blank —
+      Generate one in DataHub UI â†’ Settings â†’ Access Tokens.
+      For local unauthenticated OSS instances leave this blank â€”
       the connector will omit the Authorization header.
       See https://datahubproject.io/docs/authentication/personal-access-tokens.
 base_url: "{{input.DATAHUB_GMS_URL}}"
@@ -42,7 +42,7 @@ test_queries:
 tables:
   - name: datasets
     description: >-
-      Data catalog inventory — datasets registered across all platforms
+      Data catalog inventory â€” datasets registered across all platforms
       (Hive, S3, Kafka, HDFS, etc.) with ownership and descriptions.
     guide: |
       Each row is one registered dataset. `platform` is the underlying data
@@ -603,7 +603,7 @@ tables:
 
   - name: users
     description: >-
-      DataHub users (CorpUsers) — people registered in the catalog with
+      DataHub users (CorpUsers) â€” people registered in the catalog with
       display names and email addresses.
     guide: |
       Each row is one registered user. `username` is the login identifier.

@@ -14,11 +14,11 @@ Works with DataHub OSS (local Docker quickstart) and any self-hosted deployment.
 
 ## Authentication
 
-DataHub OSS running locally is unauthenticated by default — set `DATAHUB_TOKEN`
+DataHub OSS running locally is unauthenticated by default â€” set `DATAHUB_TOKEN`
 to any non-empty placeholder value and the connector works without a real token.
 
 For authenticated deployments, generate a Personal Access Token in the DataHub
-UI under **Settings → Access Tokens** and pass it as `DATAHUB_TOKEN`.
+UI under **Settings â†’ Access Tokens** and pass it as `DATAHUB_TOKEN`.
 
 ```bash
 # Local unauthenticated OSS (Docker quickstart)
@@ -41,7 +41,7 @@ coral source add --file sources/community/datahub/manifest.yaml --interactive
 | Input | Kind | Default | Description |
 |---|---|---|---|
 | `DATAHUB_GMS_URL` | variable | `http://localhost:8080` | Base URL of your DataHub GMS instance. Do **not** include `/api/graphql`. |
-| `DATAHUB_TOKEN` | secret | — | Personal Access Token. Use any placeholder for unauthenticated local instances. |
+| `DATAHUB_TOKEN` | secret | â€” | Personal Access Token. Use any placeholder for unauthenticated local instances. |
 
 ## Tables
 
@@ -99,7 +99,7 @@ FROM datahub.datajobs
 | `urn` | Utf8 | Unique DataJob URN |
 | `name` | Utf8 | Task or job name |
 | `description` | Utf8 | Task description |
-| `flow_urn` | Utf8 | Parent pipeline URN — join to `datahub.dataflows.urn` |
+| `flow_urn` | Utf8 | Parent pipeline URN â€” join to `datahub.dataflows.urn` |
 | `flow_platform` | Utf8 | Orchestration platform of the parent pipeline |
 
 ---
@@ -191,22 +191,22 @@ coral sql "SELECT d.name AS dataset, d.platform, d.owners FROM datahub.datasets 
 
 ```text
 datahub.domains
-  → urn (domain grouping)
+  â†’ urn (domain grouping)
 
 datahub.tags
-  → urn (applied to datasets and other entities)
+  â†’ urn (applied to datasets and other entities)
 
 datahub.users
-  → username (matches owners column in datasets)
+  â†’ username (matches owners column in datasets)
 
 datahub.dataflows
-  → urn
-    → datahub.datajobs WHERE flow_urn = dataflows.urn
-      → task-level lineage and descriptions
+  â†’ urn
+    â†’ datahub.datajobs WHERE flow_urn = dataflows.urn
+      â†’ task-level lineage and descriptions
 
 datahub.datasets
-  → urn (cross-reference with lineage, tags, domains)
-  → owners → datahub.users.username
+  â†’ urn (cross-reference with lineage, tags, domains)
+  â†’ owners â†’ datahub.users.username
 ```
 
 ## Notes
@@ -215,9 +215,9 @@ datahub.datasets
   all registered entities. SQL `WHERE` clauses are evaluated client-side by
   Coral after the full result set is fetched.
 - `DATAHUB_TOKEN` is required by the connector even for unauthenticated local
-  instances — pass any non-empty placeholder (e.g. `no-auth`) and DataHub OSS
+  instances â€” pass any non-empty placeholder (e.g. `no-auth`) and DataHub OSS
   will ignore the `Authorization` header.
-- `DATAHUB_GMS_URL` should be the **base URL only** — do not append
+- `DATAHUB_GMS_URL` should be the **base URL only** â€” do not append
   `/api/graphql`. The connector appends that path automatically.
 - Tested against DataHub OSS v0.14+ (Docker quickstart). The GraphQL `search`
   API shape used here has been stable since v0.9.
