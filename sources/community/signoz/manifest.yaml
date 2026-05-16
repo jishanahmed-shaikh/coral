@@ -36,10 +36,10 @@ tables:
     description: APM services instrumented and reporting to SigNoz.
     guide: >
       Start here to get a list of all services sending traces to SigNoz.
-      Use serviceName values from this table as filters in the operations table.
+      Returns an empty list when no instrumented services have reported data.
     request:
       method: GET
-      path: /api/v1/services
+      path: /api/v1/services/list
       query:
         - name: start
           from: now_epoch_minus_seconds
@@ -47,8 +47,7 @@ tables:
         - name: end
           from: now_epoch_minus_seconds
           seconds: 0
-    response:
-      rows_path: [data]
+    response: {}
     pagination:
       mode: none
     columns:
@@ -88,130 +87,45 @@ tables:
         description: Error rate as a fraction of total calls
         expr: {kind: path, path: [errorRate]}
 
-  - name: operations
-    description: Operations (span names) for a given service in SigNoz APM.
-    guide: >
-      Requires a service_name filter. Use serviceName values from the services
-      table. Returns the list of operation names seen for that service.
-    request:
-      method: GET
-      path: /api/v1/services/{{filter.service_name}}/operations
-      query:
-        - name: start
-          from: now_epoch_minus_seconds
-          seconds: 3600
-        - name: end
-          from: now_epoch_minus_seconds
-          seconds: 0
-    response:
-      rows_path: [data]
-    pagination:
-      mode: none
-    columns:
-      - name: operation
-        type: Utf8
-        nullable: true
-        description: Operation name
-        expr: {kind: current_row}
-      - name: service_name
-        type: Utf8
-        nullable: true
-        description: Service name (echoes the required filter)
-        expr: {kind: from_filter, key: service_name}
-        virtual: true
-    filters:
-      - name: service_name
-        required: true
-
   - name: logs
     description: Search logs stored in SigNoz via the query_range API.
     guide: >
       Requires start_time and end_time filters (epoch milliseconds).
-      Returns up to 100 log entries per query ordered by timestamp descending.
-      The response wraps results under data.result[].list; rows_path targets
-      data.newResult which is a flattened list available in newer SigNoz builds.
-      If no rows come back, verify the time range contains log data.
+      Returns result envelopes; the rows column contains the actual log
+      objects as a JSON array. If rows is null the time range has no data.
     request:
       method: POST
       path: /api/v5/query_range
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
       body:
-        format: json
-        fields:
-          - path: [start]
-            from: filter_int
-            key: start_time
-          - path: [end]
-            from: filter_int
-            key: end_time
-          - path: [requestType]
-            from: literal
-            value: raw
-          - path: [compositeQuery, queries]
-            from: literal
-            value:
-              - type: builder_query
-                spec:
-                  name: A
-                  signal: logs
-                  filter:
-                    expression: ""
-                  order:
-                    - key: {name: timestamp}
-                      direction: desc
-                    - key: {name: id}
-                      direction: desc
-                  offset: 0
-                  limit: 100
+        format: text
+        content:
+          from: template
+          template: >-
+            {"start":{{filter.start_time}},"end":{{filter.end_time}},"requestType":"raw","compositeQuery":{"queries":[{"type":"builder_query","spec":{"name":"A","signal":"logs","filter":{"expression":""},"order":[{"key":{"name":"timestamp"},"direction":"desc"},{"key":{"name":"id"},"direction":"desc"}],"offset":0,"limit":100}}]}}
     response:
-      rows_path: [data, newResult]
+      rows_path: [data, data, results]
     pagination:
       mode: none
     columns:
-      - name: timestamp
+      - name: query_name
         type: Utf8
         nullable: true
-        description: Log event timestamp (nanoseconds epoch as string)
-        expr: {kind: path, path: [timestamp]}
-      - name: id
+        description: Query name
+        expr: {kind: path, path: [queryName]}
+      - name: next_cursor
         type: Utf8
         nullable: true
-        description: Unique log entry identifier
-        expr: {kind: path, path: [data, id]}
-      - name: body
-        type: Utf8
-        nullable: true
-        description: Log message body
-        expr: {kind: path, path: [data, body]}
-      - name: severity_text
-        type: Utf8
-        nullable: true
-        description: Log severity level (INFO, WARN, ERROR, etc.)
-        expr: {kind: path, path: [data, severity_text]}
-      - name: severity_number
-        type: Int64
-        nullable: true
-        description: Numeric severity level
-        expr: {kind: path, path: [data, severity_number]}
-      - name: trace_id
-        type: Utf8
-        nullable: true
-        description: Trace ID associated with this log entry
-        expr: {kind: path, path: [data, trace_id]}
-      - name: span_id
-        type: Utf8
-        nullable: true
-        description: Span ID associated with this log entry
-        expr: {kind: path, path: [data, span_id]}
-      - name: resources_string
+        description: Cursor for the next page of results
+        expr: {kind: path, path: [nextCursor]}
+      - name: rows
         type: Json
         nullable: true
-        description: Resource attributes as a JSON object
-        expr: {kind: path, path: [data, resources_string]}
-      - name: attributes_string
-        type: Json
-        nullable: true
-        description: Log attributes as a JSON object
-        expr: {kind: path, path: [data, attributes_string]}
+        description: Array of log row objects returned by this query
+        expr: {kind: path, path: [rows]}
       - name: start_time
         type: Int64
         nullable: true
@@ -234,92 +148,41 @@ tables:
     description: Search trace spans stored in SigNoz via the query_range API.
     guide: >
       Requires start_time and end_time filters (epoch milliseconds).
-      Returns raw span records ordered by timestamp descending.
-      If no rows come back, verify the time range contains trace data.
+      Returns result envelopes; the rows column contains the actual span
+      objects as a JSON array. If rows is null the time range has no data.
     request:
       method: POST
       path: /api/v5/query_range
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
       body:
-        format: json
-        fields:
-          - path: [start]
-            from: filter_int
-            key: start_time
-          - path: [end]
-            from: filter_int
-            key: end_time
-          - path: [requestType]
-            from: literal
-            value: raw
-          - path: [compositeQuery, queries]
-            from: literal
-            value:
-              - type: builder_query
-                spec:
-                  name: A
-                  signal: traces
-                  filter:
-                    expression: ""
-                  order:
-                    - key: {name: timestamp}
-                      direction: desc
-                  offset: 0
-                  limit: 100
+        format: text
+        content:
+          from: template
+          template: >-
+            {"start":{{filter.start_time}},"end":{{filter.end_time}},"requestType":"raw","compositeQuery":{"queries":[{"type":"builder_query","spec":{"name":"A","signal":"traces","filter":{"expression":""},"order":[{"key":{"name":"timestamp"},"direction":"desc"}],"offset":0,"limit":100}}]}}
     response:
-      rows_path: [data, newResult]
+      rows_path: [data, data, results]
     pagination:
       mode: none
     columns:
-      - name: timestamp
+      - name: query_name
         type: Utf8
         nullable: true
-        description: Span start timestamp (nanoseconds epoch as string)
-        expr: {kind: path, path: [timestamp]}
-      - name: traceID
+        description: Query name
+        expr: {kind: path, path: [queryName]}
+      - name: next_cursor
         type: Utf8
         nullable: true
-        description: Trace identifier grouping related spans
-        expr: {kind: path, path: [data, traceID]}
-      - name: spanID
-        type: Utf8
+        description: Cursor for the next page of results
+        expr: {kind: path, path: [nextCursor]}
+      - name: rows
+        type: Json
         nullable: true
-        description: Unique span identifier
-        expr: {kind: path, path: [data, spanID]}
-      - name: parentSpanID
-        type: Utf8
-        nullable: true
-        description: Parent span identifier
-        expr: {kind: path, path: [data, parentSpanID]}
-      - name: name
-        type: Utf8
-        nullable: true
-        description: Span operation name
-        expr: {kind: path, path: [data, name]}
-      - name: serviceName
-        type: Utf8
-        nullable: true
-        description: Service that emitted the span
-        expr: {kind: path, path: [data, serviceName]}
-      - name: durationNano
-        type: Int64
-        nullable: true
-        description: Span duration in nanoseconds
-        expr: {kind: path, path: [data, durationNano]}
-      - name: statusCode
-        type: Int64
-        nullable: true
-        description: Span status code (0=Unset, 1=Ok, 2=Error)
-        expr: {kind: path, path: [data, statusCode]}
-      - name: statusMessage
-        type: Utf8
-        nullable: true
-        description: Span status message
-        expr: {kind: path, path: [data, statusMessage]}
-      - name: kind
-        type: Int64
-        nullable: true
-        description: Span kind (0=Unspecified, 1=Internal, 2=Server, 3=Client, 4=Producer, 5=Consumer)
-        expr: {kind: path, path: [data, kind]}
+        description: Array of trace span objects returned by this query
+        expr: {kind: path, path: [rows]}
       - name: start_time
         type: Int64
         nullable: true
@@ -394,7 +257,7 @@ tables:
       method: GET
       path: /api/v1/rules
     response:
-      rows_path: [data]
+      rows_path: [data, rules]
     pagination:
       mode: none
     columns:

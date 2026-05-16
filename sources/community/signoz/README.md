@@ -2,7 +2,7 @@
 
 **Version:** 0.1.0
 **Backend:** HTTP
-**Tables:** 6
+**Tables:** 5
 **Base URL:** your SigNoz instance URL (set via `SIGNOZ_URL`)
 
 Query services, logs, traces, dashboards, and alerts from SigNoz
@@ -18,7 +18,7 @@ To create one:
 2. Click **New Service Account**, give it a name, and click **Create**.
 3. In the **Overview** tab, assign the **SigNoz-Viewer** role and click **Save**.
 4. Switch to the **Keys** tab, click **Add Key**, enter a name, and click **Create**.
-5. Copy the key immediately — it is shown only once.
+5. Copy the key immediately â€” it is shown only once.
 
 See the [SigNoz service accounts docs](https://signoz.io/docs/manage/administrator-guide/iam/service-accounts/).
 
@@ -38,19 +38,20 @@ SIGNOZ_API_KEY=<your-key> \
 
 ## Tables
 
-| Table | Description | Required filters | Optional filters |
-|---|---|---|---|
-| `services` | APM services reporting to SigNoz | — | — |
-| `operations` | Span operation names for a service | `service_name` | — |
-| `logs` | Log entries via query_range API | `start_time`, `end_time` | — |
-| `traces` | Trace spans via query_range API | `start_time`, `end_time` | — |
-| `dashboards` | Dashboards configured in SigNoz | — | — |
-| `alerts` | Alert rules configured in SigNoz | — | — |
+| Table | Description | Required filters |
+|---|---|---|
+| `services` | APM services reporting to SigNoz | â€” |
+| `logs` | Log query results via query_range API | `start_time`, `end_time` |
+| `traces` | Trace query results via query_range API | `start_time`, `end_time` |
+| `dashboards` | Dashboards configured in SigNoz | â€” |
+| `alerts` | Alert rules configured in SigNoz | â€” |
 
 ### Time filter note
 
 `start_time` and `end_time` on the `logs` and `traces` tables are **epoch milliseconds**.
-Each query returns up to 100 rows ordered by timestamp descending.
+Each query returns result envelopes from `data.data.results`; the `rows` column
+contains the actual log or span objects as JSON. Returns an empty result set when
+no data exists for the given time range.
 
 ## Quick start
 
@@ -62,29 +63,20 @@ coral sql "
   ORDER BY errorRate DESC
 "
 
-# List operations for a service
+# Search recent logs (supply epoch-ms timestamps)
 coral sql "
-  SELECT operation
-  FROM signoz.operations
-  WHERE service_name = 'frontend'
-"
-
-# Search recent error logs
-coral sql "
-  SELECT timestamp, body, severity_text, trace_id
+  SELECT queryName, nextCursor, rows
   FROM signoz.logs
   WHERE start_time = 1700000000000
     AND end_time   = 1700003600000
-  LIMIT 50
 "
 
 # Search recent trace spans
 coral sql "
-  SELECT timestamp, traceID, spanID, name, serviceName, durationNano, statusCode
+  SELECT queryName, nextCursor, rows
   FROM signoz.traces
   WHERE start_time = 1700000000000
     AND end_time   = 1700003600000
-  LIMIT 50
 "
 
 # List all dashboards
@@ -105,16 +97,17 @@ coral sql "
 
 ```text
 services
-  → serviceName
-    → operations (WHERE service_name = '...')
-    → traces     (WHERE start_time = ... AND end_time = ...)
+  â†’ serviceName
 
-logs
-  → trace_id → traces.traceID
+logs   (WHERE start_time = ... AND end_time = ...)
+  â†’ rows (JSON array of log objects)
+
+traces (WHERE start_time = ... AND end_time = ...)
+  â†’ rows (JSON array of span objects)
 
 dashboards
-  → uuid
+  â†’ uuid
 
 alerts
-  → id
+  â†’ id
 ```
