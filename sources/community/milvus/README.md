@@ -28,7 +28,7 @@ For a UI, install Attu:
 docker run -d --name attu -p 8000:3000 zilliz/attu:latest
 ```
 
-Open `http://localhost:3000`, set Address to `host.docker.internal:19530`, and click Connect.
+Open `http://localhost:8000`, set Address to `host.docker.internal:19530`, and click Connect.
 
 ### Authentication
 

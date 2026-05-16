@@ -250,7 +250,6 @@ tables:
     description: Roles defined in the Milvus instance.
     guide: >
       Lists all roles. Default roles are "admin" and "public".
-      Use role names to query role privileges.
     request:
       method: POST
       path: /v2/vectordb/roles/list
@@ -282,15 +281,13 @@ tables:
     request:
       method: POST
       path: /v2/vectordb/aliases/list
-      headers:
-        - name: Content-Type
-          from: literal
-          value: application/json
       body:
-        format: text
-        content:
-          from: literal
-          value: "{}"
+        format: json
+        fields:
+          - path: [dbName]
+            from: filter
+            key: db_name
+            default: default
     response:
       rows_path: [data]
     pagination:
