@@ -18,7 +18,7 @@ To create one:
 2. Click **New Service Account**, give it a name, and click **Create**.
 3. In the **Overview** tab, assign the **SigNoz-Viewer** role and click **Save**.
 4. Switch to the **Keys** tab, click **Add Key**, enter a name, and click **Create**.
-5. Copy the key immediately â€” it is shown only once.
+5. Copy the key immediately -- it is shown only once.
 
 See the [SigNoz service accounts docs](https://signoz.io/docs/manage/administrator-guide/iam/service-accounts/).
 
@@ -40,11 +40,11 @@ SIGNOZ_API_KEY=<your-key> \
 
 | Table | Description | Required filters |
 |---|---|---|
-| `services` | APM services reporting to SigNoz | â€” |
+| `services` | APM services reporting to SigNoz | -- |
 | `logs` | Log query results via query_range API | `start_time`, `end_time` |
 | `traces` | Trace query results via query_range API | `start_time`, `end_time` |
-| `dashboards` | Dashboards configured in SigNoz | â€” |
-| `alerts` | Alert rules configured in SigNoz | â€” |
+| `dashboards` | Dashboards configured in SigNoz | -- |
+| `alerts` | Alert rules configured in SigNoz | -- |
 
 ### Time filter note
 
@@ -65,7 +65,7 @@ coral sql "
 
 # Search recent logs (supply epoch-ms timestamps)
 coral sql "
-  SELECT queryName, nextCursor, rows
+  SELECT query_name, next_cursor, rows
   FROM signoz.logs
   WHERE start_time = 1700000000000
     AND end_time   = 1700003600000
@@ -73,7 +73,7 @@ coral sql "
 
 # Search recent trace spans
 coral sql "
-  SELECT queryName, nextCursor, rows
+  SELECT query_name, next_cursor, rows
   FROM signoz.traces
   WHERE start_time = 1700000000000
     AND end_time   = 1700003600000
@@ -97,17 +97,17 @@ coral sql "
 
 ```text
 services
-  â†’ serviceName
+  -> serviceName
 
 logs   (WHERE start_time = ... AND end_time = ...)
-  â†’ rows (JSON array of log objects)
+  -> rows (JSON array of log objects)
 
 traces (WHERE start_time = ... AND end_time = ...)
-  â†’ rows (JSON array of span objects)
+  -> rows (JSON array of span objects)
 
 dashboards
-  â†’ uuid
+  -> uuid
 
 alerts
-  â†’ id
+  -> id
 ```
