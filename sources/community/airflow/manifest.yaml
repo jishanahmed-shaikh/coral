@@ -840,8 +840,8 @@ tables:
     guide: |
       Each row is one connection. `conn_type` is the connection type
       (e.g. postgres, http, aws, gcp). `host`, `schema`, and `port` are
-      the connection target. Passwords are never returned by the API --
-      the `password` field is always NULL. Use connections to audit what
+      the connection target. Passwords are never returned by the Airflow
+      API and are not exposed as a column. Use connections to audit what
       external systems Airflow is configured to reach.
     fetch_limit_default: 100
     request:
