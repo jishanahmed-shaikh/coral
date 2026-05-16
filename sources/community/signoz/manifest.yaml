@@ -1,0 +1,445 @@
+name: signoz
+version: 0.1.0
+dsl_version: 3
+backend: http
+description: >-
+  Query services, logs, traces, dashboards, and alerts from SigNoz
+  (Cloud or self-hosted).
+inputs:
+  SIGNOZ_URL:
+    kind: variable
+    hint: |
+      Base URL of your SigNoz instance, for example `https://signoz.example.com`
+      or `http://localhost:3301`.
+      For SigNoz Cloud, use your cloud instance URL.
+  SIGNOZ_API_KEY:
+    kind: secret
+    hint: |
+      Service account API key for SigNoz. Generate one in
+      Settings > Service Accounts: create a service account, assign it the
+      SigNoz-Viewer role, then open its Keys tab and click Add Key.
+      The key is shown only once at creation time.
+      See https://signoz.io/docs/manage/administrator-guide/iam/service-accounts/
+base_url: "{{input.SIGNOZ_URL}}"
+auth:
+  type: HeaderAuth
+  headers:
+    - name: SIGNOZ-API-KEY
+      from: input
+      key: SIGNOZ_API_KEY
+
+test_queries:
+  - SELECT * FROM signoz.services LIMIT 1
+
+tables:
+  - name: services
+    description: APM services instrumented and reporting to SigNoz.
+    guide: >
+      Start here to get a list of all services sending traces to SigNoz.
+      Use serviceName values from this table as filters in the operations table.
+    request:
+      method: GET
+      path: /api/v1/services
+      query:
+        - name: start
+          from: now_epoch_minus_seconds
+          seconds: 3600
+        - name: end
+          from: now_epoch_minus_seconds
+          seconds: 0
+    response:
+      rows_path: [data]
+    pagination:
+      mode: none
+    columns:
+      - name: serviceName
+        type: Utf8
+        nullable: true
+        description: Name of the service
+        expr: {kind: path, path: [serviceName]}
+      - name: p99
+        type: Float64
+        nullable: true
+        description: P99 latency in milliseconds
+        expr: {kind: path, path: [p99]}
+      - name: avgDuration
+        type: Float64
+        nullable: true
+        description: Average request duration in milliseconds
+        expr: {kind: path, path: [avgDuration]}
+      - name: numCalls
+        type: Int64
+        nullable: true
+        description: Total number of calls in the time window
+        expr: {kind: path, path: [numCalls]}
+      - name: callRate
+        type: Float64
+        nullable: true
+        description: Calls per second
+        expr: {kind: path, path: [callRate]}
+      - name: numErrors
+        type: Int64
+        nullable: true
+        description: Number of errors in the time window
+        expr: {kind: path, path: [numErrors]}
+      - name: errorRate
+        type: Float64
+        nullable: true
+        description: Error rate as a fraction of total calls
+        expr: {kind: path, path: [errorRate]}
+
+  - name: operations
+    description: Operations (span names) for a given service in SigNoz APM.
+    guide: >
+      Requires a service_name filter. Use serviceName values from the services
+      table. Returns the list of operation names seen for that service.
+    request:
+      method: GET
+      path: /api/v1/services/{{filter.service_name}}/operations
+      query:
+        - name: start
+          from: now_epoch_minus_seconds
+          seconds: 3600
+        - name: end
+          from: now_epoch_minus_seconds
+          seconds: 0
+    response:
+      rows_path: [data]
+    pagination:
+      mode: none
+    columns:
+      - name: operation
+        type: Utf8
+        nullable: true
+        description: Operation name
+        expr: {kind: current_row}
+      - name: service_name
+        type: Utf8
+        nullable: true
+        description: Service name (echoes the required filter)
+        expr: {kind: from_filter, key: service_name}
+        virtual: true
+    filters:
+      - name: service_name
+        required: true
+
+  - name: logs
+    description: Search logs stored in SigNoz via the query_range API.
+    guide: >
+      Requires start_time and end_time filters (epoch milliseconds).
+      Returns up to 100 log entries per query ordered by timestamp descending.
+      The response wraps results under data.result[].list; rows_path targets
+      data.newResult which is a flattened list available in newer SigNoz builds.
+      If no rows come back, verify the time range contains log data.
+    request:
+      method: POST
+      path: /api/v5/query_range
+      body:
+        format: json
+        fields:
+          - path: [start]
+            from: filter_int
+            key: start_time
+          - path: [end]
+            from: filter_int
+            key: end_time
+          - path: [requestType]
+            from: literal
+            value: raw
+          - path: [compositeQuery, queries]
+            from: literal
+            value:
+              - type: builder_query
+                spec:
+                  name: A
+                  signal: logs
+                  filter:
+                    expression: ""
+                  order:
+                    - key: {name: timestamp}
+                      direction: desc
+                    - key: {name: id}
+                      direction: desc
+                  offset: 0
+                  limit: 100
+    response:
+      rows_path: [data, newResult]
+    pagination:
+      mode: none
+    columns:
+      - name: timestamp
+        type: Utf8
+        nullable: true
+        description: Log event timestamp (nanoseconds epoch as string)
+        expr: {kind: path, path: [timestamp]}
+      - name: id
+        type: Utf8
+        nullable: true
+        description: Unique log entry identifier
+        expr: {kind: path, path: [data, id]}
+      - name: body
+        type: Utf8
+        nullable: true
+        description: Log message body
+        expr: {kind: path, path: [data, body]}
+      - name: severity_text
+        type: Utf8
+        nullable: true
+        description: Log severity level (INFO, WARN, ERROR, etc.)
+        expr: {kind: path, path: [data, severity_text]}
+      - name: severity_number
+        type: Int64
+        nullable: true
+        description: Numeric severity level
+        expr: {kind: path, path: [data, severity_number]}
+      - name: trace_id
+        type: Utf8
+        nullable: true
+        description: Trace ID associated with this log entry
+        expr: {kind: path, path: [data, trace_id]}
+      - name: span_id
+        type: Utf8
+        nullable: true
+        description: Span ID associated with this log entry
+        expr: {kind: path, path: [data, span_id]}
+      - name: resources_string
+        type: Json
+        nullable: true
+        description: Resource attributes as a JSON object
+        expr: {kind: path, path: [data, resources_string]}
+      - name: attributes_string
+        type: Json
+        nullable: true
+        description: Log attributes as a JSON object
+        expr: {kind: path, path: [data, attributes_string]}
+      - name: start_time
+        type: Int64
+        nullable: true
+        description: Query start time in epoch milliseconds (virtual filter, required)
+        expr: {kind: 'null'}
+        virtual: true
+      - name: end_time
+        type: Int64
+        nullable: true
+        description: Query end time in epoch milliseconds (virtual filter, required)
+        expr: {kind: 'null'}
+        virtual: true
+    filters:
+      - name: start_time
+        required: true
+      - name: end_time
+        required: true
+
+  - name: traces
+    description: Search trace spans stored in SigNoz via the query_range API.
+    guide: >
+      Requires start_time and end_time filters (epoch milliseconds).
+      Returns raw span records ordered by timestamp descending.
+      If no rows come back, verify the time range contains trace data.
+    request:
+      method: POST
+      path: /api/v5/query_range
+      body:
+        format: json
+        fields:
+          - path: [start]
+            from: filter_int
+            key: start_time
+          - path: [end]
+            from: filter_int
+            key: end_time
+          - path: [requestType]
+            from: literal
+            value: raw
+          - path: [compositeQuery, queries]
+            from: literal
+            value:
+              - type: builder_query
+                spec:
+                  name: A
+                  signal: traces
+                  filter:
+                    expression: ""
+                  order:
+                    - key: {name: timestamp}
+                      direction: desc
+                  offset: 0
+                  limit: 100
+    response:
+      rows_path: [data, newResult]
+    pagination:
+      mode: none
+    columns:
+      - name: timestamp
+        type: Utf8
+        nullable: true
+        description: Span start timestamp (nanoseconds epoch as string)
+        expr: {kind: path, path: [timestamp]}
+      - name: traceID
+        type: Utf8
+        nullable: true
+        description: Trace identifier grouping related spans
+        expr: {kind: path, path: [data, traceID]}
+      - name: spanID
+        type: Utf8
+        nullable: true
+        description: Unique span identifier
+        expr: {kind: path, path: [data, spanID]}
+      - name: parentSpanID
+        type: Utf8
+        nullable: true
+        description: Parent span identifier
+        expr: {kind: path, path: [data, parentSpanID]}
+      - name: name
+        type: Utf8
+        nullable: true
+        description: Span operation name
+        expr: {kind: path, path: [data, name]}
+      - name: serviceName
+        type: Utf8
+        nullable: true
+        description: Service that emitted the span
+        expr: {kind: path, path: [data, serviceName]}
+      - name: durationNano
+        type: Int64
+        nullable: true
+        description: Span duration in nanoseconds
+        expr: {kind: path, path: [data, durationNano]}
+      - name: statusCode
+        type: Int64
+        nullable: true
+        description: Span status code (0=Unset, 1=Ok, 2=Error)
+        expr: {kind: path, path: [data, statusCode]}
+      - name: statusMessage
+        type: Utf8
+        nullable: true
+        description: Span status message
+        expr: {kind: path, path: [data, statusMessage]}
+      - name: kind
+        type: Int64
+        nullable: true
+        description: Span kind (0=Unspecified, 1=Internal, 2=Server, 3=Client, 4=Producer, 5=Consumer)
+        expr: {kind: path, path: [data, kind]}
+      - name: start_time
+        type: Int64
+        nullable: true
+        description: Query start time in epoch milliseconds (virtual filter, required)
+        expr: {kind: 'null'}
+        virtual: true
+      - name: end_time
+        type: Int64
+        nullable: true
+        description: Query end time in epoch milliseconds (virtual filter, required)
+        expr: {kind: 'null'}
+        virtual: true
+    filters:
+      - name: start_time
+        required: true
+      - name: end_time
+        required: true
+
+  - name: dashboards
+    description: Dashboards configured in SigNoz.
+    guide: >
+      Returns all dashboards. No filters required.
+    request:
+      method: GET
+      path: /api/v1/dashboards
+    response:
+      rows_path: [data]
+    pagination:
+      mode: none
+    columns:
+      - name: uuid
+        type: Utf8
+        nullable: true
+        description: Dashboard UUID
+        expr: {kind: path, path: [uuid]}
+      - name: title
+        type: Utf8
+        nullable: true
+        description: Dashboard title
+        expr: {kind: path, path: [data, title]}
+      - name: description
+        type: Utf8
+        nullable: true
+        description: Dashboard description
+        expr: {kind: path, path: [data, description]}
+      - name: created_at
+        type: Utf8
+        nullable: true
+        description: Creation timestamp
+        expr: {kind: path, path: [created_at]}
+      - name: updated_at
+        type: Utf8
+        nullable: true
+        description: Last updated timestamp
+        expr: {kind: path, path: [updated_at]}
+      - name: created_by
+        type: Utf8
+        nullable: true
+        description: Email of the user who created the dashboard
+        expr: {kind: path, path: [created_by]}
+      - name: updated_by
+        type: Utf8
+        nullable: true
+        description: Email of the user who last updated the dashboard
+        expr: {kind: path, path: [updated_by]}
+
+  - name: alerts
+    description: Alert rules configured in SigNoz.
+    guide: >
+      Returns all alert rules. No filters required.
+    request:
+      method: GET
+      path: /api/v1/rules
+    response:
+      rows_path: [data]
+    pagination:
+      mode: none
+    columns:
+      - name: id
+        type: Int64
+        nullable: true
+        description: Alert rule ID
+        expr: {kind: path, path: [id]}
+      - name: alert
+        type: Utf8
+        nullable: true
+        description: Alert rule name
+        expr: {kind: path, path: [alert]}
+      - name: alertType
+        type: Utf8
+        nullable: true
+        description: Alert type (METRIC_BASED_ALERT, LOG_BASED_ALERT, TRACES_BASED_ALERT, etc.)
+        expr: {kind: path, path: [alertType]}
+      - name: state
+        type: Utf8
+        nullable: true
+        description: Current alert state (firing, inactive, etc.)
+        expr: {kind: path, path: [state]}
+      - name: severity
+        type: Utf8
+        nullable: true
+        description: Alert severity label
+        expr: {kind: path, path: [labels, severity]}
+      - name: description
+        type: Utf8
+        nullable: true
+        description: Alert description annotation
+        expr: {kind: path, path: [annotations, description]}
+      - name: created_at
+        type: Utf8
+        nullable: true
+        description: Creation timestamp
+        expr: {kind: path, path: [createAt]}
+      - name: updated_at
+        type: Utf8
+        nullable: true
+        description: Last updated timestamp
+        expr: {kind: path, path: [updateAt]}
+      - name: disabled
+        type: Boolean
+        nullable: true
+        description: Whether the alert rule is disabled
+        expr: {kind: path, path: [disabled]}
