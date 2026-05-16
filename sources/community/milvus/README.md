@@ -66,7 +66,7 @@ MILVUS_TOKEN=none \
 | `partitions` | Partitions within a collection | `collection_name` | `db_name` |
 | `users` | Users in the internal auth database | -- | -- |
 | `roles` | Roles defined in the instance | -- | -- |
-| `aliases` | Collection aliases | -- | -- |
+| `aliases` | Collection aliases | -- | `db_name` |
 
 ## Quick start
 
