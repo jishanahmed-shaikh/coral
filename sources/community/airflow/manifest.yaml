@@ -758,7 +758,7 @@ tables:
           path:
             - trigger_rule
       - name: retries
-        type: Float64
+        type: Int64
         nullable: true
         description: Number of retries configured for this task.
         expr:
@@ -774,7 +774,7 @@ tables:
           path:
             - pool
       - name: pool_slots
-        type: Float64
+        type: Int64
         nullable: true
         description: Number of pool slots this task occupies when running.
         expr:
@@ -790,7 +790,7 @@ tables:
           path:
             - queue
       - name: priority_weight
-        type: Float64
+        type: Int64
         nullable: true
         description: Task priority weight for scheduling.
         expr:
