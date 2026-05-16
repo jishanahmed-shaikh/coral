@@ -16,10 +16,10 @@ inputs:
     kind: secret
     hint: |
       Authentication token for Milvus. For a default local instance with no
-      auth, set this to an empty string or any placeholder value.
-      For Milvus with username/password auth, use the format
-      `username:password` encoded as a Base64 string, or provide a Zilliz
-      Cloud API key directly.
+      auth, set this to any non-empty placeholder value (e.g. `none`).
+      For Milvus with username/password auth, use the plaintext format
+      `username:password` (e.g. `root:milvus`). Do not Base64-encode it.
+      For Zilliz Cloud, use your API key directly.
       See https://milvus.io/docs/authenticate.md
 
 base_url: "{{input.MILVUS_URL}}"
