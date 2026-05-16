@@ -3,8 +3,8 @@ version: 0.2.0
 dsl_version: 3
 backend: http
 description: >-
-  Query DAGs, DAG runs, task instances, tasks, connections, pools, variables,
-  and providers from Apache Airflow (self-hosted). Covers pipeline inventory,
+  Query DAGs, DAG runs, task instances, tasks, connections, pools, and
+  providers from Apache Airflow (self-hosted). Covers pipeline inventory,
   execution history, task-level telemetry, infrastructure configuration, and
   installed provider packages via the Airflow REST API v2.
 inputs:
@@ -444,7 +444,9 @@ tables:
       at 1. `duration` is in seconds. `map_index` is -1 for non-mapped tasks
       and >= 0 for dynamically mapped task instances.
       Filter by `dag_id` or `dag_run_id` to scope results. Join to
-      `airflow.dag_runs` on `dag_run_id` and to `airflow.dags` on `dag_id`.
+      `airflow.dags` on `dag_id`. When joining to `airflow.dag_runs`, always
+      include both `dag_id` and `dag_run_id` -- `dag_run_id` alone is not
+      globally unique across DAGs and can produce false matches.
     filters:
       - name: dag_id
         required: false

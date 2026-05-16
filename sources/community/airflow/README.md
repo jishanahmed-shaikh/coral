@@ -219,7 +219,7 @@ FROM airflow.dags
 ORDER BY dag_id
 ```
 
-### Find failed DAG runs in the last 7 days
+### Find failed DAG runs
 
 ```sql
 SELECT dag_id, dag_run_id, start_date, duration
