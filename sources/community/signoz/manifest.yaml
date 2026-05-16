@@ -94,8 +94,10 @@ tables:
     guide: >
       Requires start_time and end_time filters (epoch milliseconds).
       Each query returns a single result envelope row. The rows column is a
-      JSON array of log objects -- use JSON extraction to access individual
-      fields. If rows is null the time range has no log data.
+      JSON array of up to 1000 log objects -- use JSON extraction to access
+      individual fields. Narrow the time range to stay within this cap.
+      If rows is null the time range has no log data.
+    fetch_limit_default: 1000
     request:
       method: POST
       path: /api/v5/query_range
@@ -108,7 +110,7 @@ tables:
         content:
           from: template
           template: >-
-            {"start":{{filter.start_time}},"end":{{filter.end_time}},"requestType":"raw","compositeQuery":{"queries":[{"type":"builder_query","spec":{"name":"A","signal":"logs","filter":{"expression":""},"order":[{"key":{"name":"timestamp"},"direction":"desc"},{"key":{"name":"id"},"direction":"desc"}],"offset":0,"limit":100}}]}}
+            {"start":{{filter.start_time}},"end":{{filter.end_time}},"requestType":"raw","compositeQuery":{"queries":[{"type":"builder_query","spec":{"name":"A","signal":"logs","filter":{"expression":""},"order":[{"key":{"name":"timestamp"},"direction":"desc"},{"key":{"name":"id"},"direction":"desc"}],"offset":0,"limit":1000}}]}}
     response:
       rows_path: [data, data, results]
     pagination:
@@ -154,8 +156,10 @@ tables:
     guide: >
       Requires start_time and end_time filters (epoch milliseconds).
       Each query returns a single result envelope row. The rows column is a
-      JSON array of span objects -- use JSON extraction to access individual
-      fields. If rows is null the time range has no trace data.
+      JSON array of up to 1000 span objects -- use JSON extraction to access
+      individual fields. Narrow the time range to stay within this cap.
+      If rows is null the time range has no trace data.
+    fetch_limit_default: 1000
     request:
       method: POST
       path: /api/v5/query_range
@@ -168,7 +172,7 @@ tables:
         content:
           from: template
           template: >-
-            {"start":{{filter.start_time}},"end":{{filter.end_time}},"requestType":"raw","compositeQuery":{"queries":[{"type":"builder_query","spec":{"name":"A","signal":"traces","filter":{"expression":""},"order":[{"key":{"name":"timestamp"},"direction":"desc"}],"offset":0,"limit":100}}]}}
+            {"start":{{filter.start_time}},"end":{{filter.end_time}},"requestType":"raw","compositeQuery":{"queries":[{"type":"builder_query","spec":{"name":"A","signal":"traces","filter":{"expression":""},"order":[{"key":{"name":"timestamp"},"direction":"desc"}],"offset":0,"limit":1000}}]}}
     response:
       rows_path: [data, data, results]
     pagination:
