@@ -51,7 +51,7 @@ tables:
     pagination:
       mode: none
     columns:
-      - name: serviceName
+      - name: service_name
         type: Utf8
         nullable: true
         description: Name of the service
@@ -61,38 +61,41 @@ tables:
         nullable: true
         description: P99 latency in milliseconds
         expr: {kind: path, path: [p99]}
-      - name: avgDuration
+      - name: avg_duration
         type: Float64
         nullable: true
         description: Average request duration in milliseconds
         expr: {kind: path, path: [avgDuration]}
-      - name: numCalls
+      - name: num_calls
         type: Int64
         nullable: true
         description: Total number of calls in the time window
         expr: {kind: path, path: [numCalls]}
-      - name: callRate
+      - name: call_rate
         type: Float64
         nullable: true
         description: Calls per second
         expr: {kind: path, path: [callRate]}
-      - name: numErrors
+      - name: num_errors
         type: Int64
         nullable: true
         description: Number of errors in the time window
         expr: {kind: path, path: [numErrors]}
-      - name: errorRate
+      - name: error_rate
         type: Float64
         nullable: true
         description: Error rate as a fraction of total calls
         expr: {kind: path, path: [errorRate]}
 
   - name: logs
-    description: Search logs stored in SigNoz via the query_range API.
+    description: >-
+      Search logs stored in SigNoz via the query_range API. Returns one result
+      envelope per query; individual log fields are in the rows JSON column.
     guide: >
       Requires start_time and end_time filters (epoch milliseconds).
-      Returns result envelopes; the rows column contains the actual log
-      objects as a JSON array. If rows is null the time range has no data.
+      Each query returns a single result envelope row. The rows column is a
+      JSON array of log objects -- use JSON extraction to access individual
+      fields. If rows is null the time range has no log data.
     request:
       method: POST
       path: /api/v5/query_range
@@ -145,11 +148,14 @@ tables:
         required: true
 
   - name: traces
-    description: Search trace spans stored in SigNoz via the query_range API.
+    description: >-
+      Search trace spans stored in SigNoz via the query_range API. Returns one
+      result envelope per query; individual span fields are in the rows JSON column.
     guide: >
       Requires start_time and end_time filters (epoch milliseconds).
-      Returns result envelopes; the rows column contains the actual span
-      objects as a JSON array. If rows is null the time range has no data.
+      Each query returns a single result envelope row. The rows column is a
+      JSON array of span objects -- use JSON extraction to access individual
+      fields. If rows is null the time range has no trace data.
     request:
       method: POST
       path: /api/v5/query_range
@@ -271,7 +277,7 @@ tables:
         nullable: true
         description: Alert rule name
         expr: {kind: path, path: [alert]}
-      - name: alertType
+      - name: alert_type
         type: Utf8
         nullable: true
         description: Alert type (METRIC_BASED_ALERT, LOG_BASED_ALERT, TRACES_BASED_ALERT, etc.)

@@ -58,9 +58,9 @@ no data exists for the given time range.
 ```bash
 # List all instrumented services
 coral sql "
-  SELECT serviceName, p99, avgDuration, numCalls, errorRate
+  SELECT service_name, p99, avg_duration, num_calls, error_rate
   FROM signoz.services
-  ORDER BY errorRate DESC
+  ORDER BY error_rate DESC
 "
 
 # Search recent logs (supply epoch-ms timestamps)
@@ -87,7 +87,7 @@ coral sql "
 
 # List all alert rules
 coral sql "
-  SELECT id, alert, alertType, state, severity, disabled
+  SELECT id, alert, alert_type, state, severity, disabled
   FROM signoz.alerts
   ORDER BY state, alert
 "
