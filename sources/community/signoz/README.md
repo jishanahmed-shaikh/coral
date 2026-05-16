@@ -97,7 +97,7 @@ coral sql "
 
 ```text
 services
-  -> serviceName
+  -> service_name
 
 logs   (WHERE start_time = ... AND end_time = ...)
   -> rows (JSON array of log objects)
