@@ -88,10 +88,13 @@ docker exec --workdir /opt/kafka/bin/ -it kafka sh
 
 ## Configuration
 
-| Input              | Kind     | Required | Description                                                                                   |
-|--------------------|----------|----------|-----------------------------------------------------------------------------------------------|
-| `KAFKA_UI_URL`     | variable | yes      | Base URL of your Kafka UI instance, e.g. `http://localhost:8080`                              |
-| `KAFKA_UI_CLUSTER` | variable | yes      | Cluster name as configured in Kafka UI, e.g. `local` (the `KAFKA_CLUSTERS_0_NAME` value)     |
+| Input          | Kind     | Required | Description                                                      |
+|----------------|----------|----------|------------------------------------------------------------------|
+| `KAFKA_UI_URL` | variable | yes      | Base URL of your Kafka UI instance, e.g. `http://localhost:8080` |
+
+The cluster name is not a global config — it is passed per query as the
+`cluster_name` filter. Use `SELECT * FROM kafka.clusters` to discover the
+names available in your Kafka UI instance.
 
 ## Schema
 

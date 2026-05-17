@@ -13,13 +13,6 @@ inputs:
       Base URL of your Kafka UI instance, for example `http://localhost:8080`.
       Kafka UI exposes a REST API that Coral uses to query cluster metadata.
       See https://github.com/provectus/kafka-ui for setup instructions.
-  KAFKA_UI_CLUSTER:
-    kind: variable
-    hint: |
-      Name of the Kafka cluster as configured in Kafka UI, for example `local`.
-      This is the cluster name shown in the Kafka UI sidebar and set via the
-      `KAFKA_CLUSTERS_0_NAME` environment variable when running Kafka UI with
-      Docker.
 
 base_url: "{{input.KAFKA_UI_URL}}"
 
