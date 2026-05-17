@@ -1,0 +1,455 @@
+name: neo4j
+version: 0.1.0
+dsl_version: 3
+backend: http
+description: >-
+  Query nodes, relationships, indexes, and constraints from Neo4j graph
+  databases via the HTTP transactional API (self-hosted or Aura).
+
+inputs:
+  NEO4J_URL:
+    kind: variable
+    default: http://localhost:7474
+    hint: |
+      Base URL of your Neo4j HTTP interface, including scheme and port.
+      Default is `http://localhost:7474` for a local instance.
+      For Neo4j Aura use `https://<instance>.databases.neo4j.io`.
+      Do not include a trailing slash.
+  NEO4J_USERNAME:
+    kind: variable
+    default: neo4j
+    hint: |
+      Neo4j username. Defaults to `neo4j`. The user needs read access
+      to the target database.
+  NEO4J_PASSWORD:
+    kind: secret
+    hint: |
+      Password for the Neo4j user. Set via `NEO4J_AUTH=neo4j/<password>`
+      when running with Docker, for example `NEO4J_AUTH=neo4j/password`.
+
+base_url: "{{input.NEO4J_URL}}"
+
+auth:
+  type: BasicAuth
+  username: "{{input.NEO4J_USERNAME}}"
+  password: "{{input.NEO4J_PASSWORD}}"
+
+test_queries:
+  - SELECT * FROM neo4j.node_labels LIMIT 5
+  - SELECT * FROM neo4j.users LIMIT 5
+
+tables:
+  - name: node_labels
+    description: Node labels defined in the Neo4j database.
+    guide: >
+      Returns one row per node label. Use label values from this table
+      to understand the graph schema before querying node tables.
+      No filter required.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"MATCH (n) WITH DISTINCT labels(n) AS lbls UNWIND lbls AS label WITH DISTINCT label ORDER BY label RETURN {rows: collect({label: label})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: label
+        type: Utf8
+        nullable: false
+        description: Node label name.
+        expr: {kind: path, path: [label]}
+
+  - name: relationship_types
+    description: Relationship types defined in the Neo4j database.
+    guide: >
+      Returns one row per relationship type. Use these values to understand
+      the graph topology before querying the relationships table.
+      No filter required.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"MATCH ()-[r]->() WITH DISTINCT type(r) AS rel_type WITH DISTINCT rel_type ORDER BY rel_type RETURN {rows: collect({relationship_type: rel_type})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: relationship_type
+        type: Utf8
+        nullable: false
+        description: Relationship type name.
+        expr: {kind: path, path: [relationship_type]}
+
+  - name: users
+    description: User nodes in the Neo4j graph.
+    guide: >
+      Returns all nodes with the User label. Each row has id, name, and email.
+      No filter required.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"MATCH (n:User) RETURN {rows: collect({id: n.id, name: n.name, email: n.email})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: id
+        type: Int64
+        nullable: false
+        description: User node ID.
+        expr: {kind: path, path: [id]}
+      - name: name
+        type: Utf8
+        nullable: true
+        description: User display name.
+        expr: {kind: path, path: [name]}
+      - name: email
+        type: Utf8
+        nullable: true
+        description: User email address.
+        expr: {kind: path, path: [email]}
+
+  - name: organizations
+    description: Organization nodes in the Neo4j graph.
+    guide: >
+      Returns all nodes with the Organization label. Each row has id and name.
+      No filter required.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"MATCH (n:Organization) RETURN {rows: collect({id: n.id, name: n.name})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: id
+        type: Int64
+        nullable: false
+        description: Organization node ID.
+        expr: {kind: path, path: [id]}
+      - name: name
+        type: Utf8
+        nullable: true
+        description: Organization name.
+        expr: {kind: path, path: [name]}
+
+  - name: products
+    description: Product nodes in the Neo4j graph.
+    guide: >
+      Returns all nodes with the Product label. Each row has id, name, and
+      category. No filter required.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"MATCH (n:Product) RETURN {rows: collect({id: n.id, name: n.name, category: n.category})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: id
+        type: Int64
+        nullable: false
+        description: Product node ID.
+        expr: {kind: path, path: [id]}
+      - name: name
+        type: Utf8
+        nullable: true
+        description: Product name.
+        expr: {kind: path, path: [name]}
+      - name: category
+        type: Utf8
+        nullable: true
+        description: Product category (e.g. GPU, Laptop, VR).
+        expr: {kind: path, path: [category]}
+
+  - name: orders
+    description: Order nodes in the Neo4j graph.
+    guide: >
+      Returns all nodes with the Order label. Each row has id and total.
+      Join with relationships to see which users placed orders and which
+      products they contain.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"MATCH (n:Order) RETURN {rows: collect({id: n.id, total: n.total})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: id
+        type: Int64
+        nullable: false
+        description: Order node ID.
+        expr: {kind: path, path: [id]}
+      - name: total
+        type: Float64
+        nullable: true
+        description: Order total value.
+        expr: {kind: path, path: [total]}
+
+  - name: technologies
+    description: Technology nodes in the Neo4j graph.
+    guide: >
+      Returns all nodes with the Technology label. Each row has a name.
+      No filter required.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"MATCH (n:Technology) RETURN {rows: collect({name: n.name})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: name
+        type: Utf8
+        nullable: false
+        description: Technology name.
+        expr: {kind: path, path: [name]}
+
+  - name: relationships
+    description: All relationships in the Neo4j graph with source and target node info.
+    guide: >
+      Returns all relationships with from_label, from_id, rel_type, to_label,
+      and to_id. Use rel_type values from the relationship_types table to
+      understand the topology. Filter results in SQL using WHERE rel_type = '...'
+      (e.g. WORKS_AT, PLACED, CONTAINS, USES, INTERESTED_IN). For very large
+      graphs, add a WHERE clause to avoid scanning all relationships.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"MATCH (a)-[r]->(b) RETURN {rows: collect({from_label: labels(a)[0], from_id: coalesce(toString(a.id), a.name), rel_type: type(r), to_label: labels(b)[0], to_id: coalesce(toString(b.id), b.name)})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: from_label
+        type: Utf8
+        nullable: true
+        description: Label of the source node.
+        expr: {kind: path, path: [from_label]}
+      - name: from_id
+        type: Utf8
+        nullable: true
+        description: ID or name of the source node (coalesced to string).
+        expr: {kind: path, path: [from_id]}
+      - name: rel_type
+        type: Utf8
+        nullable: false
+        description: Relationship type (e.g. WORKS_AT, PLACED, CONTAINS, USES, INTERESTED_IN).
+        expr: {kind: path, path: [rel_type]}
+      - name: to_label
+        type: Utf8
+        nullable: true
+        description: Label of the target node.
+        expr: {kind: path, path: [to_label]}
+      - name: to_id
+        type: Utf8
+        nullable: true
+        description: ID or name of the target node (coalesced to string).
+        expr: {kind: path, path: [to_id]}
+
+  - name: indexes
+    description: Indexes defined in the Neo4j database.
+    guide: >
+      Returns all indexes including LOOKUP, RANGE, TEXT, and POINT types.
+      The labels_or_types column contains the node label or relationship type
+      the index applies to. The properties column lists the indexed properties.
+      No filter required.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"SHOW INDEXES YIELD name, type, state, labelsOrTypes, properties, entityType RETURN {rows: collect({name: name, type: type, state: state, labels_or_types: labelsOrTypes, properties: properties, entity_type: entityType})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: name
+        type: Utf8
+        nullable: false
+        description: Index name.
+        expr: {kind: path, path: [name]}
+      - name: type
+        type: Utf8
+        nullable: true
+        description: Index type (LOOKUP, RANGE, TEXT, POINT, FULLTEXT).
+        expr: {kind: path, path: [type]}
+      - name: state
+        type: Utf8
+        nullable: true
+        description: Index state (ONLINE, POPULATING, FAILED).
+        expr: {kind: path, path: [state]}
+      - name: entity_type
+        type: Utf8
+        nullable: true
+        description: Entity type the index applies to (NODE or RELATIONSHIP).
+        expr: {kind: path, path: [entity_type]}
+      - name: labels_or_types
+        type: Json
+        nullable: true
+        description: Node labels or relationship types covered by the index.
+        expr: {kind: path, path: [labels_or_types]}
+      - name: properties
+        type: Json
+        nullable: true
+        description: Properties covered by the index.
+        expr: {kind: path, path: [properties]}
+
+  - name: constraints
+    description: Constraints defined in the Neo4j database.
+    guide: >
+      Returns all constraints including uniqueness and existence constraints.
+      The labels_or_types column contains the node label or relationship type
+      the constraint applies to. The properties column lists the constrained
+      properties. No filter required.
+    request:
+      method: POST
+      path: /db/neo4j/tx/commit
+      headers:
+        - name: Content-Type
+          from: literal
+          value: application/json
+        - name: Accept
+          from: literal
+          value: application/json
+      body:
+        format: text
+        content:
+          from: literal
+          value: '{"statements":[{"statement":"SHOW CONSTRAINTS YIELD name, type, entityType, labelsOrTypes, properties RETURN {rows: collect({name: name, type: type, entity_type: entityType, labels_or_types: labelsOrTypes, properties: properties})} AS result"}]}'
+    response:
+      rows_path: [results, "0", data, "0", row, "0", rows]
+    pagination:
+      mode: none
+    columns:
+      - name: name
+        type: Utf8
+        nullable: false
+        description: Constraint name.
+        expr: {kind: path, path: [name]}
+      - name: type
+        type: Utf8
+        nullable: true
+        description: Constraint type (e.g. NODE_PROPERTY_UNIQUENESS, NODE_PROPERTY_EXISTENCE).
+        expr: {kind: path, path: [type]}
+      - name: entity_type
+        type: Utf8
+        nullable: true
+        description: Entity type the constraint applies to (NODE or RELATIONSHIP).
+        expr: {kind: path, path: [entity_type]}
+      - name: labels_or_types
+        type: Json
+        nullable: true
+        description: Node labels or relationship types covered by the constraint.
+        expr: {kind: path, path: [labels_or_types]}
+      - name: properties
+        type: Json
+        nullable: true
+        description: Properties covered by the constraint.
+        expr: {kind: path, path: [properties]}
