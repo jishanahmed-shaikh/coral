@@ -59,7 +59,8 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"MATCH (n) WITH DISTINCT labels(n) AS lbls UNWIND lbls AS label WITH DISTINCT label ORDER BY label RETURN {rows: collect({label: label})} AS result"}]}'
+          value: |-
+            {"statements":[{"statement":"MATCH (n) UNWIND labels(n) AS l WITH DISTINCT l ORDER BY l RETURN {rows:collect({label:l})} AS x"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -91,7 +92,8 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"MATCH ()-[r]->() WITH DISTINCT type(r) AS rel_type WITH DISTINCT rel_type ORDER BY rel_type RETURN {rows: collect({relationship_type: rel_type})} AS result"}]}'
+          value: |-
+            {"statements":[{"statement":"MATCH ()-[r]->() WITH DISTINCT type(r) AS t ORDER BY t RETURN {rows:collect({t:t})} AS x"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -101,7 +103,7 @@ tables:
         type: Utf8
         nullable: false
         description: Relationship type name.
-        expr: {kind: path, path: [relationship_type]}
+        expr: {kind: path, path: [t]}
 
   - name: users
     description: User nodes in the Neo4j graph.
@@ -122,7 +124,8 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"MATCH (n:User) RETURN {rows: collect({id: n.id, name: n.name, email: n.email})} AS result"}]}'
+          value: |-
+            {"statements":[{"statement":"MATCH (n:User) RETURN {rows:collect({id:n.id,name:n.name,email:n.email})} AS x"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -163,7 +166,8 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"MATCH (n:Organization) RETURN {rows: collect({id: n.id, name: n.name})} AS result"}]}'
+          value: |-
+            {"statements":[{"statement":"MATCH (n:Organization) RETURN {rows:collect({id:n.id,name:n.name})} AS x"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -199,7 +203,8 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"MATCH (n:Product) RETURN {rows: collect({id: n.id, name: n.name, category: n.category})} AS result"}]}'
+          value: |-
+            {"statements":[{"statement":"MATCH (n:Product) RETURN {rows:collect({id:n.id,name:n.name,category:n.category})} AS x"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -241,7 +246,8 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"MATCH (n:Order) RETURN {rows: collect({id: n.id, total: n.total})} AS result"}]}'
+          value: |-
+            {"statements":[{"statement":"MATCH (n:Order) RETURN {rows:collect({id:n.id,total:n.total})} AS x"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -277,7 +283,8 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"MATCH (n:Technology) RETURN {rows: collect({name: n.name})} AS result"}]}'
+          value: |-
+            {"statements":[{"statement":"MATCH (n:Technology) RETURN {rows:collect({name:n.name})} AS x"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -293,10 +300,8 @@ tables:
     description: All relationships in the Neo4j graph with source and target node info.
     guide: >
       Returns all relationships with from_label, from_id, rel_type, to_label,
-      and to_id. Use rel_type values from the relationship_types table to
-      understand the topology. Filter results in SQL using WHERE rel_type = '...'
-      (e.g. WORKS_AT, PLACED, CONTAINS, USES, INTERESTED_IN). For very large
-      graphs, add a WHERE clause to avoid scanning all relationships.
+      and to_id. Filter by rel_type in SQL (e.g. WHERE rel_type = 'WORKS_AT').
+      from_id and to_id are the node id property cast to string.
     request:
       method: POST
       path: /db/neo4j/tx/commit
@@ -311,7 +316,8 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"MATCH (a)-[r]->(b) RETURN {rows: collect({from_label: labels(a)[0], from_id: coalesce(toString(a.id), a.name), rel_type: type(r), to_label: labels(b)[0], to_id: coalesce(toString(b.id), b.name)})} AS result"}]}'
+          value: |-
+            {"statements":[{"statement":"MATCH (a)-[r]->(b) RETURN {rows:collect({fl:labels(a)[0],fi:a.id,rt:type(r),tl:labels(b)[0],ti:b.id})}"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -321,34 +327,34 @@ tables:
         type: Utf8
         nullable: true
         description: Label of the source node.
-        expr: {kind: path, path: [from_label]}
+        expr: {kind: path, path: [fl]}
       - name: from_id
-        type: Utf8
+        type: Int64
         nullable: true
-        description: ID or name of the source node (coalesced to string).
-        expr: {kind: path, path: [from_id]}
+        description: ID property of the source node.
+        expr: {kind: path, path: [fi]}
       - name: rel_type
         type: Utf8
         nullable: false
-        description: Relationship type (e.g. WORKS_AT, PLACED, CONTAINS, USES, INTERESTED_IN).
-        expr: {kind: path, path: [rel_type]}
+        description: Relationship type (e.g. WORKS_AT, PLACED, CONTAINS, USES).
+        expr: {kind: path, path: [rt]}
       - name: to_label
         type: Utf8
         nullable: true
         description: Label of the target node.
-        expr: {kind: path, path: [to_label]}
+        expr: {kind: path, path: [tl]}
       - name: to_id
-        type: Utf8
+        type: Int64
         nullable: true
-        description: ID or name of the target node (coalesced to string).
-        expr: {kind: path, path: [to_id]}
+        description: ID property of the target node.
+        expr: {kind: path, path: [ti]}
 
   - name: indexes
     description: Indexes defined in the Neo4j database.
     guide: >
       Returns all indexes including LOOKUP, RANGE, TEXT, and POINT types.
-      The labels_or_types column contains the node label or relationship type
-      the index applies to. The properties column lists the indexed properties.
+      The lt column contains the node label or relationship type the index
+      applies to. The props column lists the indexed properties.
       No filter required.
     request:
       method: POST
@@ -364,7 +370,9 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"SHOW INDEXES YIELD name, type, state, labelsOrTypes, properties, entityType RETURN {rows: collect({name: name, type: type, state: state, labels_or_types: labelsOrTypes, properties: properties, entity_type: entityType})} AS result"}]}'
+          value: >-
+            {"statements":[{"statement":"SHOW INDEXES YIELD name,type,state,labelsOrTypes AS lt,properties AS pr,entityType AS et
+            RETURN {rows:collect({n:name,tp:type,s:state,lt:lt,pr:pr,et:et})}"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -374,40 +382,40 @@ tables:
         type: Utf8
         nullable: false
         description: Index name.
-        expr: {kind: path, path: [name]}
+        expr: {kind: path, path: [n]}
       - name: type
         type: Utf8
         nullable: true
         description: Index type (LOOKUP, RANGE, TEXT, POINT, FULLTEXT).
-        expr: {kind: path, path: [type]}
+        expr: {kind: path, path: [tp]}
       - name: state
         type: Utf8
         nullable: true
         description: Index state (ONLINE, POPULATING, FAILED).
-        expr: {kind: path, path: [state]}
+        expr: {kind: path, path: [s]}
       - name: entity_type
         type: Utf8
         nullable: true
         description: Entity type the index applies to (NODE or RELATIONSHIP).
-        expr: {kind: path, path: [entity_type]}
+        expr: {kind: path, path: [et]}
       - name: labels_or_types
         type: Json
         nullable: true
         description: Node labels or relationship types covered by the index.
-        expr: {kind: path, path: [labels_or_types]}
+        expr: {kind: path, path: [lt]}
       - name: properties
         type: Json
         nullable: true
         description: Properties covered by the index.
-        expr: {kind: path, path: [properties]}
+        expr: {kind: path, path: [pr]}
 
   - name: constraints
     description: Constraints defined in the Neo4j database.
     guide: >
       Returns all constraints including uniqueness and existence constraints.
-      The labels_or_types column contains the node label or relationship type
-      the constraint applies to. The properties column lists the constrained
-      properties. No filter required.
+      The lt column contains the node label or relationship type the constraint
+      applies to. The props column lists the constrained properties.
+      No filter required.
     request:
       method: POST
       path: /db/neo4j/tx/commit
@@ -422,7 +430,9 @@ tables:
         format: text
         content:
           from: literal
-          value: '{"statements":[{"statement":"SHOW CONSTRAINTS YIELD name, type, entityType, labelsOrTypes, properties RETURN {rows: collect({name: name, type: type, entity_type: entityType, labels_or_types: labelsOrTypes, properties: properties})} AS result"}]}'
+          value: >-
+            {"statements":[{"statement":"SHOW CONSTRAINTS YIELD name,type,entityType AS et,labelsOrTypes AS lt,properties AS pr
+            RETURN {rows:collect({n:name,tp:type,et:et,lt:lt,pr:pr})}"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
@@ -432,24 +442,24 @@ tables:
         type: Utf8
         nullable: false
         description: Constraint name.
-        expr: {kind: path, path: [name]}
+        expr: {kind: path, path: [n]}
       - name: type
         type: Utf8
         nullable: true
         description: Constraint type (e.g. NODE_PROPERTY_UNIQUENESS, NODE_PROPERTY_EXISTENCE).
-        expr: {kind: path, path: [type]}
+        expr: {kind: path, path: [tp]}
       - name: entity_type
         type: Utf8
         nullable: true
         description: Entity type the constraint applies to (NODE or RELATIONSHIP).
-        expr: {kind: path, path: [entity_type]}
+        expr: {kind: path, path: [et]}
       - name: labels_or_types
         type: Json
         nullable: true
         description: Node labels or relationship types covered by the constraint.
-        expr: {kind: path, path: [labels_or_types]}
+        expr: {kind: path, path: [lt]}
       - name: properties
         type: Json
         nullable: true
         description: Properties covered by the constraint.
-        expr: {kind: path, path: [properties]}
+        expr: {kind: path, path: [pr]}
