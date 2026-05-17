@@ -301,7 +301,8 @@ tables:
     guide: >
       Returns all relationships with from_label, from_id, rel_type, to_label,
       and to_id. Filter by rel_type in SQL (e.g. WHERE rel_type = 'WORKS_AT').
-      from_id and to_id are the node id property cast to string.
+      from_id and to_id are the raw integer id property of the source and
+      target nodes.
     request:
       method: POST
       path: /db/neo4j/tx/commit
@@ -353,8 +354,8 @@ tables:
     description: Indexes defined in the Neo4j database.
     guide: >
       Returns all indexes including LOOKUP, RANGE, TEXT, and POINT types.
-      The lt column contains the node label or relationship type the index
-      applies to. The props column lists the indexed properties.
+      The labels_or_types column contains the node label or relationship type
+      the index applies to. The properties column lists the indexed properties.
       No filter required.
     request:
       method: POST
@@ -413,9 +414,9 @@ tables:
     description: Constraints defined in the Neo4j database.
     guide: >
       Returns all constraints including uniqueness and existence constraints.
-      The lt column contains the node label or relationship type the constraint
-      applies to. The props column lists the constrained properties.
-      No filter required.
+      The labels_or_types column contains the node label or relationship type
+      the constraint applies to. The properties column lists the constrained
+      properties. No filter required.
     request:
       method: POST
       path: /db/neo4j/tx/commit
