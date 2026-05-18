@@ -31,6 +31,7 @@ request_headers:
 test_queries:
   - SELECT * FROM pinecone.indexes LIMIT 5
   - SELECT * FROM pinecone.collections LIMIT 5
+  - SELECT * FROM pinecone.backups LIMIT 1
 tables:
   - name: indexes
     description: >-
