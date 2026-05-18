@@ -8,6 +8,7 @@ description: >-
 inputs:
   MILVUS_URL:
     kind: variable
+    default: "http://localhost:19530"
     hint: |
       Base URL of your Milvus instance REST API, for example
       `http://localhost:19530` or `https://your-cluster.zillizcloud.com`.
