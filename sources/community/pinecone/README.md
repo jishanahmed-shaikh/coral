@@ -97,7 +97,7 @@ The source uses the Pinecone Control Plane API with API key authentication:
 
 ```text
 Api-Key: <PINECONE_API_KEY>
-X-Pinecone-API-Version: 2025-04
+X-Pinecone-Api-Version: 2026-04
 ```
 
 ## Example Queries
