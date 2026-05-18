@@ -22,9 +22,9 @@ auth:
       from: template
       template: "{{input.PINECONE_API_KEY}}"
 request_headers:
-  - name: X-Pinecone-API-Version
+  - name: X-Pinecone-Api-Version
     from: literal
-    value: "2025-04"
+    value: "2026-04"
   - name: Accept
     from: literal
     value: application/json
