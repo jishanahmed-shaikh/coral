@@ -56,6 +56,10 @@ MILVUS_TOKEN=none \
   coral source add --file sources/community/milvus/manifest.yaml --interactive
 ```
 
+> Note:
+> The `users` table requires admin privileges on the Milvus instance.
+> Non-admin users may receive permission errors when querying it.
+
 ## Tables
 
 | Table | Description | Required filters | Optional filters |
@@ -64,7 +68,7 @@ MILVUS_TOKEN=none \
 | `collections` | Collections in a database | -- | `db_name` |
 | `collection_details` | Schema and config for a specific collection | `collection_name` | `db_name` |
 | `partitions` | Partitions within a collection | `collection_name` | `db_name` |
-| `users` | Users in the internal auth database | -- | -- |
+| `users` | Users in the internal auth database (requires admin privileges) | -- | -- |
 | `roles` | Roles defined in the instance | -- | -- |
 | `aliases` | Collection aliases | -- | `db_name` |
 
@@ -99,8 +103,10 @@ coral sql "
   WHERE collection_name = 'my_collection'
 "
 
-# List users and roles
+# List users (requires admin privileges)
 coral sql "SELECT username FROM milvus.users"
+
+# List roles
 coral sql "SELECT role_name FROM milvus.roles"
 
 # List aliases
