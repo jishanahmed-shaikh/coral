@@ -43,7 +43,7 @@ auth:
 
 test_queries:
   - SELECT * FROM neo4j.node_labels LIMIT 5
-  - SELECT * FROM neo4j.nodes LIMIT 5
+  - SELECT * FROM neo4j.relationship_types LIMIT 5
 
 tables:
   - name: node_labels
