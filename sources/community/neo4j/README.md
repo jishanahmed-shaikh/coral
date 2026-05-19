@@ -181,10 +181,8 @@ SELECT element_id, properties
 FROM neo4j.nodes
 WHERE label = 'Organization';
 
--- Count nodes per label
-SELECT label, COUNT(*) AS node_count
-FROM neo4j.node_labels
-GROUP BY label;
+-- Count nodes per label (using node_labels as a label list, then querying each)
+SELECT label FROM neo4j.node_labels;
 
 -- All WORKS_AT relationships
 SELECT from_element_id, from_label, to_element_id, to_label

@@ -133,10 +133,14 @@ tables:
         format: json
         fields:
           - path: [statements, "0", statement]
-            from: template
-            template: >-
-              MATCH (n:`{{filter.label}}`)
+            from: literal
+            value: >-
+              MATCH (n)
+              WHERE any(l IN labels(n) WHERE l = $label)
               RETURN {rows:collect({eid:elementId(n),labels:labels(n),props:properties(n)})} AS x
+          - path: [statements, "0", parameters, label]
+            from: filter
+            key: label
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:
