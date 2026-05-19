@@ -11,13 +11,17 @@ a standard REST API over the Kafka Admin Client — this source queries that API
 
 ## Authentication
 
-The source supports optional HTTP Basic authentication. When `KAFKA_REST_USER`
-and `KAFKA_REST_PASSWORD` are provided, every request includes an
-`Authorization: Basic …` header. This covers Confluent REST Proxy deployments
-fronted by RBAC or a reverse proxy with Basic auth enabled.
+The source uses HTTP Basic authentication. `KAFKA_REST_USER` and
+`KAFKA_REST_PASSWORD` are always required at install time — the DSL does not
+support optional secrets.
 
-For unauthenticated local instances, provide any non-empty value for the
-password during install (the REST Proxy will ignore the header).
+For Confluent REST Proxy deployments fronted by RBAC or a reverse proxy with
+Basic auth enabled, set both to your real credentials.
+
+For unauthenticated local instances (the default Docker setup), set
+`KAFKA_REST_USER` to any value (e.g. `none`) and `KAFKA_REST_PASSWORD` to any
+non-empty placeholder (e.g. `none`). The REST Proxy ignores the Authorization
+header when no auth is configured.
 
 ## Local Setup
 
@@ -77,11 +81,11 @@ docker exec --workdir /opt/kafka/bin/ -it kafka sh
 
 ## Configuration
 
-| Input                 | Kind     | Required | Default                 | Description                                      |
-|-----------------------|----------|----------|-------------------------|--------------------------------------------------|
-| `KAFKA_REST_URL`      | variable | no       | `http://localhost:8082` | Base URL of your Confluent Kafka REST Proxy      |
-| `KAFKA_REST_USER`     | variable | no       | (empty)                 | Username for HTTP Basic auth                     |
-| `KAFKA_REST_PASSWORD` | secret   | yes      | —                       | Password for HTTP Basic auth                     |
+| Input                 | Kind     | Required | Default                 | Description                                                   |
+|-----------------------|----------|----------|-------------------------|---------------------------------------------------------------|
+| `KAFKA_REST_URL`      | variable | no       | `http://localhost:8082` | Base URL of your Confluent Kafka REST Proxy                   |
+| `KAFKA_REST_USER`     | variable | yes      | —                       | Username for Basic auth. Use `none` for unauthenticated setup.|
+| `KAFKA_REST_PASSWORD` | secret   | yes      | —                       | Password for Basic auth. Use `none` for unauthenticated setup.|
 
 The cluster ID is not a global config — it is discovered at query time via
 `SELECT * FROM kafka.cluster` and passed as the `cluster_id` filter to all
@@ -173,7 +177,9 @@ ORDER BY lag DESC NULLS LAST;
 ### Pagination not yet supported
 
 - The Confluent Kafka REST Proxy v3 paginates list responses (topics, consumer groups, lags, etc.) using a `metadata.next` URL in the response body.
-- This source does not yet follow those pagination links, so results are currently limited to the REST Proxy's default page size (approximately 100 items per request).
+- This source does not yet follow those pagination links, so results are
+  currently limited to the REST Proxy's default page size (approximately
+  100 items per request).
 - As a result, large Kafka clusters with many topics or consumer groups may return truncated results.
 - Full pagination support will be added once the Coral DSL supports URL-cursor pagination (`cursor_body_url` mode).
 
