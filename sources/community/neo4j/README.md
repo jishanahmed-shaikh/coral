@@ -132,7 +132,7 @@ Generic node table. Requires a `label` filter. Returns one row per node with:
 
 | Column       | Type  | Description                                      |
 |--------------|-------|--------------------------------------------------|
-| `element_id` | Utf8  | Stable Neo4j element ID for the node             |
+| `element_id` | Utf8  | Neo4j element ID for the node (not guaranteed stable across restores or imports) |
 | `labels`     | Json  | All labels on the node as a JSON array           |
 | `properties` | Json  | All node properties as a JSON object             |
 
@@ -210,11 +210,15 @@ WHERE type = 'NODE_PROPERTY_UNIQUENESS';
 
 - The `nodes` table requires a `label` filter and works with any graph schema.
   Properties are returned as a JSON object — use `->>'key'` to extract
-  individual values in SQL.
-- The `relationships` table returns all relationships in the graph. For very
-  large graphs, add a `WHERE rel_type = '...'` clause to scope results.
+  individual values in SQL. All matching nodes are fetched from Neo4j before
+  SQL filtering applies, so use a selective label to avoid large result sets.
+- The `relationships` table fetches all relationships from Neo4j before SQL
+  filtering applies. Add a `WHERE rel_type = '...'` clause to reduce the
+  result set, but be aware the full graph traversal still runs in Cypher first.
 - `from_element_id` and `to_element_id` in `relationships` are Neo4j element
-  IDs (stable string identifiers). Use them to join with `nodes.element_id`.
+  IDs. They are suitable for joining within a session but are not guaranteed
+  stable across database restores, imports, or migrations — use a business
+  key property for persistent cross-session references.
 - The `labels_or_types` and `properties` columns in `indexes` and `constraints`
   are JSON arrays (e.g. `["User"]`, `["id"]`).
 - Set `NEO4J_DATABASE` to target a named database. Defaults to `neo4j`.

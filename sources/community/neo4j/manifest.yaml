@@ -118,7 +118,9 @@ tables:
       Requires a label filter (e.g. WHERE label = 'Person'). Returns one row
       per node with its element ID, all labels as a JSON array, and all
       properties as a JSON object. Use node_labels to discover available
-      labels first. For large graphs, combine with a LIMIT clause.
+      labels first. All matching nodes are fetched from Neo4j before SQL
+      filtering applies — for very large node sets consider scoping with
+      a more selective label.
     request:
       method: POST
       path: /db/{{input.NEO4J_DATABASE}}/tx/commit
@@ -150,8 +152,9 @@ tables:
         type: Utf8
         nullable: false
         description: >-
-          Stable element ID of the node (e.g.
-          4:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:0).
+          Neo4j element ID of the node (e.g.
+          4:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:0). Not guaranteed stable
+          across restores or imports — use a business key for persistence.
         expr: {kind: path, path: [eid]}
       - name: labels
         type: Json
@@ -173,7 +176,9 @@ tables:
       Returns relationships with element IDs, labels, rel type, and
       properties. Optionally filter by rel_type in SQL using
       WHERE rel_type = 'KNOWS'. from_element_id and to_element_id are
-      stable Neo4j element IDs. For very large graphs add a LIMIT clause.
+      Neo4j element IDs (session-scoped; use business keys for persistent
+      references). All relationships are fetched from Neo4j before SQL
+      filtering applies — on very large graphs this can be expensive.
     request:
       method: POST
       path: /db/{{input.NEO4J_DATABASE}}/tx/commit
@@ -199,7 +204,9 @@ tables:
       - name: from_element_id
         type: Utf8
         nullable: true
-        description: Element ID of the source node.
+        description: >-
+          Element ID of the source node. Not guaranteed stable across
+          restores or imports — use a business key for persistence.
         expr: {kind: path, path: [feid]}
       - name: from_label
         type: Utf8
@@ -219,7 +226,9 @@ tables:
       - name: to_element_id
         type: Utf8
         nullable: true
-        description: Element ID of the target node.
+        description: >-
+          Element ID of the target node. Not guaranteed stable across
+          restores or imports — use a business key for persistence.
         expr: {kind: path, path: [teid]}
       - name: to_label
         type: Utf8
