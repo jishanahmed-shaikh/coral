@@ -2,7 +2,7 @@
 
 **Version:** 0.1.0
 **Backend:** HTTP
-**Tables:** 7
+**Tables:** 8
 **Base URL:** your Milvus REST API URL (set via `MILVUS_URL`)
 
 Query databases, collections, partitions, users, roles, and aliases
@@ -67,6 +67,7 @@ MILVUS_TOKEN=none \
 | `databases` | Databases in the Milvus instance | -- | -- |
 | `collections` | Collections in a database | -- | `db_name` |
 | `collection_details` | Schema and config for a specific collection | `collection_name` | `db_name` |
+| `collection_stats` | Row count for a specific collection | `collection_name` | `db_name` |
 | `partitions` | Partitions within a collection | `collection_name` | `db_name` |
 | `users` | Users in the internal auth database (requires admin privileges) | -- | -- |
 | `roles` | Roles defined in the instance | -- | -- |
@@ -96,6 +97,13 @@ coral sql "
   WHERE collection_name = 'my_collection'
 "
 
+# Get the row count for a collection
+coral sql "
+  SELECT row_count
+  FROM milvus.collection_stats
+  WHERE collection_name = 'my_collection'
+"
+
 # List partitions in a collection
 coral sql "
   SELECT partition_name
@@ -121,6 +129,7 @@ databases
     -> collections (WHERE db_name = '...')
       -> collection_name
         -> collection_details (WHERE collection_name = '...')
+        -> collection_stats   (WHERE collection_name = '...')
         -> partitions         (WHERE collection_name = '...')
 
 users
