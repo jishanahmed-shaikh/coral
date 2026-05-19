@@ -169,6 +169,35 @@ tables:
         nullable: true
         description: Whether dynamic fields are enabled
         expr: {kind: path, path: [enableDynamicField]}
+      - name: collection_id
+        type: Int64
+        nullable: true
+        description: Stable internal ID assigned to the collection upon creation.
+        expr: {kind: path, path: [collectionID]}
+      - name: auto_id
+        type: Boolean
+        nullable: true
+        description: >-
+          Whether the primary key auto-increments (Milvus-generated IDs).
+          False means the application supplies IDs.
+        expr: {kind: path, path: [autoId]}
+      - name: partitions_num
+        type: Int64
+        nullable: true
+        description: >-
+          Number of partitions declared for the collection. Compare with
+          the count from milvus.partitions to audit partition usage.
+        expr: {kind: path, path: [partitionsNum]}
+      - name: aliases
+        type: Json
+        nullable: true
+        description: List of aliases assigned to this collection.
+        expr: {kind: path, path: [aliases]}
+      - name: properties
+        type: Json
+        nullable: true
+        description: Extra collection properties as key-value pairs.
+        expr: {kind: path, path: [properties]}
     filters:
       - name: collection_name
         required: true
