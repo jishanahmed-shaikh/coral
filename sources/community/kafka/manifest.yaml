@@ -160,7 +160,8 @@ tables:
       topics table. Each row is one configuration entry. source indicates
       where the value originates (DEFAULT_CONFIG, DYNAMIC_TOPIC_CONFIG,
       DYNAMIC_DEFAULT_BROKER_CONFIG, etc.). is_default is true when the
-      value matches the broker default.
+      value matches the broker default. Topic names containing URL-reserved
+      characters (e.g. /, ?, #) are not supported as filter values.
     filters:
       - name: cluster_id
         required: true
@@ -278,7 +279,9 @@ tables:
       consumer_group_id values from the consumer_groups table. Each row is
       one topic-partition assignment. lag is the difference between
       log_end_offset and current_offset. consumer_id identifies which
-      consumer instance holds the partition.
+      consumer instance holds the partition. Consumer group IDs containing
+      URL-reserved characters (e.g. /, ?, #) are not supported as filter
+      values.
     filters:
       - name: cluster_id
         required: true
