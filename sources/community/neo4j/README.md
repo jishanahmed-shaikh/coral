@@ -8,11 +8,11 @@ Query nodes, relationships, indexes, and constraints from
 
 Neo4j stores data as a property graph — nodes connected by typed relationships.
 This source sends Cypher queries to the Neo4j HTTP transactional API
-(`/db/neo4j/tx/commit`) and maps the results into flat SQL-queryable tables.
-Each node label gets its own table. Relationships are exposed as a single
-`relationships` table with `from_label`, `rel_type`, and `to_label` columns.
-Schema metadata (indexes, constraints, labels, relationship types) is exposed
-as dedicated tables.
+(`/db/<database>/tx/commit`) and maps the results into flat SQL-queryable
+tables. The `nodes` table accepts a `label` filter and returns all properties
+as a JSON object, making it work with any graph schema. Relationships are
+exposed as a single `relationships` table. Schema metadata (indexes,
+constraints, labels, relationship types) is exposed as dedicated tables.
 
 ## Authentication
 
@@ -34,10 +34,12 @@ docker run -d \
 Neo4j Browser will be available at `http://localhost:7474`.
 Log in with username `neo4j` and password `password`.
 
-### 1. Create mock data
+### Tutorial: sample graph
 
-Run the following in the Neo4j Browser query editor to create sample nodes
-and relationships for testing:
+The queries below create a small sample graph you can use to explore the
+source. Run them in the Neo4j Browser query editor.
+
+#### 1. Create sample nodes and relationships
 
 ```cypher
 CREATE
@@ -70,7 +72,7 @@ CREATE
   (o2)-[:USES]->(t3);
 ```
 
-### 2. Add indexes
+#### 2. Add indexes
 
 ```cypher
 CREATE INDEX user_email_index FOR (u:User) ON (u.email);
@@ -78,7 +80,7 @@ CREATE INDEX product_name_index FOR (p:Product) ON (p.name);
 CREATE INDEX organization_name_index FOR (o:Organization) ON (o.name);
 ```
 
-### 3. Add constraints
+#### 3. Add constraints
 
 ```cypher
 CREATE CONSTRAINT user_id_unique IF NOT EXISTS
@@ -94,78 +96,53 @@ FOR (o:Organization)
 REQUIRE o.id IS UNIQUE;
 ```
 
-### 4. Verify metadata
-
-Run these in the Neo4j Browser to confirm everything was created correctly:
+#### 4. Verify metadata
 
 ```cypher
--- Labels
 CALL db.labels();
-
--- Relationship types
 CALL db.relationshipTypes();
-
--- Indexes
 SHOW INDEXES;
-
--- Constraints
 SHOW CONSTRAINTS;
-```
-
-### 5. Visual graph query (Neo4j Browser only)
-
-```cypher
-MATCH (n)-[r]->(m)
-RETURN n, r, m
-LIMIT 100
 ```
 
 ## Configuration
 
-| Input            | Kind     | Required | Description                                                              |
-|------------------|----------|----------|--------------------------------------------------------------------------|
-| `NEO4J_URL`      | variable | yes      | Base URL of the Neo4j HTTP interface, e.g. `http://localhost:7474`       |
-| `NEO4J_USERNAME` | variable | yes      | Neo4j username (default: `neo4j`)                                        |
-| `NEO4J_PASSWORD` | secret   | yes      | Neo4j password (set via `NEO4J_AUTH=neo4j/<password>` in Docker)         |
+| Input              | Kind     | Required | Default  | Description                                                        |
+|--------------------|----------|----------|----------|--------------------------------------------------------------------|
+| `NEO4J_URL`        | variable | yes      | `http://localhost:7474` | Base URL of the Neo4j HTTP interface          |
+| `NEO4J_USERNAME`   | variable | yes      | `neo4j`  | Neo4j username                                                     |
+| `NEO4J_PASSWORD`   | secret   | yes      |          | Neo4j password (set via `NEO4J_AUTH=neo4j/<password>` in Docker)   |
+| `NEO4J_DATABASE`   | variable | no       | `neo4j`  | Name of the database to query. Change for named databases.         |
 
 ## Schema
 
 ### `node_labels`
 
 One row per node label defined in the database. Start here to discover what
-node types exist before querying individual node tables.
+node types exist before querying the `nodes` table.
 
 ### `relationship_types`
 
 One row per relationship type. Use these values to filter the `relationships`
 table by `rel_type`.
 
-### `users`
+### `nodes`
 
-All nodes with the `User` label. Fields: `id`, `name`, `email`.
+Generic node table. Requires a `label` filter. Returns one row per node with:
 
-### `organizations`
+| Column       | Type  | Description                                      |
+|--------------|-------|--------------------------------------------------|
+| `element_id` | Utf8  | Stable Neo4j element ID for the node             |
+| `labels`     | Json  | All labels on the node as a JSON array           |
+| `properties` | Json  | All node properties as a JSON object             |
 
-All nodes with the `Organization` label. Fields: `id`, `name`.
-
-### `products`
-
-All nodes with the `Product` label. Fields: `id`, `name`, `category`.
-
-### `orders`
-
-All nodes with the `Order` label. Fields: `id`, `total`.
-
-### `technologies`
-
-All nodes with the `Technology` label. Fields: `name`.
+Works with any graph schema — no assumptions about property names.
 
 ### `relationships`
 
-All relationships in the graph with source and target node info. Fields:
-`from_label`, `from_id`, `rel_type`, `to_label`, `to_id`. Use this table to
-traverse the graph topology in SQL. Filter by `rel_type` in a WHERE clause
-to scope results (e.g. `WHERE rel_type = 'WORKS_AT'`).
+All relationships in the graph. Fields: `from_element_id`, `from_label`,
+`rel_type`, `rel_properties`, `to_element_id`, `to_label`. Filter by
+`rel_type` in a WHERE clause to scope results.
 
 ### `indexes`
 
@@ -186,24 +163,33 @@ SELECT label FROM neo4j.node_labels;
 -- Discover all relationship types
 SELECT relationship_type FROM neo4j.relationship_types;
 
--- List all users
-SELECT id, name, email FROM neo4j.users;
+-- List all User nodes (returns properties as JSON)
+SELECT element_id, properties
+FROM neo4j.nodes
+WHERE label = 'User';
 
--- List all products by category
-SELECT name, category FROM neo4j.products ORDER BY category, name;
+-- Extract a specific property from nodes
+SELECT
+  element_id,
+  properties->>'name' AS name,
+  properties->>'email' AS email
+FROM neo4j.nodes
+WHERE label = 'User';
 
--- See which users work at which organizations
-SELECT r.from_id AS user_id, u.name AS user_name, o.name AS org_name
-FROM neo4j.relationships r
-JOIN neo4j.users u ON r.from_id = CAST(u.id AS VARCHAR)
-JOIN neo4j.organizations o ON r.to_id = CAST(o.id AS VARCHAR)
-WHERE r.rel_type = 'WORKS_AT';
+-- List all Organization nodes
+SELECT element_id, properties
+FROM neo4j.nodes
+WHERE label = 'Organization';
 
--- See which orders contain which products
-SELECT r.from_id AS order_id, p.name AS product_name, p.category
-FROM neo4j.relationships r
-JOIN neo4j.products p ON r.to_id = CAST(p.id AS VARCHAR)
-WHERE r.rel_type = 'CONTAINS';
+-- Count nodes per label
+SELECT label, COUNT(*) AS node_count
+FROM neo4j.node_labels
+GROUP BY label;
+
+-- All WORKS_AT relationships
+SELECT from_element_id, from_label, to_element_id, to_label
+FROM neo4j.relationships
+WHERE rel_type = 'WORKS_AT';
 
 -- Count relationships by type
 SELECT rel_type, COUNT(*) AS count
@@ -224,13 +210,13 @@ WHERE type = 'NODE_PROPERTY_UNIQUENESS';
 
 ## Notes
 
+- The `nodes` table requires a `label` filter and works with any graph schema.
+  Properties are returned as a JSON object — use `->>'key'` to extract
+  individual values in SQL.
 - The `relationships` table returns all relationships in the graph. For very
   large graphs, add a `WHERE rel_type = '...'` clause to scope results.
-- The `from_id` and `to_id` columns in `relationships` are coerced to strings
-  using `coalesce(toString(node.id), node.name)`. Numeric IDs are cast to
-  string for uniform comparison.
+- `from_element_id` and `to_element_id` in `relationships` are Neo4j element
+  IDs (stable string identifiers). Use them to join with `nodes.element_id`.
 - The `labels_or_types` and `properties` columns in `indexes` and `constraints`
   are JSON arrays (e.g. `["User"]`, `["id"]`).
-- This source targets the `neo4j` database. For a different database, update
-  the path in the manifest from `/db/neo4j/tx/commit` to
-  `/db/<your-database>/tx/commit`.
+- Set `NEO4J_DATABASE` to target a named database. Defaults to `neo4j`.
