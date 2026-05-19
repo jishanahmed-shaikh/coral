@@ -48,7 +48,7 @@ docker run -d \
   -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
   -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
   -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
-  apache/kafka:latest
+  apache/kafka:4.2.0
 
 # 3. Start Confluent Kafka REST Proxy pointing to the kafka container
 docker run -d \
@@ -58,7 +58,7 @@ docker run -d \
   -e KAFKA_REST_HOST_NAME=kafka-rest \
   -e KAFKA_REST_BOOTSTRAP_SERVERS=kafka:9092 \
   -e KAFKA_REST_LISTENERS=http://0.0.0.0:8082 \
-  confluentinc/cp-kafka-rest:latest
+  confluentinc/cp-kafka-rest:8.2.1
 ```
 
 Kafka REST Proxy will be available at `http://localhost:8082`.
