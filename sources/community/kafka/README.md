@@ -161,6 +161,15 @@ WHERE cluster_id = 'your-cluster-id'
 ORDER BY lag DESC NULLS LAST;
 ```
 
+## Limitations
+
+### Pagination not yet supported
+
+- The Confluent Kafka REST Proxy v3 paginates list responses (topics, consumer groups, lags, etc.) using a `metadata.next` URL in the response body.
+- This source does not yet follow those pagination links, so results are currently limited to the REST Proxy's default page size (approximately 100 items per request).
+- As a result, large Kafka clusters with many topics or consumer groups may return truncated results.
+- Full pagination support will be added once the Coral DSL supports URL-cursor pagination (`cursor_body_url` mode).
+
 ## Notes
 
 - The REST Proxy is always connected to exactly one Kafka cluster. The
