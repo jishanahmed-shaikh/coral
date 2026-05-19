@@ -116,6 +116,16 @@ tables:
           kind: path
           path:
             - host
+      - name: private_host
+        type: Utf8
+        nullable: true
+        description: >-
+          Private host URL for this index when private networking (VPC) is
+          enabled. NULL for standard public indexes.
+        expr:
+          kind: path
+          path:
+            - private_host
       - name: spec_cloud
         type: Utf8
         nullable: true
