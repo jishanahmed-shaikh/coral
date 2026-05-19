@@ -171,6 +171,58 @@ tables:
           path:
             - embed
             - metric
+      - name: embed_field_map
+        type: Json
+        nullable: true
+        description: >-
+          Field mapping for integrated embedding -- which source field gets
+          embedded (e.g. {"text": "text"}). NULL for bring-your-own-vector indexes.
+        expr:
+          kind: path
+          path:
+            - embed
+            - field_map
+      - name: embed_vector_type
+        type: Utf8
+        nullable: true
+        description: Vector type produced by the integrated embedding model (dense or sparse).
+        expr:
+          kind: path
+          path:
+            - embed
+            - vector_type
+      - name: embed_write_parameters
+        type: Json
+        nullable: true
+        description: >-
+          Embedding parameters used at write/upsert time
+          (e.g. input_type, truncate, dimension).
+        expr:
+          kind: path
+          path:
+            - embed
+            - write_parameters
+      - name: embed_read_parameters
+        type: Json
+        nullable: true
+        description: >-
+          Embedding parameters used at query/read time
+          (e.g. input_type, truncate, dimension).
+        expr:
+          kind: path
+          path:
+            - embed
+            - read_parameters
+      - name: tags
+        type: Json
+        nullable: true
+        description: >-
+          User-defined tags on the index as a key/value map
+          (e.g. environment, team, cost-center). NULL if no tags are set.
+        expr:
+          kind: path
+          path:
+            - tags
 
   - name: collections
     description: >-
