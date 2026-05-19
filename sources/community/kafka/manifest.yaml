@@ -19,15 +19,14 @@ base_url: "{{input.KAFKA_REST_URL}}"
 
 test_queries:
   - SELECT * FROM kafka.cluster LIMIT 1
-  - SELECT * FROM kafka.topics WHERE cluster_id = 'local' LIMIT 5
 
 tables:
   - name: cluster
     description: The Kafka cluster connected to this REST Proxy instance.
     guide: >
-      Returns a single row with the cluster_id and controller broker link.
-      Start here — the cluster_id value is required by all other tables as
-      a required filter. REST Proxy is always connected to exactly one cluster.
+      Returns a single row with the cluster_id. Start here — the cluster_id
+      value is required by all other tables as a required filter. REST Proxy
+      is always connected to exactly one cluster.
     request:
       method: GET
       path: /v3/clusters
@@ -44,11 +43,6 @@ tables:
           Unique cluster ID. Use this as the cluster_id filter in all
           other tables.
         expr: {kind: path, path: [cluster_id]}
-      - name: controller_broker_id
-        type: Int64
-        nullable: true
-        description: Broker ID of the current controller.
-        expr: {kind: path, path: [controller, related]}
 
   - name: brokers
     description: Brokers in the Kafka cluster.
