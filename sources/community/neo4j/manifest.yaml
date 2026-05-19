@@ -189,8 +189,8 @@ tables:
         content:
           from: literal
           value: >-
-            {"statements":[{"statement":"MATCH (a)-[r]->(b) RETURN {rows:collect({feid:elementId(a),fl:labels(a)[0],
-            rt:type(r),rprops:properties(r),teid:elementId(b),tl:labels(b)[0]})} AS x"}]}
+            {"statements":[{"statement":"MATCH (a)-[r]->(b) RETURN {rows:collect({feid:elementId(a),fl:head(labels(a)),
+            rt:type(r),rprops:properties(r),teid:elementId(b),tl:head(labels(b))})} AS x"}]}
     response:
       rows_path: [results, "0", data, "0", row, "0", rows]
     pagination:

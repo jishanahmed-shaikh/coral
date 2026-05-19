@@ -109,8 +109,8 @@ SHOW CONSTRAINTS;
 
 | Input              | Kind     | Required | Default  | Description                                                        |
 |--------------------|----------|----------|----------|--------------------------------------------------------------------|
-| `NEO4J_URL`        | variable | yes      | `http://localhost:7474` | Base URL of the Neo4j HTTP interface          |
-| `NEO4J_USERNAME`   | variable | yes      | `neo4j`  | Neo4j username                                                     |
+| `NEO4J_URL`        | variable | no       | `http://localhost:7474` | Base URL of the Neo4j HTTP interface          |
+| `NEO4J_USERNAME`   | variable | no       | `neo4j`  | Neo4j username                                                     |
 | `NEO4J_PASSWORD`   | secret   | yes      |          | Neo4j password (set via `NEO4J_AUTH=neo4j/<password>` in Docker)   |
 | `NEO4J_DATABASE`   | variable | no       | `neo4j`  | Name of the database to query. Change for named databases.         |
 
