@@ -14,8 +14,26 @@ inputs:
       Base URL of your Confluent Kafka REST Proxy instance.
       Default is `http://localhost:8082` for a local instance.
       See https://github.com/confluentinc/kafka-rest for setup instructions.
+  KAFKA_REST_USER:
+    kind: variable
+    default: ""
+    hint: |
+      Username for HTTP Basic authentication against the REST Proxy.
+      Leave blank when running an unauthenticated local instance.
+      Required when the REST Proxy is fronted by Confluent RBAC or a
+      reverse proxy with Basic auth enabled.
+  KAFKA_REST_PASSWORD:
+    kind: secret
+    hint: |
+      Password for HTTP Basic authentication against the REST Proxy.
+      Pair with KAFKA_REST_USER. Required when authentication is enabled.
 
 base_url: "{{input.KAFKA_REST_URL}}"
+
+auth:
+  type: BasicAuth
+  username: "{{input.KAFKA_REST_USER}}"
+  password: "{{input.KAFKA_REST_PASSWORD}}"
 
 test_queries:
   - SELECT * FROM kafka.cluster LIMIT 1
@@ -206,8 +224,8 @@ tables:
     description: Consumer groups in the Kafka cluster.
     guide: >
       Requires cluster_id filter. Each row is one consumer group.
-      consumer_group_id is the group identifier — use it as the group_id
-      filter in consumer_group_lags. state is one of STABLE, EMPTY, DEAD,
+      consumer_group_id is the group identifier — use it as the
+      consumer_group_id filter in consumer_group_lags. state is one of STABLE, EMPTY, DEAD,
       PREPARING_REBALANCE, COMPLETING_REBALANCE, or UNKNOWN.
       is_simple is true for simple (non-coordinated) consumers.
     filters:
@@ -226,7 +244,7 @@ tables:
         type: Utf8
         nullable: false
         description: >-
-          Consumer group ID. Use as the group_id filter in
+          Consumer group ID. Use as the consumer_group_id filter in
           consumer_group_lags.
         expr: {kind: path, path: [consumer_group_id]}
       - name: state
@@ -256,18 +274,19 @@ tables:
   - name: consumer_group_lags
     description: Per-partition lag for a specific consumer group.
     guide: >
-      Requires cluster_id and group_id filters. Use group IDs from the
-      consumer_groups table. Each row is one topic-partition assignment.
-      lag is the difference between log_end_offset and current_offset.
-      consumer_id identifies which consumer instance holds the partition.
+      Requires cluster_id and consumer_group_id filters. Use
+      consumer_group_id values from the consumer_groups table. Each row is
+      one topic-partition assignment. lag is the difference between
+      log_end_offset and current_offset. consumer_id identifies which
+      consumer instance holds the partition.
     filters:
       - name: cluster_id
         required: true
-      - name: group_id
+      - name: consumer_group_id
         required: true
     request:
       method: GET
-      path: /v3/clusters/{{filter.cluster_id}}/consumer-groups/{{filter.group_id}}/lags
+      path: /v3/clusters/{{filter.cluster_id}}/consumer-groups/{{filter.consumer_group_id}}/lags
     response:
       rows_path: [data]
       row_strategy: direct
@@ -304,11 +323,11 @@ tables:
         nullable: true
         description: Messages behind (log_end_offset - current_offset).
         expr: {kind: path, path: [lag]}
-      - name: group_id
+      - name: consumer_group_id
         type: Utf8
         nullable: true
-        description: Consumer group ID (echoes the group_id filter).
-        expr: {kind: from_filter, key: group_id}
+        description: Consumer group ID (echoes the consumer_group_id filter).
+        expr: {kind: from_filter, key: consumer_group_id}
         virtual: true
       - name: cluster_id
         type: Utf8
