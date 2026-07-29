@@ -1,9 +1,10 @@
-//! Outbound URL policies for configured endpoints and untrusted metadata.
+//! Outbound URL policies for configured endpoints, discovery, and untrusted metadata.
 //!
-//! These policies are intentionally separate. Operator-configured endpoints
-//! may use HTTPS anywhere or plain HTTP on an explicit loopback host. URLs
-//! supplied by an untrusted client must instead identify a public HTTPS
-//! resource and use a DNS resolver that rejects non-public answers.
+//! These policies are intentionally separate. Operator-configured endpoints may
+//! use HTTPS anywhere or plain HTTP on an explicit loopback host. Provider
+//! discovery may use loopback HTTP only when the configured issuer does. URLs
+//! supplied by an untrusted client must instead identify a public HTTPS resource
+//! and use a DNS resolver that rejects non-public answers.
 
 #![cfg_attr(
     not(test),
@@ -19,6 +20,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use url::{Host, Url};
+use zeroize::Zeroizing;
 
 use crate::bootstrap::is_loopback_ip;
 
@@ -33,14 +35,9 @@ pub(crate) const PUBLIC_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 /// private one, with no check on what the host resolves to. Both are sound only
 /// for a value an operator authored — a config file or environment variable.
 ///
-/// Do not build one from a value a remote party controls. That includes the
-/// endpoints inside an `OpenID` Connect discovery document, which the provider
-/// supplies: a compromised provider answering with
-/// `token_endpoint: "http://127.0.0.1:9999/x"` would be handed the client
-/// secret, authorization code, and PKCE verifier in cleartext, readable by any
-/// local process. Remote-supplied endpoints are a third trust level and need
-/// their own profile — one that requires HTTPS unless the configured issuer is
-/// itself loopback HTTP.
+/// Do not build one from a value a remote party controls. Use
+/// [`DiscoveredEndpointUrl`] for endpoints supplied by an `OpenID` Connect
+/// discovery document.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredEndpointUrl(Url);
 
@@ -56,15 +53,7 @@ impl ConfiguredEndpointUrl {
     /// point exists for a caller that already needed the [`Url`] — parsing with
     /// a syntax-violation callback, say — and would otherwise parse it twice.
     pub(crate) fn from_parsed(url: Url) -> Result<Self, OutboundUrlPolicyError> {
-        if url.host().is_none() {
-            return Err(OutboundUrlPolicyError::MissingHost);
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(OutboundUrlPolicyError::CredentialsNotAllowed);
-        }
-        if url.fragment().is_some() {
-            return Err(OutboundUrlPolicyError::FragmentNotAllowed);
-        }
+        check_endpoint_url(&url)?;
         match url.scheme() {
             "https" => Ok(Self(url)),
             "http" if is_explicit_loopback(&url) => Ok(Self(url)),
@@ -90,6 +79,70 @@ impl fmt::Debug for ConfiguredEndpointUrl {
             .field(&RedactedUrl(&self.0))
             .finish()
     }
+}
+
+/// A remotely discovered provider endpoint safe for credential-bearing requests.
+///
+/// HTTPS may target any host, including a private one. Plain HTTP is restricted
+/// to an explicit loopback endpoint and is accepted only when the
+/// operator-configured issuer also uses loopback HTTP.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveredEndpointUrl(Url);
+
+impl DiscoveredEndpointUrl {
+    /// Parses an endpoint under the trust policy established by `issuer`.
+    pub(crate) fn parse(
+        value: &str,
+        issuer: &ConfiguredEndpointUrl,
+    ) -> Result<Self, OutboundUrlPolicyError> {
+        let url = parse_endpoint(value)?;
+        match url.scheme() {
+            "https" => Ok(Self(url)),
+            "http" if issuer.as_url().scheme() == "http" && is_explicit_loopback(&url) => {
+                Ok(Self(url))
+            }
+            _ => Err(OutboundUrlPolicyError::DiscoveredEndpointTransport),
+        }
+    }
+
+    /// Returns the validated URL.
+    pub(crate) fn as_url(&self) -> &Url {
+        &self.0
+    }
+
+    /// Consumes this wrapper and returns the validated URL.
+    pub(crate) fn into_url(self) -> Url {
+        self.0
+    }
+}
+
+impl fmt::Debug for DiscoveredEndpointUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("DiscoveredEndpointUrl")
+            .field(&RedactedUrl(&self.0))
+            .finish()
+    }
+}
+
+fn parse_endpoint(value: &str) -> Result<Url, OutboundUrlPolicyError> {
+    let url = Url::parse(value).map_err(OutboundUrlPolicyError::InvalidUrl)?;
+    check_endpoint_url(&url)?;
+    Ok(url)
+}
+
+/// Rejects an endpoint URL that no profile accepts, whatever its scheme.
+fn check_endpoint_url(url: &Url) -> Result<(), OutboundUrlPolicyError> {
+    if url.host().is_none() {
+        return Err(OutboundUrlPolicyError::MissingHost);
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(OutboundUrlPolicyError::CredentialsNotAllowed);
+    }
+    if url.fragment().is_some() {
+        return Err(OutboundUrlPolicyError::FragmentNotAllowed);
+    }
+    Ok(())
 }
 
 /// An attacker-controlled metadata URL validated for public HTTPS fetching.
@@ -172,6 +225,11 @@ pub(crate) enum OutboundUrlPolicyError {
     /// A configured endpoint used an unsafe transport.
     #[error("configured endpoint must use HTTPS or explicit loopback HTTP")]
     ConfiguredEndpointTransport,
+    /// A discovered endpoint used a transport the configured issuer cannot authorize.
+    #[error(
+        "discovered endpoint must use HTTPS unless the configured issuer uses explicit loopback HTTP"
+    )]
+    DiscoveredEndpointTransport,
     /// Public metadata did not use HTTPS.
     #[error("public metadata URL must use HTTPS")]
     PublicMetadataTransport,
@@ -227,6 +285,20 @@ pub(crate) fn public_metadata_http_client() -> Result<reqwest::Client, OutboundU
 }
 
 /// Reads a response body without buffering more than `limit` bytes.
+///
+/// # Secret handling
+///
+/// The buffer is [`Zeroizing`] while it fills, so the accumulated copy of a
+/// body abandoned part-read — over the limit, or a read error — is wiped rather
+/// than left in the allocator. On success the buffer is *moved* to the caller
+/// by [`std::mem::take`], which is deliberate: zeroizing at that point would
+/// wipe only the empty `Vec` left behind, and the caller is the one that knows
+/// whether the bytes are secret.
+///
+/// Reserving `limit` up front is the guarantee that survives that move: a `Vec`
+/// that grew while filling would strand copies of already-read bytes in freed
+/// allocations, which no later wipe can reach. Keep the reserve, and do not
+/// turn the move into a copy.
 pub(crate) async fn read_bounded_body(
     mut response: reqwest::Response,
     limit: usize,
@@ -238,7 +310,7 @@ pub(crate) async fn read_bounded_body(
         return Err(OutboundUrlPolicyError::BodyTooLarge { limit });
     }
 
-    let mut body = Vec::new();
+    let mut body = Zeroizing::new(Vec::with_capacity(limit));
     while let Some(chunk) = response
         .chunk()
         .await
@@ -246,7 +318,7 @@ pub(crate) async fn read_bounded_body(
     {
         append_bounded_chunk(&mut body, &chunk, limit)?;
     }
-    Ok(body)
+    Ok(std::mem::take(&mut *body))
 }
 
 #[derive(Clone)]
@@ -464,9 +536,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        ConfiguredEndpointUrl, OutboundUrlPolicyError, PublicMetadataUrl, append_bounded_chunk,
-        public_metadata_http_client, public_metadata_ip_is_blocked, read_bounded_body,
-        validate_public_resolution,
+        ConfiguredEndpointUrl, DiscoveredEndpointUrl, OutboundUrlPolicyError, PublicMetadataUrl,
+        append_bounded_chunk, public_metadata_http_client, public_metadata_ip_is_blocked,
+        read_bounded_body, validate_public_resolution,
     };
 
     #[test]
@@ -522,6 +594,40 @@ mod tests {
         assert!(matches!(
             ConfiguredEndpointUrl::parse("https://user:password@login.example.test/oauth"),
             Err(OutboundUrlPolicyError::CredentialsNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn discovered_endpoints_bind_loopback_http_to_loopback_http_issuers() {
+        let remote_issuer =
+            ConfiguredEndpointUrl::parse("https://accounts.example.test/tenant").expect("issuer");
+        let loopback_issuer =
+            ConfiguredEndpointUrl::parse("http://127.0.0.1:9080/tenant").expect("issuer");
+
+        for endpoint in [
+            "http://localhost:14554/authorize",
+            "http://127.42.0.1:14554/token",
+            "http://[::1]:14554/jwks",
+        ] {
+            assert!(matches!(
+                DiscoveredEndpointUrl::parse(endpoint, &remote_issuer),
+                Err(OutboundUrlPolicyError::DiscoveredEndpointTransport)
+            ));
+            DiscoveredEndpointUrl::parse(endpoint, &loopback_issuer)
+                .expect("loopback issuer permits loopback endpoint");
+        }
+
+        for endpoint in [
+            "https://accounts.example.test/authorize",
+            "https://10.0.0.8/token",
+        ] {
+            DiscoveredEndpointUrl::parse(endpoint, &remote_issuer)
+                .expect("HTTPS reaches public or private providers");
+        }
+
+        assert!(matches!(
+            DiscoveredEndpointUrl::parse("http://accounts.example.test/token", &loopback_issuer),
+            Err(OutboundUrlPolicyError::DiscoveredEndpointTransport)
         ));
     }
 
@@ -759,9 +865,14 @@ mod tests {
         let response = reqwest::get(format!("{}/metadata", server.uri()))
             .await
             .expect("response");
+        // The limit sits well above the body so the capacity below can only
+        // come from the reserve, not from the five bytes that were read.
+        let body = read_bounded_body(response, 4096).await.expect("body");
+        assert_eq!(body, b"hello");
         assert_eq!(
-            read_bounded_body(response, 5).await.expect("body"),
-            b"hello"
+            body.capacity(),
+            4096,
+            "the bounded buffer must reserve its full limit to avoid reallocating secret data"
         );
 
         let response = reqwest::get(format!("{}/metadata", server.uri()))
