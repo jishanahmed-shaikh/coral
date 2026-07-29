@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use super::config::{AuthSettings, signing_key_env_error};
+use super::config::{AuthSettings, ResolvedAuthSettings, signing_key_env_error};
 use super::error::AuthServerError;
 use super::session::SessionTokenIssuer;
 use super::state_store::{InMemoryStateStore, StateStore};
@@ -22,7 +22,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Prepared Coral authorization server with validated settings and runtime dependencies.
 pub struct CoralAuthorizationServer {
-    settings: Arc<AuthSettings>,
+    settings: Arc<ResolvedAuthSettings>,
     session_tokens: SessionTokenIssuer,
     state_store: Arc<dyn StateStore>,
 }
@@ -32,6 +32,8 @@ impl CoralAuthorizationServer {
     ///
     /// [`AuthSettings`] can only be produced by [`AuthSettings::from_toml`],
     /// so the settings arrive already validated and are not rechecked here.
+    /// This resolves what parsing cannot: the provider secret and the session
+    /// signing key.
     ///
     /// `config_path` is used only to resolve a relative session signing-key
     /// path. Config parsing and the `config.toml` filesystem read remain the
@@ -39,21 +41,22 @@ impl CoralAuthorizationServer {
     ///
     /// # Errors
     ///
-    /// Returns an error when the session signing key cannot be resolved or the
-    /// session-token key material is invalid.
+    /// Returns an error when the provider secret cannot be resolved from its
+    /// environment variable, the session signing key cannot be resolved, or
+    /// the session-token key material is invalid.
     pub fn from_settings(
         config_path: &Path,
         settings: AuthSettings,
     ) -> Result<Self, AuthServerError> {
         let (settings, session_tokens) = settings
-            .resolve_session_token_issuer(config_path, &|name| {
+            .resolve_runtime_dependencies(config_path, &|name| {
                 crate::bootstrap::env_var(name).map_err(|error| signing_key_env_error(&error))
             })?;
         Self::from_resolved_settings(settings, session_tokens)
     }
 
     pub(crate) fn from_resolved_settings(
-        settings: AuthSettings,
+        settings: ResolvedAuthSettings,
         session_tokens: SessionTokenIssuer,
     ) -> Result<Self, AuthServerError> {
         if !settings.matches_session_token_issuer(&session_tokens) {
@@ -62,7 +65,10 @@ impl CoralAuthorizationServer {
         Ok(Self::from_validated_parts(settings, session_tokens))
     }
 
-    fn from_validated_parts(settings: AuthSettings, session_tokens: SessionTokenIssuer) -> Self {
+    fn from_validated_parts(
+        settings: ResolvedAuthSettings,
+        session_tokens: SessionTokenIssuer,
+    ) -> Self {
         Self {
             settings: Arc::new(settings),
             session_tokens,
@@ -170,7 +176,7 @@ impl Drop for RunningCoralAuthorizationServer {
 
 #[derive(Clone)]
 struct AuthorizationServerHttpState {
-    settings: Arc<AuthSettings>,
+    settings: Arc<ResolvedAuthSettings>,
     #[expect(
         dead_code,
         reason = "used by the OAuth token endpoint in a descendant PR"
@@ -288,9 +294,11 @@ mod tests {
         let dir = authorization_server("");
         let config_path = dir.path().join("config.toml");
         let raw = fs::read_to_string(&config_path).expect("config snapshot");
-        let settings = AuthSettings::from_toml(&raw)
+        let (settings, _issuer) = AuthSettings::from_toml(&raw)
             .expect("valid config")
-            .expect("auth settings");
+            .expect("auth settings")
+            .resolve_runtime_dependencies(&config_path, &|_| Ok(None))
+            .expect("resolved runtime dependencies");
         let signing_key = fs::read(dir.path().join("session.key")).expect("session key");
         let session_tokens = super::SessionTokenIssuer::new(
             Some("http://localhost:9999"),
