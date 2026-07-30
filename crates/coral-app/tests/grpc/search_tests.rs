@@ -243,6 +243,8 @@ async fn search_and_list_catalog_share_installed_udf_metadata() {
         .add_function(Request::new(AddFunctionRequest {
             workspace: Some(workspace.clone()),
             sql: review_queue_function_sql(),
+            fail_if_exists: false,
+            write_surface: 0,
         }))
         .await
         .expect("add review queue function");
@@ -297,6 +299,8 @@ async fn natural_language_review_queue_query_ranks_installed_udf_in_top_three() 
         .add_function(Request::new(AddFunctionRequest {
             workspace: Some(default_workspace()),
             sql: review_queue_function_sql(),
+            fail_if_exists: false,
+            write_surface: 0,
         }))
         .await
         .expect("add review queue function");

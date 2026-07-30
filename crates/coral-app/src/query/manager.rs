@@ -21,7 +21,10 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use crate::bootstrap::AppError;
 use crate::catalog::model::CatalogResolution;
 use crate::credentials::{CredentialManager, CredentialSetId};
-use crate::functions::manager::{FunctionListing, FunctionManager, ValidatedFunctionInstall};
+use crate::functions::manager::{
+    FunctionInstallMode, FunctionListing, FunctionManager, ValidatedFunctionInstall,
+};
+use crate::functions::model::FunctionWriteSurface;
 use crate::hash::sha256_hex;
 use crate::query::QueryAttribution;
 use crate::query::extensions::{EngineExtensionsProvider, engine_extensions_for_providers};
@@ -65,6 +68,13 @@ pub(crate) enum ExecuteSqlOutcome {
 pub(crate) struct ValidatedSource {
     pub(crate) source: InstalledSource,
     pub(crate) report: SourceValidationReport,
+}
+
+#[derive(Debug)]
+pub(crate) struct AddedUserFunction {
+    pub(crate) definition: UdfRuntimeDefinition,
+    pub(crate) replaced: bool,
+    pub(crate) write_surface: FunctionWriteSurface,
 }
 
 #[derive(Clone, Copy)]
@@ -793,7 +803,9 @@ impl QueryManager {
         &self,
         workspace_name: &WorkspaceName,
         raw_sql: &str,
-    ) -> Result<UdfRuntimeDefinition, QueryManagerError> {
+        mode: FunctionInstallMode,
+        write_surface: FunctionWriteSurface,
+    ) -> Result<AddedUserFunction, QueryManagerError> {
         for _ in 0..2 {
             let revision = self.lifecycle_lock.snapshot_async().await.revision();
             self.require_workspace(workspace_name)
@@ -820,11 +832,19 @@ impl QueryManager {
                     raw_sql,
                     &runtime_function,
                     revision,
+                    mode,
+                    write_surface,
                 )
                 .await
                 .map_err(QueryManagerError::App)?
             {
-                ValidatedFunctionInstall::Installed => return Ok(runtime_function),
+                ValidatedFunctionInstall::Installed { replaced } => {
+                    return Ok(AddedUserFunction {
+                        definition: runtime_function,
+                        replaced,
+                        write_surface,
+                    });
+                }
                 ValidatedFunctionInstall::WorkspaceChanged => {}
             }
         }
@@ -1206,6 +1226,7 @@ fn app_error_type(error: &AppError) -> &'static str {
         AppError::Unauthenticated(_) => "UNAUTHENTICATED",
         AppError::SourceNotFound(_) => "SOURCE_NOT_FOUND",
         AppError::FunctionNotFound(_) => "FUNCTION_NOT_FOUND",
+        AppError::FunctionAlreadyExists(_) => "FUNCTION_ALREADY_EXISTS",
         AppError::WorkspaceNotFound(_) => "WORKSPACE_NOT_FOUND",
         AppError::WorkspaceAlreadyExists(_) => "WORKSPACE_ALREADY_EXISTS",
         AppError::InvalidInput(_) => "INVALID_INPUT",
@@ -2572,7 +2593,12 @@ select text from function_demo.messages
 
         let error = fixture
             .manager
-            .add_user_function(&workspace_name, function_sql)
+            .add_user_function(
+                &workspace_name,
+                function_sql,
+                FunctionInstallMode::ReplaceExisting,
+                FunctionWriteSurface::Unknown,
+            )
             .await
             .expect_err("source change should invalidate the original validation snapshot");
 

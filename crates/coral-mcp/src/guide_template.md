@@ -4,7 +4,7 @@
 
 ## Discovery Workflow
 
-Treat Coral like a read-only SQL database. The MCP discovery tools are routing helpers, not replacement APIs. {{SEARCH_DISCOVERY_GUIDANCE}}
+Treat Coral's `sql` tool like a read-only SQL database. The MCP discovery tools are routing helpers, not replacement APIs. {{SEARCH_DISCOVERY_GUIDANCE}}
 
 Prefer one SQL statement with `JOIN`, `CROSS JOIN`, CTEs, subqueries, aggregates, or window functions over fetching rows and combining them in the agent. Use `CROSS JOIN` explicitly when the query needs every combination of rows from two relations. Call table functions from `FROM` with named arguments, for example `github.search_issues(q => 'repo:withcoral/coral deploy failure')`.
 
@@ -61,6 +61,18 @@ SELECT *
 FROM launchdarkly.flag_environments
 WHERE json_get_str(rules, 0, 'clauses', 0, 'values', 0) = 'phoebe-org';
 ```
+
+## Creating Reusable Functions
+
+Test the query with representative values, consolidate the useful workflow into one read-only query, replace varying scalar values with `$placeholders`, and call `add_function`:
+
+```sql
+select number, title, html_url as url
+from github.pulls
+where owner = $owner and repo = $repo and state = 'open'
+```
+
+Each distinct placeholder becomes a required named argument. Coral infers its type from the surrounding SQL; add an explicit cast such as `cast($limit as BIGINT)` when the context is ambiguous. Placeholders represent scalar values and cannot replace schema, table, function, or column identifiers.
 
 ## Query Guidance
 
