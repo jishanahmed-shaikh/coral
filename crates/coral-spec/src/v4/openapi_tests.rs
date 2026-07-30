@@ -2002,7 +2002,7 @@ components:
 
 /// Row-path inference asks the pagination detectors whether an operation is
 /// paginated rather than predicting their answer, so a contract binding any
-/// request input is envelope evidence — one case per way `binds_pagination_input`
+/// request input is envelope evidence — one case per way `signals_page_envelope`
 /// can be satisfied. Predicting the answer used to deadlock the two inferences:
 /// no row path because an alias was unknown, and no pagination because the gate
 /// needs a row path. `skip`/`take` and `$skip`/`$top` are the aliases that
@@ -2125,7 +2125,7 @@ components:
         ("cursorlist", PaginationMode::CursorQuery),
         ("pagelist", PaginationMode::Page),
         // Link-header detection is tried first, so this reaches
-        // `binds_pagination_input` by a different route than `pagelist` does —
+        // `signals_page_envelope` by a different route than `pagelist` does —
         // and it is the shape most real paginated endpoints use.
         ("linkheaderlist", PaginationMode::LinkHeader),
     ] {
@@ -2305,4 +2305,322 @@ paths:
         operation.diagnostics
     );
     assert_eq!(operation.output.cardinality, OutputCardinality::Unknown);
+}
+
+/// A body field holding a whole next-page URL is a stronger signal than a
+/// guessed cursor parameter, so it outranks cursor-query and offset detection —
+/// but only for names that actually denote a URL.
+#[test]
+fn importer_detects_body_next_url_pagination_above_cursor_and_offset() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: nexturl
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://api.example.com
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /next-url:
+    get:
+      operationId: nextUrlList
+      parameters:
+        - {name: skip, in: query, schema: {type: integer, default: 0}}
+        - {name: limit, in: query, schema: {type: integer, default: 25}}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  next_page_url: {type: string}
+                  data:
+                    type: array
+                    items: {type: object, properties: {id: {type: string}}}
+  /next-token:
+    get:
+      operationId: nextTokenList
+      parameters:
+        - {name: cursor, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, default: 25}}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  next_cursor: {type: string}
+                  data:
+                    type: array
+                    items: {type: object, properties: {id: {type: string}}}
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    let next_url = imported_rest_pagination(&ir, "nexturllist");
+    assert_eq!(next_url.mode, PaginationMode::NextUrlBody);
+    assert_eq!(next_url.next_url_path, ["next_page_url"]);
+    assert_eq!(
+        next_url
+            .page_size
+            .as_ref()
+            .and_then(|size| size.query_param.as_deref()),
+        Some("limit"),
+        "page one still asks for a page size; later pages inherit it from the URL"
+    );
+    assert!(
+        next_url.offset_param.is_none(),
+        "a whole next URL must beat offset detection, which would drive `skip` the server may reject"
+    );
+    assert_eq!(imported_row_path(&ir, "nexturllist"), ["data"]);
+
+    // `next_cursor` is a token, not a URL: it belongs in the request parameter
+    // that expects it, so it must keep falling through to cursor-query.
+    let next_token = imported_rest_pagination(&ir, "nexttokenlist");
+    assert_eq!(next_token.mode, PaginationMode::CursorQuery);
+    assert_eq!(next_token.cursor_param.as_deref(), Some("cursor"));
+    assert!(next_token.next_url_path.is_empty());
+}
+
+/// A declared `Link` header is cheaper and more standard than reading the body,
+/// so it stays ahead of body next-URL detection.
+#[test]
+fn importer_prefers_a_declared_link_header_over_a_body_next_url() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: linkfirst
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://api.example.com
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /both:
+    get:
+      operationId: bothList
+      parameters:
+        - {name: per_page, in: query, schema: {type: integer, default: 30}}
+      responses:
+        '200':
+          headers:
+            Link:
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  next_link: {type: string}
+                  data:
+                    type: array
+                    items: {type: object, properties: {id: {type: string}}}
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    let pagination = imported_rest_pagination(&ir, "bothlist");
+    assert_eq!(pagination.mode, PaginationMode::LinkHeader);
+    assert!(pagination.next_url_path.is_empty());
+}
+
+/// A next-page URL in the response body is envelope evidence in its own right.
+///
+/// Graph is the shape that needs it: `{"@odata.nextLink": ..., "value": [...]}`
+/// on an operation that declares no `$top`. The response names no conventional
+/// row property and carries no metadata sibling the lexicon recognizes, so
+/// without the next-URL path there is nothing to unwrap `value` on — and a
+/// contract only survives once the response reads as a list, so the pagination
+/// would have been discarded along with the row path.
+#[test]
+fn importer_treats_a_body_next_url_as_envelope_evidence_without_page_inputs() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: odata
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://graph.microsoft.com/v1.0
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /users:
+    get:
+      operationId: listUsers
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  '@odata.nextLink': {type: string}
+                  value:
+                    type: array
+                    items: {type: object, properties: {id: {type: string}}}
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    assert_eq!(imported_row_path(&ir, "listusers"), ["value"]);
+    let pagination = imported_rest_pagination(&ir, "listusers");
+    assert_eq!(pagination.mode, PaginationMode::NextUrlBody);
+    assert_eq!(pagination.next_url_path, ["@odata.nextLink"]);
+    assert!(
+        pagination.page_size.is_none(),
+        "nothing declares a page size here; the next URL carries the paging state"
+    );
+}
+
+/// A body next-URL outranks the input-corroborated modes, so it has to be more
+/// than a name match: the schema must declare the property a string.
+///
+/// Without that, an operation like this one got `mode: next_url_body` on the
+/// strength of the name `nextLink`. At runtime `Value::as_str` on a non-string
+/// reads `None`, `advance_pagination_state` stops, and the query returns page
+/// one — no error, no diagnostic — where the `skip`/`limit` contract the server
+/// actually declared would have fetched everything.
+#[test]
+fn importer_ignores_a_body_next_url_the_schema_does_not_declare_a_string() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: things
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://api.example.com
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /things:
+    get:
+      operationId: listThings
+      parameters:
+        - {name: skip, in: query, schema: {type: integer, default: 0}}
+        - {name: limit, in: query, schema: {type: integer, default: 25}}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nextLink: {}
+                  data:
+                    type: array
+                    items: {type: object, properties: {id: {type: string}}}
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    let pagination = imported_rest_pagination(&ir, "listthings");
+    assert_eq!(
+        pagination.mode,
+        PaginationMode::Offset,
+        "an undeclared type is not enough to displace the contract the server declared"
+    );
+    assert_eq!(pagination.offset_param.as_deref(), Some("skip"));
+    assert!(pagination.next_url_path.is_empty());
+}
+
+/// ...but only at the response root, which is where what it unlocks applies.
+///
+/// `find_response_cursor_path` descends into nested objects up to depth 8. A
+/// singleton resource that happens to carry a nested link — every pre-existing
+/// detector was immune to this, because each needed a bound request input —
+/// would otherwise reach the sole-array fallback and have its one incidental
+/// array promoted to the whole relation.
+#[test]
+fn importer_ignores_a_body_next_url_nested_below_the_response_root() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: tracks
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://api.example.com
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /tracks/{id}:
+    get:
+      operationId: getTrack
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  tags:
+                    type: array
+                    items: {type: string}
+                  links:
+                    type: object
+                    properties:
+                      next_href: {type: string}
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    assert!(
+        imported_row_path(&ir, "gettrack").is_empty(),
+        "the track is the resource; its tags are one of its fields, not the relation"
+    );
+    assert_eq!(
+        imported_rest_pagination(&ir, "gettrack").mode,
+        PaginationMode::None,
+        "a contract only survives once the response reads as a list"
+    );
 }
