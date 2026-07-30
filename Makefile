@@ -28,14 +28,16 @@ perf-check:
 # ----------------------------------------------------------------------------
 # Local Postgres-backed tests
 # ----------------------------------------------------------------------------
-# Starts a Docker Postgres matching CI's major version and runs the ignored
-# Postgres coverage against it. By default Docker chooses an available localhost
-# port, and postgres-tests creates a fresh database inside the container for
-# each run. Set LOCAL_POSTGRES_PORT=55432 if you need a stable host port.
+# Runs all ignored Postgres coverage through postgres-tests. When
+# CORAL_TEST_POSTGRES_URL is set, the target uses that database. Otherwise it
+# starts a Docker Postgres matching CI's major version and creates a fresh
+# database inside the reusable container. Docker chooses an available localhost
+# port by default; set LOCAL_POSTGRES_PORT=55432 if you need a stable host port.
 #
 #   make postgres-start   # start/wait for local Docker Postgres
 #   make postgres-url     # print the local Postgres connection URL
-#   make postgres-tests   # start Docker Postgres, then run Postgres tests
+#   make postgres-tests   # provision locally, then run all Postgres tests
+#   CORAL_TEST_POSTGRES_URL=... make postgres-tests  # use an existing database
 #   make postgres-stop    # stop the local Docker Postgres container
 #   make postgres-clean   # remove the local Docker Postgres container
 
@@ -91,18 +93,33 @@ postgres-stop:
 postgres-clean:
 	@docker rm -f "$(LOCAL_POSTGRES_CONTAINER)" >/dev/null 2>&1 || true
 
-postgres-tests: postgres-start
+# Provision the local container through a prerequisite rather than a recursive
+# $(MAKE) call inside the recipe. GNU make runs any recipe line containing
+# $(MAKE) even under -n/-t/-q, and this recipe is a single continued line, so an
+# inline sub-make would make `make -n postgres-tests` execute the real suite.
+# CORAL_TEST_POSTGRES_URL reaches both this conditional and the recipe's shell
+# whether it is set in the environment or on the command line.
+POSTGRES_TESTS_PREREQS :=
+ifeq ($(strip $(CORAL_TEST_POSTGRES_URL)),)
+POSTGRES_TESTS_PREREQS := postgres-start
+endif
+
+postgres-tests: $(POSTGRES_TESTS_PREREQS)
 	@set -eu; \
-	host_port=$$(docker port "$(LOCAL_POSTGRES_CONTAINER)" 5432/tcp | sed -n 's/.*:\([0-9][0-9]*\)$$/\1/p' | head -n 1); \
-	if [ -z "$$host_port" ]; then \
-	  echo "Local Postgres is not exposing 5432/tcp"; \
-	  exit 1; \
+	url="$${CORAL_TEST_POSTGRES_URL:-}"; \
+	cleanup() { :; }; \
+	if [ -z "$$url" ]; then \
+	  host_port=$$(docker port "$(LOCAL_POSTGRES_CONTAINER)" 5432/tcp | sed -n 's/.*:\([0-9][0-9]*\)$$/\1/p' | head -n 1); \
+	  if [ -z "$$host_port" ]; then \
+	    echo "Local Postgres is not exposing 5432/tcp"; \
+	    exit 1; \
+	  fi; \
+	  db_name="coral_test_$$(date +%s)_$$$$"; \
+	  docker exec "$(LOCAL_POSTGRES_CONTAINER)" createdb -U postgres "$$db_name"; \
+	  cleanup() { docker exec "$(LOCAL_POSTGRES_CONTAINER)" dropdb -U postgres --if-exists "$$db_name" >/dev/null 2>&1 || true; }; \
+	  url="postgres://postgres:postgres@127.0.0.1:$$host_port/$$db_name"; \
 	fi; \
-	db_name="coral_test_$$(date +%s)_$$$$"; \
-	docker exec "$(LOCAL_POSTGRES_CONTAINER)" createdb -U postgres "$$db_name"; \
-	cleanup() { docker exec "$(LOCAL_POSTGRES_CONTAINER)" dropdb -U postgres --if-exists "$$db_name" >/dev/null 2>&1 || true; }; \
 	trap cleanup EXIT INT TERM; \
-	url="postgres://postgres:postgres@127.0.0.1:$$host_port/$$db_name"; \
 	echo "Running Postgres tests against $$url"; \
 	CORAL_TEST_POSTGRES_URL="$$url" cargo test --locked -p coral-app --lib \
 	  repository_round_trips_against_postgres \
