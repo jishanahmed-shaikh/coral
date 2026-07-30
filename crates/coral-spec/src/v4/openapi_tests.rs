@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use super::*;
 use crate::{
@@ -1231,6 +1232,198 @@ components:
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("allOf property")),
+        "{:?}",
+        operation.diagnostics
+    );
+    assert_eq!(operation.output.type_ref, "json");
+}
+
+/// A branch may be an alias — `{$ref: Alias}` where `Alias` is itself
+/// `{$ref: Base}` — which one hop of resolution leaves still holding a `$ref`,
+/// with nothing to contribute.
+///
+/// Inference resolves chains, so a branch dropped here would make a row path it
+/// found look absent from the imported type, and `infer_row_path` would discard
+/// the path.
+#[test]
+fn importer_folds_all_of_branches_through_alias_refs() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: aliased_all_of
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://api.example.com
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /items:
+    get:
+      operationId: items/list
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Page'}
+components:
+  schemas:
+    Base:
+      type: object
+      properties:
+        next_cursor: {type: string}
+    Alias: {$ref: '#/components/schemas/Base'}
+    Page:
+      type: object
+      allOf:
+        - {$ref: '#/components/schemas/Alias'}
+        - type: object
+          properties:
+            items:
+              type: array
+              items: {type: object, properties: {id: {type: string}}}
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    let operation = ir.operations.first().expect("operation");
+    let row_type = ir
+        .types
+        .iter()
+        .find(|ty| ty.id == operation.output.type_ref)
+        .expect("row type");
+    let IrTypeShape::Object { fields } = &row_type.shape else {
+        panic!("the composed page should import as an object: {row_type:?}");
+    };
+    let names = fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        names.contains(&"next_cursor"),
+        "the aliased base contributes its properties: {names:?}"
+    );
+    assert!(names.contains(&"items"), "{names:?}");
+}
+
+/// The fold tracks the refs it is resolving, so a self-referential branch is
+/// named as a cycle rather than recursing until the depth cap stops it.
+#[test]
+fn importer_reports_a_cyclic_all_of_branch() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: cyclic_all_of
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://api.example.com
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /items:
+    get:
+      operationId: items/list
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Loop'}
+components:
+  schemas:
+    Loop:
+      type: object
+      allOf:
+        - {$ref: '#/components/schemas/Loop'}
+"
+        .as_bytes(),
+    )
+    .expect("a cyclic allOf imports with diagnostics rather than recursing");
+
+    let operation = ir.operations.first().expect("operation");
+    assert!(
+        operation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("cyclic")),
+        "the diagnostic must name the cycle, not a depth ceiling: {:?}",
+        operation.diagnostics
+    );
+    assert_eq!(operation.output.type_ref, "json");
+}
+
+/// Composition past the cap reports its own ceiling. Reusing the property
+/// comparison error sent whoever read it to a constant eight times larger.
+#[test]
+fn importer_reports_all_of_composition_past_the_depth_cap() {
+    let mut schemas = String::from(
+        r"
+components:
+  schemas:
+    Deep0:
+      type: object
+      properties:
+        id: {type: string}
+",
+    );
+    for level in 1..=12 {
+        writeln!(
+            schemas,
+            "    Deep{level}:\n      type: object\n      allOf:\n        - {{$ref: '#/components/schemas/Deep{}'}}",
+            level - 1
+        )
+        .expect("writing to a String cannot fail");
+    }
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: deep_all_of
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://api.example.com
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let document = format!(
+        r"
+openapi: 3.0.3
+paths:
+  /items:
+    get:
+      operationId: items/list
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {{$ref: '#/components/schemas/Deep12'}}
+{schemas}"
+    );
+    let ir = import_openapi_surface(v4, &v4.surface, document.as_bytes()).expect("import");
+
+    let operation = ir.operations.first().expect("operation");
+    assert!(
+        operation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("nests past")),
         "{:?}",
         operation.diagnostics
     );
@@ -2622,5 +2815,420 @@ paths:
         imported_rest_pagination(&ir, "gettrack").mode,
         PaginationMode::None,
         "a contract only survives once the response reads as a list"
+    );
+}
+
+/// End to end on the Microsoft Graph shape: an `allOf` envelope of a shared
+/// pagination base and a `value` array, with `$top`/`$skip` both declared.
+///
+/// The `offset_param` assertion is the regression guard for the ordering
+/// constraint. Graph declares `$skip` on collections that reject it at runtime,
+/// so if body next-URL detection ever stopped winning, these tables would go
+/// from returning one page to returning an error.
+#[test]
+fn importer_reads_odata_collections_as_paginated_row_tables() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: graph
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://graph.microsoft.com/v1.0
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /me/chats:
+    get:
+      operationId: me.listChats
+      parameters:
+        - {name: $top, in: query, schema: {type: integer}}
+        - {name: $skip, in: query, schema: {type: integer}}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/microsoft.graph.chatCollectionResponse'
+components:
+  schemas:
+    BaseCollectionPaginationCountResponse:
+      title: Base collection pagination and count responses
+      type: object
+      properties:
+        '@odata.count': {type: integer, format: int64, nullable: true}
+        '@odata.nextLink': {type: string, nullable: true}
+    microsoft.graph.chat:
+      type: object
+      properties:
+        id: {type: string}
+        topic: {type: string}
+    microsoft.graph.chatCollectionResponse:
+      title: Collection of chat
+      type: object
+      allOf:
+        - $ref: '#/components/schemas/BaseCollectionPaginationCountResponse'
+        - type: object
+          properties:
+            value:
+              type: array
+              items:
+                $ref: '#/components/schemas/microsoft.graph.chat'
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    assert_eq!(imported_row_path(&ir, "me_listchats"), ["value"]);
+
+    let pagination = imported_rest_pagination(&ir, "me_listchats");
+    assert_eq!(pagination.mode, PaginationMode::NextUrlBody);
+    assert_eq!(pagination.next_url_path, ["@odata.nextLink"]);
+    assert_eq!(
+        pagination
+            .page_size
+            .as_ref()
+            .and_then(|size| size.query_param.as_deref()),
+        Some("$top")
+    );
+    assert!(
+        pagination.offset_param.is_none(),
+        "Graph rejects $skip on several collections; the next link is the only contract that works"
+    );
+}
+
+/// The fixture above declares only `$top` and `$skip`, which is not what a real
+/// Graph collection looks like: they also declare a boolean `$count`.
+///
+/// `find_numeric_query_input` picks the first candidate-named input and only
+/// then filters by type, so `$count` is chosen and rejected and `$top` is never
+/// reached — page-size detection finds nothing. Pinning it here so the
+/// follow-up that fixes the ordering has an assertion to flip; pagination
+/// itself is unaffected, since the next link carries the paging state and Coral
+/// just accepts Graph's server-side default page size.
+#[test]
+fn importer_misses_the_page_size_a_boolean_count_parameter_masks() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: graph
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://graph.microsoft.com/v1.0
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /me/chats:
+    get:
+      operationId: me.listChats
+      parameters:
+        - {name: $top, in: query, schema: {type: integer}}
+        - {name: $skip, in: query, schema: {type: integer}}
+        - {name: $count, in: query, schema: {type: boolean}}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/microsoft.graph.chatCollectionResponse'
+components:
+  schemas:
+    BaseCollectionPaginationCountResponse:
+      title: Base collection pagination and count responses
+      type: object
+      properties:
+        '@odata.count': {type: integer, format: int64, nullable: true}
+        '@odata.nextLink': {type: string, nullable: true}
+    microsoft.graph.chat:
+      type: object
+      properties:
+        id: {type: string}
+        topic: {type: string}
+    microsoft.graph.chatCollectionResponse:
+      title: Collection of chat
+      type: object
+      allOf:
+        - $ref: '#/components/schemas/BaseCollectionPaginationCountResponse'
+        - type: object
+          properties:
+            value:
+              type: array
+              items:
+                $ref: '#/components/schemas/microsoft.graph.chat'
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    // The collection still reads as a paginated row table — only the page size
+    // is lost.
+    assert_eq!(imported_row_path(&ir, "me_listchats"), ["value"]);
+    let pagination = imported_rest_pagination(&ir, "me_listchats");
+    assert_eq!(pagination.mode, PaginationMode::NextUrlBody);
+    assert_eq!(pagination.next_url_path, ["@odata.nextLink"]);
+    assert!(
+        pagination.page_size.is_none(),
+        "boolean $count sorts ahead of $top and masks it; flip this when \
+         find_numeric_query_input filters by type before choosing"
+    );
+}
+
+/// Graph nests its envelope bases: a delta collection response composes
+/// `BaseDeltaFunctionResponse`, which is itself an `allOf` over
+/// `BaseCollectionPaginationCountResponse`. Row-path inference folds that whole
+/// tree, so type import has to fold it too — otherwise the imported type is
+/// missing the properties the inferred path names and the path is discarded.
+#[test]
+fn importer_folds_nested_all_of_envelope_bases() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: graph
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://graph.microsoft.com/v1.0
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /me/chats/delta:
+    get:
+      operationId: me.chats.delta
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/microsoft.graph.chatDeltaCollectionResponse'
+components:
+  schemas:
+    BaseCollectionPaginationCountResponse:
+      type: object
+      properties:
+        '@odata.count': {type: integer, format: int64, nullable: true}
+        '@odata.nextLink': {type: string, nullable: true}
+    BaseDeltaFunctionResponse:
+      type: object
+      allOf:
+        - $ref: '#/components/schemas/BaseCollectionPaginationCountResponse'
+        - type: object
+          properties:
+            '@odata.deltaLink': {type: string, nullable: true}
+    microsoft.graph.chat:
+      type: object
+      properties:
+        id: {type: string}
+    microsoft.graph.chatDeltaCollectionResponse:
+      type: object
+      allOf:
+        - $ref: '#/components/schemas/BaseDeltaFunctionResponse'
+        - type: object
+          properties:
+            value:
+              type: array
+              items:
+                $ref: '#/components/schemas/microsoft.graph.chat'
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    assert_eq!(imported_row_path(&ir, "me_chats_delta"), ["value"]);
+
+    let pagination = imported_rest_pagination(&ir, "me_chats_delta");
+    assert_eq!(pagination.mode, PaginationMode::NextUrlBody);
+    assert_eq!(pagination.next_url_path, ["@odata.nextLink"]);
+
+    // The nested base contributes `@odata.count`/`@odata.nextLink` and the
+    // intermediate one `@odata.deltaLink`. Folding only the immediate branches
+    // kept `value` alone.
+    let IrTypeShape::Object { fields } = &ir
+        .semantic_ir
+        .types
+        .iter()
+        .find(|ty| ty.id == "me_chats_delta_row")
+        .expect("response type")
+        .shape
+    else {
+        panic!("expected an object response type");
+    };
+    let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "@odata.count",
+            "@odata.deltaLink",
+            "@odata.nextLink",
+            "value"
+        ]
+    );
+}
+
+/// `properties` declared alongside `allOf` are as much part of the schema as
+/// the branches are.
+///
+/// Row-path inference reads both, so before type import did too, the inferred
+/// `value` path was rejected as absent from the imported type and the whole
+/// collection collapsed to a single JSON row.
+#[test]
+fn importer_keeps_properties_declared_beside_all_of() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: graph
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://graph.microsoft.com/v1.0
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /me/chats:
+    get:
+      operationId: me.listChats
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/microsoft.graph.chatCollectionResponse'
+components:
+  schemas:
+    BaseCollectionPaginationCountResponse:
+      type: object
+      properties:
+        '@odata.count': {type: integer, format: int64, nullable: true}
+        '@odata.nextLink': {type: string, nullable: true}
+    microsoft.graph.chat:
+      type: object
+      properties:
+        id: {type: string}
+    microsoft.graph.chatCollectionResponse:
+      type: object
+      properties:
+        value:
+          type: array
+          items:
+            $ref: '#/components/schemas/microsoft.graph.chat'
+      allOf:
+        - $ref: '#/components/schemas/BaseCollectionPaginationCountResponse'
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    assert_eq!(imported_row_path(&ir, "me_listchats"), ["value"]);
+}
+
+/// A subtype re-declaring an inherited property to pin an annotation is not a
+/// conflict.
+///
+/// Every Graph type re-declares the `@odata.type` discriminator with its own
+/// `default`. Comparing declarations byte-for-byte reads that as two branches
+/// disagreeing and discards the whole type, which costs every column rather
+/// than the one property — so the comparison is on validation semantics, and
+/// [`importer_warns_for_openapi_all_of_property_conflicts`] still holds for branches
+/// that genuinely disagree.
+#[test]
+fn importer_accepts_annotation_only_redeclaration_across_all_of_levels() {
+    let manifest = parse_source_manifest_yaml(
+        r"
+name: graph
+dsl_version: 4
+surface:
+    type: openapi
+    file: /tmp/openapi.yaml
+    base_url: https://graph.microsoft.com/v1.0
+",
+    )
+    .expect("manifest");
+    let v4 = manifest.as_v4().expect("v4");
+    let ir = import_openapi_surface(
+        v4,
+        &v4.surface,
+        r"
+openapi: 3.0.3
+paths:
+  /me/drive:
+    get:
+      operationId: me.getDrive
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/microsoft.graph.drive'
+components:
+  schemas:
+    microsoft.graph.entity:
+      type: object
+      properties:
+        id: {type: string}
+        '@odata.type': {type: string}
+    microsoft.graph.baseItem:
+      type: object
+      allOf:
+        - $ref: '#/components/schemas/microsoft.graph.entity'
+        - type: object
+          properties:
+            name: {type: string}
+            webUrl: {type: string}
+    microsoft.graph.drive:
+      type: object
+      allOf:
+        - $ref: '#/components/schemas/microsoft.graph.baseItem'
+        - type: object
+          properties:
+            driveType: {type: string}
+            '@odata.type': {type: string, default: '#microsoft.graph.drive'}
+"
+        .as_bytes(),
+    )
+    .expect("import");
+
+    let IrTypeShape::Object { fields } = &ir
+        .semantic_ir
+        .types
+        .iter()
+        .find(|ty| ty.id == "me_getdrive_row")
+        .expect("drive response type")
+        .shape
+    else {
+        panic!("a conflict would have left the type as opaque JSON");
+    };
+    let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["@odata.type", "driveType", "id", "name", "webUrl"],
+        "the inherited columns must survive two levels of composition"
     );
 }
