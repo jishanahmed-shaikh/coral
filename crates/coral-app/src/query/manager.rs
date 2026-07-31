@@ -142,6 +142,10 @@ impl SourceDecorator for CatalogFailureRecorder {
         "catalog_failure_recorder"
     }
 
+    fn supports_catalog_sources(&self) -> bool {
+        true
+    }
+
     fn decorate_source(
         &mut self,
         _source: &QuerySource,
@@ -285,7 +289,7 @@ impl QueryManager {
                         SourceObservationMode::Disabled,
                     )
                     .await?;
-                Ok(runtime.list_tables(schema_filter, table_filter))
+                Ok(runtime.list_tables(None, schema_filter, table_filter))
             },
             |tables| Some(u64::try_from(tables.len()).unwrap_or(u64::MAX)),
             |_, _| {},
@@ -336,7 +340,7 @@ impl QueryManager {
                 let runtime_schema_owners =
                     runtime_schema_owners(&source_load.loaded).map_err(QueryManagerError::App)?;
                 Ok(CatalogResolution {
-                    catalog: runtime.list_catalog(schema_filter),
+                    catalog: runtime.list_catalog(None, schema_filter),
                     failed_source_names,
                     runtime_schema_owners,
                 })
@@ -385,7 +389,7 @@ impl QueryManager {
                         SourceObservationMode::Disabled,
                     )
                     .await?;
-                Ok(runtime.describe_table(schema_name, table_name))
+                Ok(runtime.describe_table(None, schema_name, table_name))
             },
             |_| None,
             |_, _| {},
@@ -424,8 +428,13 @@ impl QueryManager {
                     .await
                     .map_err(QueryManagerError::Core)?;
                 if let Some(shown_guide_ids) = shown_guide_ids {
-                    let required_guides =
-                        required_query_guides(&runtime.list_catalog(None), prepared.resources());
+                    // Unfiltered on both qualifiers: a required guide has to be
+                    // found wherever the query's tables live, including
+                    // catalog-backed sources.
+                    let required_guides = required_query_guides(
+                        &runtime.list_catalog(None, None),
+                        prepared.resources(),
+                    );
                     let unseen_guides = required_guides
                         .into_iter()
                         .filter(|guide| !shown_guide_ids.contains(&guide.guide_id))
@@ -1166,6 +1175,7 @@ fn record_query_provenance(span: &tracing::Span, provenance: &QueryExecutionProv
             .map(|table| {
                 json!({
                     "source_name": table.source_name(),
+                    "catalog_name": table.catalog_name(),
                     "schema_name": table.schema_name(),
                     "table_name": table.table_name(),
                 })
@@ -1601,7 +1611,10 @@ mod tests {
         );
         let resources = ResolvedQueryResources::new(
             vec!["github".to_string()],
-            vec![QueryTableUsage::new("github", "github", "issues")],
+            vec![
+                QueryTableUsage::new("github", None, "github", "issues"),
+                QueryTableUsage::new("warehouse", Some("warehouse"), "public", "users"),
+            ],
             vec![QueryTableFunctionUsage::new(
                 "github",
                 "github",
@@ -1624,10 +1637,12 @@ mod tests {
             span_attr(query_span, crate::telemetry::QUERY_TRACE_SOURCES_ATTR),
             Some(r#"["github"]"#.to_string())
         );
+        // A catalog-backed table records its catalog: `(schema, table)` alone
+        // would merge two databases that both expose `public.users`.
         assert_eq!(
             span_attr(query_span, crate::telemetry::QUERY_TRACE_TABLES_ATTR),
             Some(
-                r#"[{"source_name":"github","schema_name":"github","table_name":"issues"}]"#
+                r#"[{"source_name":"github","catalog_name":null,"schema_name":"github","table_name":"issues"},{"source_name":"warehouse","catalog_name":"warehouse","schema_name":"public","table_name":"users"}]"#
                     .to_string()
             )
         );
