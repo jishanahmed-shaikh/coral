@@ -80,14 +80,17 @@ pub(crate) fn guide_resource_content(
     );
     let mut schemas = tables
         .iter()
-        .filter(|table| table.schema_name != "coral")
-        .map(|table| table.schema_name.as_str())
+        .filter(|table| !is_coral_system_schema(table))
+        .map(visible_schema_entry)
         .collect::<BTreeSet<_>>();
+    // Sanitized like the table schemas above: source names are only validated
+    // as path segments, so a schema publishing table functions could otherwise
+    // carry a newline and break out of its `Visible schemas:` bullet.
     schemas.extend(
         table_function_schema_names
             .iter()
-            .map(String::as_str)
-            .filter(|schema| *schema != "coral"),
+            .filter(|schema| *schema != "coral")
+            .map(|schema| prompt_safe_text(schema)),
     );
     if schemas.is_empty() {
         if sources.is_empty() {
@@ -97,7 +100,7 @@ pub(crate) fn guide_resource_content(
         }
     } else {
         sources_section.push_str("\nVisible schemas:\n");
-        for schema in schemas {
+        for schema in &schemas {
             writeln!(sources_section, "- {schema}").expect("writing to String is infallible");
         }
     }
@@ -108,11 +111,21 @@ pub(crate) fn guide_resource_content(
 FROM coral.columns WHERE schema_name = '<schema>' AND table_name = '<table>' ORDER BY ordinal_position;"
                 .to_string()
         },
-        |(schema_name, table_name)| {
-            format!(
-                "SELECT column_name, data_type, is_nullable, is_virtual, is_required_filter, filter_mode, description \
-FROM coral.columns WHERE schema_name = '{schema_name}' AND table_name = '{table_name}' ORDER BY ordinal_position;"
-            )
+        |(catalog_name, schema_name, table_name)| {
+            let schema_name = sql_string_literal(schema_name);
+            let table_name = sql_string_literal(table_name);
+            if catalog_name.is_empty() {
+                format!(
+                    "SELECT column_name, data_type, is_nullable, is_virtual, is_required_filter, filter_mode, description \
+FROM coral.columns WHERE schema_name = {schema_name} AND table_name = {table_name} ORDER BY ordinal_position;"
+                )
+            } else {
+                let catalog_name = sql_string_literal(catalog_name);
+                format!(
+                    "SELECT column_name, data_type, is_nullable, is_virtual, is_required_filter, filter_mode, description \
+FROM coral.columns WHERE catalog_name = {catalog_name} AND schema_name = {schema_name} AND table_name = {table_name} ORDER BY ordinal_position;"
+                )
+            }
         },
     );
 
@@ -164,14 +177,51 @@ fn tables_resource_description(visible_table_count: usize) -> String {
     format!("Fully qualified database tables in Coral ({visible_table_count} table(s)).")
 }
 
-fn first_visible_table(tables: &[TableSummary]) -> Option<(&str, &str)> {
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn first_visible_table(tables: &[TableSummary]) -> Option<(&str, &str, &str)> {
     tables
         .iter()
-        .filter(|table| table.schema_name != "coral")
+        .filter(|table| !is_coral_system_schema(table))
         .min_by(|left, right| {
-            (&left.schema_name, &left.name).cmp(&(&right.schema_name, &right.name))
+            (&left.catalog_name, &left.schema_name, &left.name).cmp(&(
+                &right.catalog_name,
+                &right.schema_name,
+                &right.name,
+            ))
         })
-        .map(|table| (table.schema_name.as_str(), table.name.as_str()))
+        .map(|table| {
+            (
+                table.catalog_name.as_str(),
+                table.schema_name.as_str(),
+                table.name.as_str(),
+            )
+        })
+}
+
+fn is_coral_system_schema(table: &TableSummary) -> bool {
+    table.catalog_name.is_empty() && table.schema_name == "coral"
+}
+
+/// Renders one entry for the visible-schema list.
+///
+/// A catalog-backed table names its catalog separately rather than joining the
+/// two into `catalog.schema`: this list is labelled as schemas, and
+/// `warehouse.public` is not a schema — the schema is `public` and the catalog
+/// is `warehouse`. Keeping them apart is also what the `coral.*` metadata
+/// tables expect, since they filter on `catalog_name` and `schema_name`.
+fn visible_schema_entry(table: &TableSummary) -> String {
+    let schema_name = prompt_safe_text(&table.schema_name);
+    if table.catalog_name.is_empty() {
+        schema_name
+    } else {
+        format!(
+            "{schema_name} (catalog: {})",
+            prompt_safe_text(&table.catalog_name)
+        )
+    }
 }
 
 struct RenderedQueryExample {
@@ -277,10 +327,18 @@ mod tests {
                 name: "default".to_string(),
             }),
             schema_name: schema_name.to_string(),
+            catalog_name: String::new(),
             name: name.to_string(),
             description: format!("{name} description"),
             required_filters: Vec::new(),
             guide: format!("Query {name}."),
+        }
+    }
+
+    fn catalog_table(catalog_name: &str, schema_name: &str, name: &str) -> TableSummary {
+        TableSummary {
+            catalog_name: catalog_name.to_string(),
+            ..table(schema_name, name)
         }
     }
 
@@ -516,6 +574,22 @@ WHERE title LIKE '%bug%'",
     }
 
     #[test]
+    fn guide_content_qualifies_catalog_schema_and_column_example() {
+        let content = guide_resource_content(
+            &[source("warehouse")],
+            &[catalog_table("warehouse", "public", "orders")],
+            &[],
+            false,
+        );
+
+        assert!(content.contains("Visible schemas:\n- public (catalog: warehouse)"));
+        assert!(content.contains(
+            "FROM coral.columns WHERE catalog_name = 'warehouse' AND schema_name = 'public' \
+             AND table_name = 'orders' ORDER BY ordinal_position;"
+        ));
+    }
+
+    #[test]
     fn guide_content_includes_function_only_schemas() {
         let function_schemas = vec!["searchy".to_string()];
 
@@ -543,20 +617,24 @@ WHERE title LIKE '%bug%'",
     #[test]
     fn sql_reference_quotes_each_identifier_independently() {
         assert_eq!(
-            format_schema_table_equivalent("github", "pulls"),
+            format_schema_table_equivalent(None, "github", "pulls"),
             "github.pulls"
         );
         assert_eq!(
-            format_schema_table_equivalent("github", "Pull.Requests"),
+            format_schema_table_equivalent(None, "github", "Pull.Requests"),
             "github.\"Pull.Requests\""
         );
         assert_eq!(
-            format_schema_table_equivalent("git.hub", "pulls"),
+            format_schema_table_equivalent(None, "git.hub", "pulls"),
             "\"git.hub\".pulls"
         );
         assert_eq!(
-            format_schema_table_equivalent("git\"hub", "pulls"),
+            format_schema_table_equivalent(None, "git\"hub", "pulls"),
             "\"git\"\"hub\".pulls"
+        );
+        assert_eq!(
+            format_schema_table_equivalent(Some("coral_db"), "Main.Schema", "users"),
+            "coral_db.\"Main.Schema\".users"
         );
     }
 }
