@@ -15,6 +15,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use url::Position;
 
+use super::OIDC_CALLBACK_PATH;
 use super::config::{AuthSettings, ResolvedAuthSettings, signing_key_env_error};
 use super::error::AuthServerError;
 use super::provider_client::OidcProviderClient;
@@ -23,6 +24,9 @@ use super::state_store::{InMemoryStateStore, StateStore};
 use crate::outbound_url_policy::{EndpointUrl, ResourceIdentifier};
 
 mod authorize;
+mod callback;
+mod query;
+mod response;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -108,7 +112,10 @@ impl CoralAuthorizationServer {
     /// Starts the HTTP listener.
     ///
     /// The server is intended to run on loopback or behind a TLS-terminating
-    /// reverse proxy.
+    /// reverse proxy that forwards at the origin root. Every endpoint is served
+    /// and advertised relative to `auth.authorization_server.issuer`, which must
+    /// mount at the root, so a proxy that adds a path prefix strands discovery,
+    /// the authorize route, and the OIDC callback.
     /// # Errors
     /// Returns an error when the listener cannot start.
     pub async fn start(self) -> Result<RunningCoralAuthorizationServer, AuthServerError> {
@@ -128,6 +135,7 @@ impl CoralAuthorizationServer {
                 get(authorization_server_metadata),
             )
             .route("/oauth/authorize", get(authorize::oauth_authorize))
+            .route(OIDC_CALLBACK_PATH, get(callback::oidc_callback))
             .with_state(state);
         let listener =
             TcpListener::bind(bind_addr)
