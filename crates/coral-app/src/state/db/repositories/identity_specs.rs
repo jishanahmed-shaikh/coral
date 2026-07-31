@@ -3,13 +3,15 @@
     reason = "identity persistence APIs are not yet wired to production consumers"
 )]
 
-use sea_query::{Expr, ExprTrait, Order, Query};
+use sea_query::{Expr, ExprTrait, OnConflict, Order, Query};
 
 use crate::bootstrap::AppError;
 use crate::state::db::schema::IdentitySpecs;
-use crate::state::db::{DbError, DbSession};
+use crate::state::db::{CoralTx, DbError, DbSession};
 use crate::workspaces::WorkspaceName;
-use coral_spec::validate_identity_spec_name;
+use coral_spec::{
+    IdentityManifest, IdentitySpecType, parse_identity_manifest_yaml, validate_identity_spec_name,
+};
 use uuid::{Uuid, Variant, Version};
 
 /// Opaque database identity for one persisted identity spec.
@@ -164,19 +166,13 @@ struct IdentitySpecRow {
 
 impl IdentitySpecRow {
     fn validate(self) -> Result<IdentitySpecRecord, DbError> {
-        if [
+        validate_identity_spec_fields([
             &self.version,
             &self.issuer,
             &self.identity_type,
             &self.manifest_yaml,
-        ]
-        .into_iter()
-        .any(|value| value.trim().is_empty())
-        {
-            return Err(DbError::CorruptData(
-                "identity spec row has an empty required field".to_string(),
-            ));
-        }
+        ])
+        .map_err(DbError::CorruptData)?;
         if self.created_at_unix_nanos < 0 || self.updated_at_unix_nanos < self.created_at_unix_nanos
         {
             return Err(DbError::CorruptData(
@@ -248,6 +244,93 @@ where
     }
 }
 
+impl IdentitySpecsRepo<'_, CoralTx<'_>> {
+    /// Insert or replace one exact-scope definition while preserving creation time.
+    pub(crate) async fn upsert(
+        &mut self,
+        key: &IdentitySpecKey,
+        manifest: &IdentityManifest,
+        manifest_yaml: &str,
+        now_unix_nanos: i64,
+    ) -> Result<IdentitySpecRecord, AppError> {
+        validate_identity_spec_write(key, manifest, manifest_yaml)?;
+        validate_write_timestamp(now_unix_nanos)?;
+        let current_updated_at =
+            Expr::col((IdentitySpecs::Table, IdentitySpecs::UpdatedAtUnixNanos));
+        let id = IdentitySpecId::new();
+        let mut on_conflict = match key.scope() {
+            IdentitySpecScope::Global => OnConflict::column(IdentitySpecs::Name),
+            IdentitySpecScope::Workspace(_) => {
+                OnConflict::columns([IdentitySpecs::WorkspaceId, IdentitySpecs::Name])
+            }
+        };
+        match key.scope() {
+            IdentitySpecScope::Global => {
+                on_conflict.target_and_where(Expr::col(IdentitySpecs::WorkspaceId).is_null());
+            }
+            IdentitySpecScope::Workspace(_) => {
+                on_conflict.target_and_where(Expr::col(IdentitySpecs::WorkspaceId).is_not_null());
+            }
+        }
+        on_conflict
+            .update_columns([
+                IdentitySpecs::Version,
+                IdentitySpecs::Description,
+                IdentitySpecs::Issuer,
+                IdentitySpecs::IdentityType,
+                IdentitySpecs::ManifestYaml,
+            ])
+            .value(
+                IdentitySpecs::UpdatedAtUnixNanos,
+                Expr::case(
+                    current_updated_at.clone().gt(now_unix_nanos),
+                    current_updated_at,
+                )
+                .finally(now_unix_nanos),
+            );
+        let statement = Query::insert()
+            .into_table(IdentitySpecs::Table)
+            .columns(identity_spec_columns())
+            .values_panic([
+                Expr::val(id.as_str()),
+                Expr::val(key.scope.workspace_id().map(ToString::to_string)),
+                Expr::val(key.name.clone()),
+                Expr::val(manifest.version.clone()),
+                Expr::val(manifest.description.clone()),
+                Expr::val(manifest.issuer.clone()),
+                Expr::val(identity_spec_type_label(manifest.identity_type)),
+                Expr::val(manifest_yaml),
+                Expr::val(now_unix_nanos),
+                Expr::val(now_unix_nanos),
+            ])
+            .on_conflict(on_conflict)
+            .to_owned();
+        let rows_affected = self.session.execute_rows_affected(statement).await?;
+        if rows_affected != 1 {
+            return Err(AppError::Database(format!(
+                "identity spec upsert affected {rows_affected} rows"
+            )));
+        }
+        self.get(key)
+            .await?
+            .ok_or_else(|| AppError::Database("identity spec disappeared after upsert".to_string()))
+    }
+
+    /// Delete one exact-scope definition.
+    pub(crate) async fn delete(&mut self, key: &IdentitySpecKey) -> Result<bool, DbError> {
+        let rows_affected = self
+            .session
+            .execute_rows_affected(
+                Query::delete()
+                    .from_table(IdentitySpecs::Table)
+                    .and_where(identity_spec_key_where(key))
+                    .to_owned(),
+            )
+            .await?;
+        zero_or_one_affected(rows_affected, "identity spec delete")
+    }
+}
+
 /// Repository shell for encrypted setup-input documents owned by identity specs.
 pub(crate) struct IdentitySpecDocumentsRepo<'a, S> {
     session: &'a mut S,
@@ -266,6 +349,68 @@ where
 fn parse_identity_spec_name(name: &str) -> Result<String, AppError> {
     validate_identity_spec_name(name).map_err(|error| AppError::InvalidInput(error.to_string()))?;
     Ok(name.to_string())
+}
+
+fn validate_identity_spec_fields(fields: [&str; 4]) -> Result<(), String> {
+    if fields.into_iter().any(|value| value.trim().is_empty()) {
+        return Err("identity spec has an empty required field".to_string());
+    }
+    Ok(())
+}
+
+fn validate_identity_spec_write(
+    key: &IdentitySpecKey,
+    manifest: &IdentityManifest,
+    manifest_yaml: &str,
+) -> Result<(), AppError> {
+    if key.name() != manifest.name {
+        return Err(AppError::InvalidInput(format!(
+            "identity spec key name '{}' does not match manifest name '{}'",
+            key.name(),
+            manifest.name
+        )));
+    }
+    validate_identity_spec_fields([
+        &manifest.version,
+        &manifest.issuer,
+        identity_spec_type_label(manifest.identity_type),
+        manifest_yaml,
+    ])
+    .map_err(AppError::InvalidInput)?;
+    let parsed_manifest = parse_identity_manifest_yaml(manifest_yaml)
+        .map_err(|error| AppError::InvalidInput(error.to_string()))?;
+    if &parsed_manifest != manifest {
+        return Err(AppError::InvalidInput(
+            "identity spec manifest YAML does not match the validated manifest".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+const fn identity_spec_type_label(identity_type: IdentitySpecType) -> &'static str {
+    match identity_type {
+        IdentitySpecType::OAuth => "oauth",
+        IdentitySpecType::FixedToken => "fixed_token",
+    }
+}
+
+fn validate_write_timestamp(now_unix_nanos: i64) -> Result<(), AppError> {
+    match now_unix_nanos {
+        0.. => Ok(()),
+        _ => Err(AppError::InvalidInput(
+            "identity spec timestamp is negative".to_string(),
+        )),
+    }
+}
+
+fn zero_or_one_affected(rows_affected: u64, operation: &str) -> Result<bool, DbError> {
+    match rows_affected {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(DbError::CorruptData(format!(
+            "{operation} affected {rows_affected} rows"
+        ))),
+    }
 }
 
 fn parse_workspace_name(workspace_id: &str) -> Result<WorkspaceName, DbError> {
@@ -333,11 +478,15 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    use super::{IdentitySpecId, IdentitySpecKey, IdentitySpecRecord, identity_spec_columns};
-    use crate::bootstrap::AppError;
+    use super::{
+        IdentitySpecId, IdentitySpecKey, IdentitySpecRecord, identity_spec_columns,
+        validate_identity_spec_write,
+    };
+    use crate::bootstrap::{self, AppError};
     use crate::state::db::schema::IdentitySpecs;
     use crate::state::db::{CoralDb, CoralTx, DbError, DbRepos, ResolvedDatabaseConfig};
     use crate::workspaces::WorkspaceName;
+    use coral_spec::{IdentityManifest, parse_identity_manifest_yaml};
 
     #[derive(Clone, Copy)]
     struct SpecSeed {
@@ -413,6 +562,47 @@ mod tests {
                 Err(DbError::CorruptData(_))
             ));
         }
+    }
+
+    #[test]
+    fn identity_spec_write_inputs_validate_repository_invariants() {
+        let key = IdentitySpecKey::global("github").expect("key");
+        let (other_manifest, other_yaml) = valid_manifest("other", "1.0.0");
+        assert!(matches!(
+            validate_identity_spec_write(&key, &other_manifest, &other_yaml),
+            Err(AppError::InvalidInput(_))
+        ));
+
+        let (mut manifest, manifest_yaml) = valid_manifest(key.name(), "1.0.0");
+        manifest.version.clear();
+        assert!(matches!(
+            validate_identity_spec_write(&key, &manifest, &manifest_yaml),
+            Err(AppError::InvalidInput(_))
+        ));
+
+        let blank_description_yaml = format!(
+            "kind: identity\nspec_version: 1\nname: {}\nversion: 1.0.0\ndescription: ''\nissuer: github\ntype: fixed_token\naudience:\n  host: api.github.com\n",
+            key.name()
+        );
+        let blank_description_manifest = parse_identity_manifest_yaml(&blank_description_yaml)
+            .expect("valid manifest with blank description");
+        validate_identity_spec_write(&key, &blank_description_manifest, &blank_description_yaml)
+            .expect("blank descriptions are valid");
+        assert!(matches!(
+            validate_identity_spec_write(&key, &blank_description_manifest, "\n"),
+            Err(AppError::InvalidInput(_))
+        ));
+
+        let (manifest, _) = valid_manifest(key.name(), "1.0.0");
+        let (_, mismatched_yaml) = valid_manifest(key.name(), "2.0.0");
+        assert!(matches!(
+            validate_identity_spec_write(&key, &manifest, &mismatched_yaml),
+            Err(AppError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_identity_spec_write(&key, &manifest, "not: [valid"),
+            Err(AppError::InvalidInput(_))
+        ));
     }
 
     #[tokio::test]
@@ -572,6 +762,182 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn upserts_preserve_creation_and_monotonic_update_time() {
+        let (_temp, db) = open_sqlite().await;
+        assert_upserts_preserve_creation_and_monotonic_update_time(&db, "sqlite").await;
+    }
+
+    #[tokio::test]
+    async fn mutations_are_exact_and_transactional_against_sqlite() {
+        let (_temp, db) = open_sqlite().await;
+        assert_mutations_are_exact_and_transactional(&db, "sqlite").await;
+    }
+
+    /// Runs the identity-spec mutation contract against a live Postgres backend.
+    ///
+    /// `upsert` selects its arbiter index through `ON CONFLICT ... WHERE`, which
+    /// each backend resolves against its own partial-index inference rules, so the
+    /// two tests above cannot stand in for this coverage. CI selects this test by
+    /// the shared `repository_round_trips_against_postgres` name filter.
+    #[tokio::test]
+    #[ignore = "set CORAL_TEST_POSTGRES_URL to run the shared repository harness against Postgres"]
+    async fn identity_spec_repository_round_trips_against_postgres() {
+        let Some(url) = postgres_test_url() else {
+            return;
+        };
+        let db = CoralDb::open(ResolvedDatabaseConfig::Postgres { url })
+            .await
+            .expect("open postgres");
+        db.migrate().await.expect("migrate postgres");
+
+        assert_upserts_preserve_creation_and_monotonic_update_time(&db, &unique_suffix()).await;
+        assert_mutations_are_exact_and_transactional(&db, &unique_suffix()).await;
+    }
+
+    async fn assert_upserts_preserve_creation_and_monotonic_update_time(
+        db: &CoralDb,
+        suffix: &str,
+    ) {
+        let global = IdentitySpecKey::global(&format!("github_{suffix}")).expect("global key");
+        let mut tx = db.begin().await.expect("begin mutation transaction");
+        let (manifest, manifest_yaml) = valid_manifest(global.name(), "1.0.0");
+        let inserted = tx
+            .identity_specs()
+            .upsert(&global, &manifest, &manifest_yaml, 10)
+            .await
+            .expect("insert global spec");
+        assert_eq!(
+            (
+                inserted.version.as_str(),
+                inserted.identity_type.as_str(),
+                inserted.created_at_unix_nanos,
+                inserted.updated_at_unix_nanos,
+            ),
+            ("1.0.0", "fixed_token", 10, 10)
+        );
+        assert_eq!(inserted.manifest_yaml, manifest_yaml);
+        upsert_spec(&mut tx, &global, "2.0.0", 30)
+            .await
+            .expect("replace global spec");
+        let stale_clock_update = upsert_spec(&mut tx, &global, "3.0.0", 20)
+            .await
+            .expect("replace without timestamp regression");
+        assert_eq!(
+            stale_clock_update.id, inserted.id,
+            "upserts must preserve the internal identity spec id"
+        );
+        assert_eq!(
+            (
+                stale_clock_update.version.as_str(),
+                stale_clock_update.created_at_unix_nanos,
+                stale_clock_update.updated_at_unix_nanos,
+            ),
+            ("3.0.0", 10, 30)
+        );
+        tx.commit().await.expect("commit mutation transaction");
+
+        let mut session = db;
+        let persisted = session
+            .identity_specs()
+            .get(&global)
+            .await
+            .expect("read global")
+            .expect("global persists");
+        assert_eq!(persisted, stale_clock_update);
+    }
+
+    async fn assert_mutations_are_exact_and_transactional(db: &CoralDb, suffix: &str) {
+        let (global, workspace_key) = seed_scoped_specs(db, suffix).await;
+        let negative_timestamp =
+            IdentitySpecKey::global(&format!("negative_timestamp_{suffix}")).expect("key");
+        let mut tx = db.begin().await.expect("begin validation transaction");
+        assert!(matches!(
+            upsert_spec(&mut tx, &negative_timestamp, "1.0.0", -1).await,
+            Err(AppError::InvalidInput(_))
+        ));
+        tx.commit().await.expect("commit validation transaction");
+
+        let rolled_back = IdentitySpecKey::global(&format!("rolled_back_{suffix}")).expect("key");
+        let mut tx = db.begin().await.expect("begin rollback transaction");
+        upsert_spec(&mut tx, &rolled_back, "1.0.0", 40)
+            .await
+            .expect("insert rolled-back spec");
+        assert!(
+            tx.identity_specs()
+                .delete(&global)
+                .await
+                .expect("delete global in rollback")
+        );
+        tx.rollback().await.expect("rollback mutation transaction");
+
+        let missing_workspace =
+            WorkspaceName::parse(&format!("missing_team_{suffix}")).expect("workspace");
+        let missing_workspace_key =
+            IdentitySpecKey::workspace(missing_workspace, global.name()).expect("key");
+        let mut tx = db.begin().await.expect("begin foreign-key transaction");
+        assert!(matches!(
+            upsert_spec(&mut tx, &missing_workspace_key, "1.0.0", 50).await,
+            Err(AppError::Database(_))
+        ));
+        tx.rollback().await.expect("rollback failed upsert");
+
+        let mut tx = db.begin().await.expect("begin delete transaction");
+        assert!(
+            tx.identity_specs()
+                .delete(&workspace_key)
+                .await
+                .expect("delete workspace spec")
+        );
+        assert!(
+            !tx.identity_specs()
+                .delete(&workspace_key)
+                .await
+                .expect("repeat workspace delete")
+        );
+        tx.commit().await.expect("commit exact delete");
+
+        let mut session = db;
+        let persisted_global = session
+            .identity_specs()
+            .get(&global)
+            .await
+            .expect("read global after rollback")
+            .expect("global survives exact workspace delete");
+        assert_eq!(persisted_global.version, "global");
+        for missing in [&negative_timestamp, &rolled_back, &workspace_key] {
+            assert!(
+                session
+                    .identity_specs()
+                    .get(missing)
+                    .await
+                    .expect("read missing exact key")
+                    .is_none()
+            );
+        }
+    }
+
+    async fn seed_scoped_specs(db: &CoralDb, suffix: &str) -> (IdentitySpecKey, IdentitySpecKey) {
+        let workspace = WorkspaceName::parse(&format!("team_{suffix}")).expect("workspace");
+        let spec_name = format!("github_{suffix}");
+        let global = IdentitySpecKey::global(&spec_name).expect("global key");
+        let workspace_key =
+            IdentitySpecKey::workspace(workspace.clone(), &spec_name).expect("workspace key");
+        let mut tx = db.begin().await.expect("begin seed transaction");
+        tx.workspaces()
+            .ensure(workspace.as_str(), 1)
+            .await
+            .expect("create workspace");
+        upsert_spec(&mut tx, &global, "global", 10)
+            .await
+            .expect("insert global spec");
+        upsert_spec(&mut tx, &workspace_key, "workspace", 12)
+            .await
+            .expect("insert workspace spec");
+        tx.commit().await.expect("commit seed transaction");
+        (global, workspace_key)
+    }
+
     async fn open_sqlite() -> (tempfile::TempDir, CoralDb) {
         let temp = tempdir().expect("temp dir");
         let db = CoralDb::open(ResolvedDatabaseConfig::Sqlite {
@@ -581,6 +947,17 @@ mod tests {
         .expect("open sqlite");
         db.migrate().await.expect("migrate sqlite");
         (temp, db)
+    }
+
+    fn postgres_test_url() -> Option<String> {
+        bootstrap::env_var("CORAL_TEST_POSTGRES_URL")
+            .expect("read CORAL_TEST_POSTGRES_URL")
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Keeps every Postgres run isolated inside CI's single shared database.
+    fn unique_suffix() -> String {
+        Uuid::new_v4().simple().to_string()
     }
 
     async fn insert_spec(
@@ -632,5 +1009,26 @@ mod tests {
 
     fn spec_names(records: &[IdentitySpecRecord]) -> Vec<&str> {
         records.iter().map(|record| record.key.name()).collect()
+    }
+
+    async fn upsert_spec(
+        tx: &mut CoralTx<'_>,
+        key: &IdentitySpecKey,
+        version: &str,
+        now_unix_nanos: i64,
+    ) -> Result<IdentitySpecRecord, AppError> {
+        let (manifest, manifest_yaml) = valid_manifest(key.name(), version);
+        tx.identity_specs()
+            .upsert(key, &manifest, &manifest_yaml, now_unix_nanos)
+            .await
+    }
+
+    fn valid_manifest(name: &str, version: &str) -> (IdentityManifest, String) {
+        let manifest_yaml = format!(
+            "kind: identity\nspec_version: 1\nname: {name}\nversion: {version}\ndescription: Test identity spec\nissuer: github\ntype: fixed_token\naudience:\n  host: api.github.com\n"
+        );
+        let manifest =
+            parse_identity_manifest_yaml(&manifest_yaml).expect("valid identity manifest");
+        (manifest, manifest_yaml)
     }
 }
