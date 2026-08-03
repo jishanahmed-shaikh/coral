@@ -98,6 +98,52 @@ impl Principal {
         }
     }
 
+    /// Derives the stable Coral user identity for a federated session subject.
+    ///
+    /// The subject alone is the identity: `[auth.provider]` holds exactly one
+    /// OIDC provider (not a list), so every subject Coral ever sees is issued
+    /// by that provider and two subjects cannot collide. The `subject` argument
+    /// is the raw upstream `sub` claim, with no issuer or provider prefix.
+    ///
+    /// The preimage is versioned because of that assumption: admitting a second
+    /// provider would make the provider part of the identity, which needs a `-v2`
+    /// preimage. Note what that costs — and the limit of the cost. The derivation
+    /// is one-way and the upstream subject is persisted nowhere (only the
+    /// short-lived in-memory authorization-code store holds it), but the subject
+    /// is re-presented at every login, so a stored id is recomputable then. A
+    /// version bump is therefore a lazy rekey — `UPDATE ... WHERE
+    /// created_by_principal_id = <old id>` as each user next signs in — rather
+    /// than dual-prefix acceptance or orphaned attribution rows. What it does
+    /// cost is time: a user's rows carry the old id until they come back.
+    ///
+    /// The digest is stable and collision-free, but it is not opaque against a
+    /// guesser: it is unkeyed, and subjects are low-entropy (emails, numeric
+    /// provider ids), so anyone holding this value and a candidate list can confirm a
+    /// match offline. Nothing deployment-specific enters the preimage either, so
+    /// the same subject yields the same id everywhere — two databases join on it
+    /// directly. Keying the derivation is the fix, and doing it before any
+    /// deployment stores `federated-*` rows is free rather than a rekey. No
+    /// running instance can store one at this commit: nothing calls
+    /// `into_authorization_server`, so no token endpoint is served and no session
+    /// token exists to resolve here. That makes this the work of whichever change
+    /// first serves that endpoint.
+    ///
+    /// One trap for whoever does it. The session signing key is the obvious
+    /// keying material and the wrong one: `SessionTokenVerifier` models a
+    /// multi-key `JwkSet` precisely so that key can be rotated, and keying
+    /// principal ids off it would turn a routine JWT rotation into a rekey of
+    /// every user. It needs a salt derived once and never rotated.
+    pub(crate) fn for_federated(subject: &str) -> Self {
+        let mut identity = Vec::with_capacity(subject.len() + 32);
+        identity.extend_from_slice(b"coral-federated-user-v1\0");
+        identity.extend_from_slice(&(subject.len() as u64).to_be_bytes());
+        identity.extend_from_slice(subject.as_bytes());
+        Self {
+            id: PrincipalId(format!("federated-{}", crate::hash::sha256_hex(&identity))),
+            kind: PrincipalKind::User,
+        }
+    }
+
     /// Returns the stable principal identity.
     #[must_use]
     pub const fn id(&self) -> &PrincipalId {
@@ -213,6 +259,25 @@ pub trait PrincipalProvider: Send + Sync + std::fmt::Debug {
     ) -> Result<Principal, PrincipalProviderError>;
 }
 
+/// Server-side authenticator for a bearer token held outside gRPC metadata.
+///
+/// A served surface that already parsed the token out of its own transport —
+/// the MCP HTTP `Authorization` header, say — authenticates it here instead of
+/// re-encoding a gRPC [`tonic::metadata::MetadataMap`] for
+/// [`PrincipalProvider`] to take apart again. The two entry points must accept
+/// the same tokens, so an implementation is expected to share one verification
+/// path between them.
+#[tonic::async_trait]
+pub trait BearerAuthenticator: Send + Sync + std::fmt::Debug {
+    /// Returns the principal a bare bearer token authenticates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrincipalProviderError`] when the token is malformed, fails
+    /// verification, or principal selection fails.
+    async fn principal_for_bearer(&self, token: &str) -> Result<Principal, PrincipalProviderError>;
+}
+
 /// Default OSS principal provider for local mode.
 #[derive(Debug, Default)]
 pub struct LocalPrincipalProvider;
@@ -308,6 +373,15 @@ mod tests {
         assert_eq!(principal.id(), &id);
         assert_eq!(principal.id().as_str(), "product:principal/saul");
         assert_eq!(principal.kind(), PrincipalKind::Agent);
+    }
+
+    #[test]
+    fn federated_principal_is_stable_and_namespaces_subject() {
+        let principal = Principal::for_federated("alice");
+        assert_eq!(principal, Principal::for_federated("alice"));
+        assert_ne!(principal, Principal::for_federated("bob"));
+        PrincipalId::parse(principal.id().as_str()).expect("generated id is canonical");
+        assert_eq!(principal.kind(), PrincipalKind::User);
     }
 
     #[tokio::test]
