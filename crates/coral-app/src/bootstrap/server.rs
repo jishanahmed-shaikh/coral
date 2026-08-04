@@ -1385,9 +1385,11 @@ redirect_uri = 'https://auth.example.test/auth/oidc/callback'
         let temp = TempDir::new().expect("temp dir");
         let config_dir = temp.path().join("coral-config");
         std::fs::create_dir_all(&config_dir).expect("create config dir");
+        // Keep this server-start test from populating process-global tracing
+        // state and making telemetry unit tests depend on execution order.
         std::fs::write(
             config_dir.join("config.toml"),
-            "[server]\nbind_addr = '127.0.0.1:0'\n",
+            "[server]\nbind_addr = '127.0.0.1:0'\n\n[trace_history]\nenabled = false\n",
         )
         .expect("write config");
 

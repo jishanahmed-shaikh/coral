@@ -41,7 +41,7 @@ use crate::sources::runtime_package::{
 };
 use crate::state::{AppConfig, AppStateLayout, ConfigStore};
 use crate::task::id::TaskId;
-use crate::telemetry::WORKSPACE_SPAN_ATTRIBUTE;
+use crate::telemetry::app_error_type;
 use crate::workspaces::{
     WorkspaceLifecycleLock, WorkspaceLifecycleRevision, WorkspaceManager, WorkspaceName,
 };
@@ -577,7 +577,10 @@ impl QueryManager {
             workspace = tracing::field::Empty,
             source.count = tracing::field::Empty,
         );
-        span.record(WORKSPACE_SPAN_ATTRIBUTE, workspace_name.as_str());
+        span.record(
+            coral_telemetry::WORKSPACE_SPAN_ATTRIBUTE,
+            workspace_name.as_str(),
+        );
         let _guard = span.enter();
         let mut loaded_sources = Vec::new();
         let mut failed_source_names = BTreeSet::new();
@@ -1150,6 +1153,7 @@ where
         query_span.set_status(OtelStatus::error(error_message));
     }
 
+    drop(query_span);
     result
 }
 
@@ -1162,6 +1166,9 @@ fn create_query_span(
     let operation = operation.as_str();
     let span = tracing::info_span!(
         "coral.query",
+        coral.stream.entry = true,
+        coral.stream.kind = coral_telemetry::QUERY_STREAM_KIND_QUERY,
+        coral.stream.name = operation,
         otel.name = "coral.query",
         operation = operation,
         workspace = tracing::field::Empty,
@@ -1179,7 +1186,10 @@ fn create_query_span(
     if let Some(task_id) = task_id {
         span.record("task.id", tracing::field::display(task_id));
     }
-    span.record(WORKSPACE_SPAN_ATTRIBUTE, workspace_name.as_str());
+    span.record(
+        coral_telemetry::WORKSPACE_SPAN_ATTRIBUTE,
+        workspace_name.as_str(),
+    );
     span
 }
 
@@ -1251,45 +1261,6 @@ fn query_error_message(error: &QueryManagerError) -> String {
         QueryManagerError::App(error) => error.to_string(),
         QueryManagerError::Core(CoreError::QueryFailure(error)) => error.summary().to_string(),
         QueryManagerError::Core(error) => error.to_string(),
-    }
-}
-
-fn app_error_type(error: &AppError) -> &'static str {
-    match error {
-        AppError::Unauthenticated(_) => "UNAUTHENTICATED",
-        AppError::SourceNotFound(_) => "SOURCE_NOT_FOUND",
-        AppError::FunctionNotFound(_) => "FUNCTION_NOT_FOUND",
-        AppError::FunctionAlreadyExists(_) => "FUNCTION_ALREADY_EXISTS",
-        AppError::WorkspaceNotFound(_) => "WORKSPACE_NOT_FOUND",
-        AppError::WorkspaceAlreadyExists(_) => "WORKSPACE_ALREADY_EXISTS",
-        AppError::InvalidInput(_) => "INVALID_INPUT",
-        AppError::FailedPrecondition(_) => "FAILED_PRECONDITION",
-        AppError::MissingSourceInputs { .. } => "MISSING_SOURCE_INPUTS",
-        AppError::UnsupportedV4IdentityRequirements { .. } => {
-            "UNSUPPORTED_V4_IDENTITY_REQUIREMENTS"
-        }
-        AppError::MissingOrIncompatibleV4Materialization { .. } => {
-            "MISSING_OR_INCOMPATIBLE_V4_MATERIALIZATION"
-        }
-        AppError::IncompatibleInstalledV4Manifest { .. } => "INCOMPATIBLE_INSTALLED_V4_MANIFEST",
-        AppError::InvalidV4ProjectionOverride { .. } => "INVALID_V4_PROJECTION_OVERRIDE",
-        AppError::InvalidV4OperationMetadataOverride { .. } => {
-            "INVALID_V4_OPERATION_METADATA_OVERRIDE"
-        }
-        AppError::CredentialRefresh(_) => "CREDENTIAL_REFRESH",
-        AppError::Unavailable(_) => "UNAVAILABLE",
-        AppError::ResourceExhausted(_) => "RESOURCE_EXHAUSTED",
-        AppError::Internal(_) => "INTERNAL",
-        AppError::Io(_) => "IO",
-        AppError::Yaml(_) => "YAML",
-        AppError::TomlDecode(_) | AppError::TomlEditDecode(_) => "TOML_DECODE",
-        AppError::TomlEncode(_) => "TOML_ENCODE",
-        AppError::Json(_) => "JSON",
-        AppError::Transport(_) => "TRANSPORT",
-        AppError::TaskJoin(_) => "TASK_JOIN",
-        AppError::Credentials(_) => "CREDENTIALS",
-        AppError::Database(_) => "DATABASE",
-        AppError::MissingConfigDir => "MISSING_CONFIG_DIR",
     }
 }
 
@@ -1581,6 +1552,63 @@ mod tests {
             .find(|attribute| attribute.key.as_str() == "task.id")
             .expect("task.id attribute present");
         assert_eq!(task_attr.value.as_str(), task_id);
+        assert!(query_span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == coral_telemetry::QUERY_STREAM_ENTRY_ATTRIBUTE
+                && attribute.value == opentelemetry::Value::Bool(true)
+        }));
+        assert_eq!(
+            span_attr(query_span, coral_telemetry::QUERY_STREAM_KIND_ATTRIBUTE),
+            Some(coral_telemetry::QUERY_STREAM_KIND_QUERY.to_string())
+        );
+        assert_eq!(
+            span_attr(query_span, coral_telemetry::QUERY_STREAM_NAME_ATTRIBUTE),
+            Some("execute_sql".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_span_finishes_before_completed_future_is_dropped() {
+        use std::future::poll_fn;
+
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("query-span-lifecycle-test");
+        let subscriber = tracing_subscriber::Registry::default()
+            .with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let workspace = WorkspaceName::default();
+        let mut operation = Box::pin(run_query_operation(
+            QueryOperation::ListTables,
+            &workspace,
+            "LIST TABLES *.*",
+            None,
+            async { Ok::<(), QueryManagerError>(()) },
+            |()| None,
+            |_, ()| {},
+        ));
+        poll_fn(|context| operation.as_mut().poll(context))
+            .await
+            .expect("query operation should succeed");
+
+        provider.force_flush().expect("flush spans");
+        let spans = exporter.get_finished_spans().expect("finished spans");
+        let query_span = spans
+            .iter()
+            .find(|span| span.name == "coral.query")
+            .expect("completed operation should finish its query span");
+        assert_eq!(
+            span_attr(query_span, "operation"),
+            Some("list_tables".to_string())
+        );
+
+        drop(operation);
     }
 
     #[tokio::test(flavor = "current_thread")]
