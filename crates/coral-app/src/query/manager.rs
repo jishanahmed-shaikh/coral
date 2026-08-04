@@ -290,7 +290,10 @@ impl QueryManager {
                         SourceObservationMode::Disabled,
                     )
                     .await?;
-                Ok(runtime.list_tables(catalog_filter, schema_filter, table_filter))
+                runtime
+                    .list_tables(catalog_filter, schema_filter, table_filter)
+                    .await
+                    .map_err(QueryManagerError::Core)
             },
             |tables| Some(u64::try_from(tables.len()).unwrap_or(u64::MAX)),
             |_, _| {},
@@ -343,7 +346,10 @@ impl QueryManager {
                 let runtime_schema_owners =
                     runtime_schema_owners(&source_load.loaded).map_err(QueryManagerError::App)?;
                 Ok(CatalogResolution {
-                    catalog: runtime.list_catalog(catalog_filter, schema_filter),
+                    catalog: runtime
+                        .list_catalog(catalog_filter, schema_filter)
+                        .await
+                        .map_err(QueryManagerError::Core)?,
                     failed_source_names,
                     runtime_schema_owners,
                 })
@@ -393,7 +399,10 @@ impl QueryManager {
                         SourceObservationMode::Disabled,
                     )
                     .await?;
-                Ok(runtime.describe_table(catalog_name, schema_name, table_name))
+                runtime
+                    .describe_table(catalog_name, schema_name, table_name)
+                    .await
+                    .map_err(QueryManagerError::Core)
             },
             |_| None,
             |_, _| {},
@@ -408,7 +417,9 @@ impl QueryManager {
         shown_guide_ids: Option<&HashSet<String>>,
         attribution: &QueryAttribution,
     ) -> Result<ExecuteSqlOutcome, QueryManagerError> {
-        run_query_operation(
+        // Keep the database-enabled operation future off this async state machine: on Linux it
+        // exceeds Clippy's `large_futures` threshold when awaited inline.
+        Box::pin(run_query_operation(
             QueryOperation::ExecuteSql,
             workspace_name,
             sql,
@@ -435,10 +446,11 @@ impl QueryManager {
                     // Unfiltered on both qualifiers: a required guide has to be
                     // found wherever the query's tables live, including
                     // catalog-backed sources.
-                    let required_guides = required_query_guides(
-                        &runtime.list_catalog(None, None),
-                        prepared.resources(),
-                    );
+                    let catalog = runtime
+                        .list_catalog(None, None)
+                        .await
+                        .map_err(QueryManagerError::Core)?;
+                    let required_guides = required_query_guides(&catalog, prepared.resources());
                     let unseen_guides = required_guides
                         .into_iter()
                         .filter(|guide| !shown_guide_ids.contains(&guide.guide_id))
@@ -464,7 +476,7 @@ impl QueryManager {
                     record_query_provenance(span, execution.provenance());
                 }
             },
-        )
+        ))
         .await
     }
 
