@@ -71,7 +71,9 @@ use crate::task::store::TaskStore;
 use crate::telemetry::TelemetryConfig;
 use crate::telemetry::service::TraceService;
 use crate::transport::GrpcRequestContextLayer;
-use crate::workspaces::{WorkspaceLifecycleLock, WorkspaceManager, WorkspaceService};
+use crate::workspaces::{
+    WorkspaceLifecycleLock, WorkspaceManager, WorkspacePoolRegistry, WorkspaceService,
+};
 
 /// A static asset (e.g., a built SPA file) served on the same port as
 /// gRPC-Web.
@@ -395,27 +397,15 @@ impl ServerBuilder {
         let config_store = ConfigStore::new(layout.clone());
         run_state_migrations(&coral_db, &config_store, &layout).await?;
         let coral_db = Arc::new(coral_db);
-        let telemetry_config = TelemetryConfig::load(&layout)?;
-        let internal_trace_store_dir = telemetry_config
-            .trace_history
-            .enabled
-            .then(|| layout.local_trace_store_dir());
-        let installed_trace_store = crate::telemetry::init_tracing(
-            &telemetry_config,
-            self.config.enable_stderr_logs,
-            internal_trace_store_dir.clone(),
-        )?;
-        let active_trace_store = telemetry_config
-            .trace_history
-            .enabled
-            .then_some(installed_trace_store)
-            .flatten();
+        let (telemetry_config, active_trace_store) =
+            init_server_telemetry(&layout, self.config.enable_stderr_logs)?;
         let active_trace_store_dir = active_trace_store.as_ref().map(|store| store.dir.clone());
         let credential_config = CredentialStorageConfig::load(&layout)?;
         let credential_store =
             CredentialStore::with_preference(layout.clone(), credential_config.storage);
         let credential_manager = CredentialManager::new(credential_store);
         let workspace_lifecycle_lock = WorkspaceLifecycleLock::default();
+        let workspace_pool_registry = Arc::new(WorkspacePoolRegistry::default());
         let diagnostic_reporter = SourceDiagnosticReporter::default();
         let source_manager = SourceManager::with_diagnostic_reporter(
             config_store.clone(),
@@ -423,7 +413,8 @@ impl ServerBuilder {
             layout.clone(),
             workspace_lifecycle_lock.clone(),
             diagnostic_reporter.clone(),
-        );
+        )
+        .with_pool_registry(Arc::clone(&workspace_pool_registry));
         let workspace_manager = WorkspaceManager::new(
             config_store.clone(),
             credential_manager.clone(),
@@ -432,7 +423,8 @@ impl ServerBuilder {
             workspace_lifecycle_lock.clone(),
             Arc::clone(&coral_db),
             diagnostic_reporter.clone(),
-        );
+        )
+        .with_pool_registry(Arc::clone(&workspace_pool_registry));
         let feedback_manager =
             FeedbackManager::with_publisher(layout.clone(), self.config.feedback_publisher);
         let task_manager = TaskManager::new(TaskStore::new(Arc::clone(&coral_db)));
@@ -452,6 +444,7 @@ impl ServerBuilder {
             workspace_lifecycle_lock.clone(),
             self.config.engine_extensions_providers,
             diagnostic_reporter.clone(),
+            workspace_pool_registry,
         );
         let observed_values_search_enabled = features.enabled(Feature::ObservedValuesSearch);
         let search_observations =
@@ -483,6 +476,31 @@ impl ServerBuilder {
         )
         .await
     }
+}
+
+fn init_server_telemetry(
+    layout: &AppStateLayout,
+    enable_stderr_logs: bool,
+) -> Result<
+    (
+        TelemetryConfig,
+        Option<crate::telemetry::InstalledLocalTraceStore>,
+    ),
+    AppError,
+> {
+    let config = TelemetryConfig::load(layout)?;
+    let local_trace_store_dir = config
+        .trace_history
+        .enabled
+        .then(|| layout.local_trace_store_dir());
+    let installed_trace_store =
+        crate::telemetry::init_tracing(&config, enable_stderr_logs, local_trace_store_dir)?;
+    let active_trace_store = config
+        .trace_history
+        .enabled
+        .then_some(installed_trace_store)
+        .flatten();
+    Ok((config, active_trace_store))
 }
 
 fn trace_components_for_store(
