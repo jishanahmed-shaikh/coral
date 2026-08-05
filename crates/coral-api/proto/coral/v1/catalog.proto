@@ -94,6 +94,8 @@ message TableFunctionArgument {
   bool required = 2;
   // Allowed values, if the source declares an enum-like value set.
   repeated string values = 3;
+  // Argument type in manifest spelling, matching result column types.
+  string data_type = 4;
 }
 
 // A result column returned by a query-visible table function.
