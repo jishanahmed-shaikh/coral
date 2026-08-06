@@ -1,5 +1,5 @@
 import { createRoutesStub } from 'react-router'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { render } from 'vitest-browser-react'
 
 import {
@@ -10,6 +10,8 @@ import {
 import { getOnboardingStepState } from './onboarding-steps'
 
 const nextStepsStep = getOnboardingStepState('next-steps')
+
+const WORKSPACES = [{ name: 'default' }, { name: 'analytics' }]
 
 describe('OnboardingNextStepsPage', () => {
   it('defaults to AI-assisted setup and offers manual setup', async () => {
@@ -27,16 +29,14 @@ describe('OnboardingNextStepsPage', () => {
       {
         Component: () => (
           <OnboardingNextStepsPage
-            mcpLaunchConfig={{
-              config: {
-                args: ['mcp-stdio'],
-                command: '/Applications/Coral.app/Contents/Resources/coral/coral',
-              },
-              status: 'success',
+            mcpClients={{
+              clients: [{ id: 'codex', name: 'Codex' }],
+              onWorkspaceChange: vi.fn(),
             }}
             onContinue={() => undefined}
             runtime="desktop"
             step={nextStepsStep}
+            workspaces={WORKSPACES}
           />
         ),
         path: '/',
@@ -90,29 +90,53 @@ describe('OnboardingNextStepsPage', () => {
     await expect
       .element(screen.getByRole('heading', { name: '2. Install the Coral skill' }))
       .toBeVisible()
-    expect(
-      screen.getByLabelText('Coral MCP server configuration', { exact: true }).element()
-        .textContent,
-    ).toBe('command: "/Applications/Coral.app/Contents/Resources/coral/coral"\nargs: ["mcp-stdio"]')
-    await expect
-      .element(screen.getByRole('button', { name: 'Copy Coral MCP server configuration' }))
-      .toBeVisible()
+    await expect.element(screen.getByRole('button', { name: 'Not configured' })).toBeVisible()
     await expect
       .element(screen.getByRole('link', { name: 'MCP setup guide' }))
       .toHaveAttribute('href', 'https://withcoral.com/docs/guides/use-coral-over-mcp')
-    await expect.element(screen.getByText(/Restart your agent or open a new chat/)).toBeVisible()
   })
 
-  it('does not invent a local executable path on the web', async () => {
+  it('connects and disconnects a client from the workspace menu', async () => {
+    const onWorkspaceChange = vi.fn()
     const Stub = createRoutesStub([
       {
         Component: () => (
           <OnboardingNextStepsPage
-            mcpLaunchConfig={{ status: 'unavailable' }}
-            runtime="web"
+            mcpClients={{
+              clients: [
+                { configuredWorkspace: 'default', id: 'claude-code', name: 'Claude Code' },
+                { id: 'codex', name: 'Codex' },
+              ],
+              onWorkspaceChange,
+            }}
+            runtime="desktop"
             step={nextStepsStep}
+            workspaces={WORKSPACES}
           />
         ),
+        path: '/',
+      },
+    ])
+    const screen = await render(<Stub />)
+
+    await screen.getByRole('tab', { name: 'Manual' }).click()
+
+    await screen.getByRole('button', { name: 'Not configured' }).click()
+    await screen.getByRole('menuitemradio', { name: 'analytics' }).click()
+    expect(onWorkspaceChange).toHaveBeenCalledWith('codex', 'analytics')
+
+    await screen.getByRole('button', { name: 'default' }).click()
+    await expect
+      .element(screen.getByRole('menuitemradio', { name: 'default' }))
+      .toHaveAttribute('aria-checked', 'true')
+    await screen.getByRole('menuitemradio', { name: 'Not configured' }).click()
+    expect(onWorkspaceChange).toHaveBeenLastCalledWith('claude-code', undefined)
+  })
+
+  it('does not offer to connect a client on the web', async () => {
+    const Stub = createRoutesStub([
+      {
+        Component: () => <OnboardingNextStepsPage runtime="web" step={nextStepsStep} />,
         path: '/',
       },
     ])
@@ -125,10 +149,10 @@ describe('OnboardingNextStepsPage', () => {
     await screen.getByRole('tab', { name: 'Manual' }).click()
 
     await expect
-      .element(screen.getByText(/web agents cannot launch a local stdio MCP server/))
+      .element(screen.getByText(/Open this step in Coral Desktop to connect a client/))
       .toBeVisible()
     await expect
-      .element(screen.getByLabelText('Coral MCP server configuration', { exact: true }))
+      .element(screen.getByRole('button', { name: 'Not configured' }))
       .not.toBeInTheDocument()
   })
 })
