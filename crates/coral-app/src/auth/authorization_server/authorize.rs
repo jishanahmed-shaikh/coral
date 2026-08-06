@@ -563,12 +563,17 @@ mod tests {
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-store"),
             (header::PRAGMA, "no-cache"),
+            // No `form-action`: see `approval_page_does_not_restrict_form_action`.
             (
                 header::CONTENT_SECURITY_POLICY,
-                "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+                "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
             ),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (header::REFERRER_POLICY, "no-referrer"),
+            // Not `no-referrer`: that policy makes Chromium submit this page's
+            // own form with `Origin: null`, which the exact-origin check on the
+            // submission can never accept. See
+            // `approval_page_referrer_policy_preserves_the_submission_origin`.
+            (header::REFERRER_POLICY, "same-origin"),
             (header::X_FRAME_OPTIONS, "DENY"),
         ] {
             assert_eq!(response.headers()[name], value);
@@ -770,6 +775,70 @@ mod tests {
         assert!(
             location(&bound_browser).is_some_and(|location| location.contains("access_denied"))
         );
+    }
+
+    /// The approval page must not restrict `form-action`.
+    ///
+    /// Submitting the form starts a sign-in that navigates through this server,
+    /// the provider, any hop the provider adds, this server's callback, and
+    /// finally the client's redirect URI. Browsers apply `form-action` to every
+    /// one of them, so any list short of all of them blocks the login — after
+    /// the POST has already consumed the approval, leaving the user on a page
+    /// where nothing happened and a retry reporting the approval as expired.
+    /// A real sign-in through a hosted provider crossed five origins this way.
+    /// The remaining directives still deny every fetch, base URI and framing.
+    #[tokio::test]
+    async fn approval_page_does_not_restrict_form_action() {
+        let auth_state = state(
+            "https://provider.invalid",
+            Arc::new(InMemoryStateStore::new()),
+        );
+        let page = request(auth_state, &pairs()).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let policy = page.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .expect("policy");
+        assert!(
+            !policy.contains("form-action"),
+            "form-action cannot enumerate an OAuth redirect chain, got: {policy}"
+        );
+        assert!(policy.contains("default-src 'none'"));
+        assert!(policy.contains("base-uri 'none'"));
+        assert!(policy.contains("frame-ancestors 'none'"));
+    }
+
+    /// The approval page must not carry `no-referrer`.
+    ///
+    /// Its own form posts back to this handler, and that submission is checked
+    /// against an exact `Origin`. Chromium derives a form submission's `Origin`
+    /// from the document's referrer policy, so a page served with `no-referrer`
+    /// submits `Origin: null` and every approval fails — the whole browser
+    /// login flow, for every client. Asserting the header's presence is what
+    /// missed this: both halves were tested, their interaction was not. The
+    /// `Origin: null` case below is the submission this policy would produce.
+    #[tokio::test]
+    async fn approval_page_referrer_policy_preserves_the_submission_origin() {
+        let auth_state = state(
+            "https://provider.invalid",
+            Arc::new(InMemoryStateStore::new()),
+        );
+        let page = request(auth_state.clone(), &pairs()).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(page.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(page.headers()[header::PRAGMA], "no-cache");
+        assert_eq!(page.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(page.headers()[header::REFERRER_POLICY], "same-origin");
+
+        let ticket = ticket_from_page(&response_body(page).await);
+        let mut null_origin = submission_request(&ticket, "cancel");
+        null_origin
+            .headers_mut()
+            .insert(header::ORIGIN, "null".parse().unwrap());
+        let null_origin = oauth_authorize_post(State(auth_state.clone()), null_origin).await;
+        assert_eq!(null_origin.status(), StatusCode::BAD_REQUEST);
+
+        let bound_browser = submit(auth_state, &ticket, "cancel").await;
+        assert_eq!(bound_browser.status(), StatusCode::FOUND);
     }
 
     #[tokio::test]
