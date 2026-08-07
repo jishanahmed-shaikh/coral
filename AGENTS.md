@@ -209,6 +209,12 @@
   becoming a separate source of truth. Use
   `cargo run --locked -p xtask -- export-skills --dest <path>` for local
   export checks and distribution syncs.
+- Keep `plugins/coral` conformant with Agent Plugins 1.0: portable metadata
+  belongs in root `plugin.json`, skills are discovered from `skills/`, and MCP
+  servers are declared in root `mcp.json`. Keep the legacy `.codex-plugin`,
+  `.mcp.json`, and `.app.json` package files for pre-0.147 Codex compatibility.
+  Put current Codex-only metadata under `extensions.com.openai`, and align shared
+  metadata and MCP invocation across both representations.
 - Coral skills must include `agents/openai.yaml`. Keep
   `interface.display_name` in the form `Coral` or `Coral <Title Case Suffix>`,
   keep the top-level `SKILL.md` heading equal to that display name, and set
