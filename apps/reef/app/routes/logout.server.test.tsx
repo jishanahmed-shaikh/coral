@@ -47,9 +47,6 @@ describe('logout route', () => {
     authMocks.reefAuthConfig.mockReset()
     authMocks.readReefSession.mockReset()
     authMocks.validateCsrfToken.mockReset()
-    authMocks.clearCsrfToken.mockResolvedValue('reef_session_csrf=; Max-Age=0; Path=/')
-    authMocks.clearOAuthTransaction.mockResolvedValue('reef_oauth=; Max-Age=0; Path=/')
-    authMocks.clearReefSession.mockResolvedValue('reef_session=; Max-Age=0; Path=/')
   })
 
   it('keeps disabled local and desktop logout inert', async () => {
@@ -91,23 +88,33 @@ describe('logout route', () => {
     expect(authMocks.clearReefSession).not.toHaveBeenCalled()
   })
 
-  it('clears hosted auth cookies and lands on the signed-out screen', async () => {
+  it('clears hosted auth state and lands on the signed-out screen', async () => {
     authMocks.reefAuthConfig.mockReturnValue(requiredConfig)
     authMocks.readReefSession.mockResolvedValue(session)
     authMocks.validateCsrfToken.mockResolvedValue(true)
+    authMocks.clearCsrfToken.mockResolvedValue('reef_session_csrf=; Max-Age=0; Path=/')
+    authMocks.clearOAuthTransaction.mockResolvedValue('reef_oauth=; Max-Age=0; Path=/')
+    authMocks.clearReefSession.mockResolvedValue('reef_session=; Max-Age=0; Path=/')
     const request = logoutRequest('valid-token')
 
     const response = await action(authRouteTestArgs(request, {}))
 
     expect(response.status).toBe(302)
     expect(response.headers.get('Location')).toBe('/login?signedOut=1')
-    expect(response.headers.getSetCookie()).toEqual([
-      'reef_session_csrf=; Max-Age=0; Path=/',
-      'reef_oauth=; Max-Age=0; Path=/',
-      'reef_session=; Max-Age=0; Path=/',
-    ])
     expect(response.headers.get('Cache-Control')).toBe('private, no-store')
+    expect(response.headers.get('Vary')).toBe('Cookie')
+    expect(response.headers.getSetCookie().map(cookieName)).toEqual([
+      'reef_session_csrf',
+      'reef_oauth',
+      'reef_session',
+    ])
+    expect(response.headers.getSetCookie().every((cookie) => cookie.includes('Max-Age=0'))).toBe(
+      true,
+    )
     expect(authMocks.validateCsrfToken).toHaveBeenCalledWith(request, requiredConfig, session)
+    expect(authMocks.clearCsrfToken).toHaveBeenCalledWith(requiredConfig)
+    expect(authMocks.clearOAuthTransaction).toHaveBeenCalledWith(requiredConfig)
+    expect(authMocks.clearReefSession).toHaveBeenCalledWith(requiredConfig)
   })
 })
 
@@ -116,4 +123,8 @@ function logoutRequest(csrf: string): Request {
     body: new URLSearchParams({ csrf }),
     method: 'POST',
   })
+}
+
+function cookieName(cookie: string): string {
+  return cookie.slice(0, cookie.indexOf('='))
 }
