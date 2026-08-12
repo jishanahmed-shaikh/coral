@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use coral_api::v1::{
-    AddFunctionRequest, CatalogItemKind as ProtoCatalogItemKind, DescribeTableRequest,
-    DescribeTableResponse, EndTaskRequest, ExecuteSqlRequest, FunctionWriteSurface,
+    AddFunctionRequest, CatalogItemKind as ProtoCatalogItemKind, DescribeCatalogSurfaceRequest,
+    DescribeCatalogSurfaceResponse, EndTaskRequest, ExecuteSqlRequest, FunctionWriteSurface,
     ListCatalogRequest, ListCatalogResponse, ListColumnsRequest, ListSourcesRequest,
     PaginationRequest, QueryGuideReadContext, SearchRequest, Source, StartTaskRequest,
     SubmitFeedbackRequest, TableSummary as ProtoTableSummary, TaskStatus as ProtoTaskStatus,
@@ -40,13 +40,13 @@ use crate::{
         SqlBatchValue, SqlGuideBlockValue, SqlGuideValue, SqlQueryResultValue, StartTaskArguments,
         TaskEndedValue, TaskId, TaskStartedValue, TaskStatus, ToolAvailability,
         ToolDescriptionContext, ToolName, add_function_arguments, available_tools,
-        build_tool_result, describe_table_arguments, describe_table_value, end_task_arguments,
+        build_tool_result, describe_arguments, describe_value, end_task_arguments,
         feedback_arguments, function_added_value, guide_resource, guide_resource_content,
         initial_instructions, list_catalog_arguments, list_catalog_value, list_columns_arguments,
-        list_columns_table_fallback_value, list_columns_value, render_function_artifact,
-        required_task_id_argument, required_tool_intent_argument, search_arguments, sql_arguments,
-        start_task_arguments, status_to_error_data, tables_resource, tables_resource_content,
-        tool_error_from_status, tool_error_result,
+        list_columns_value, render_function_artifact, required_task_id_argument,
+        required_tool_intent_argument, search_arguments, sql_arguments, start_task_arguments,
+        status_to_error_data, tables_resource, tables_resource_content, tool_error_from_status,
+        tool_error_result,
     },
     telemetry,
 };
@@ -221,7 +221,7 @@ fn task_context_requirement(options: &McpOptions, tool_name: ToolName) -> TaskCo
         | ToolName::AddFunction
         | ToolName::Search
         | ToolName::ListCatalog
-        | ToolName::DescribeTable
+        | ToolName::Describe
         | ToolName::ListColumns => TaskContextRequirement::TaskIdAndIntent,
         ToolName::StartTask => TaskContextRequirement::Intent,
         ToolName::EndTask => TaskContextRequirement::TaskId,
@@ -430,19 +430,19 @@ impl CoralMcpServer {
         .map(guide_catalog_from_response)
     }
 
-    async fn load_table_description(
+    async fn load_catalog_surface_description(
         &self,
         catalog_name: Option<&str>,
         schema_name: &str,
-        table_name: &str,
-    ) -> Result<DescribeTableResponse, tonic::Status> {
+        surface_name: &str,
+    ) -> Result<DescribeCatalogSurfaceResponse, tonic::Status> {
         let mut catalog_client = self.catalog.clone();
         Ok(catalog_client
-            .describe_table(Request::new(DescribeTableRequest {
+            .describe_catalog_surface(Request::new(DescribeCatalogSurfaceRequest {
                 workspace: Some(self.workspace()),
                 catalog_name: catalog_name.unwrap_or_default().to_string(),
                 schema_name: schema_name.to_string(),
-                table_name: table_name.to_string(),
+                surface_name: surface_name.to_string(),
             }))
             .await?
             .into_inner())
@@ -736,30 +736,23 @@ impl CoralMcpServer {
         ))
     }
 
-    async fn describe_table_tool_result(
+    async fn describe_tool_result(
         &self,
         request_arguments: Option<&Map<String, Value>>,
     ) -> Result<ToolCallOutcome, ErrorData> {
-        let arguments = describe_table_arguments(request_arguments)?;
-        match self
-            .load_table_description(
+        let arguments = describe_arguments(request_arguments)?;
+        let result = self
+            .load_catalog_surface_description(
                 arguments.catalog.as_deref(),
                 &arguments.schema,
-                &arguments.table,
+                &arguments.surface,
             )
             .await
-        {
-            Ok(response) => Ok(ToolCallOutcome::success(describe_table_value(
-                arguments.catalog.as_deref(),
-                &arguments.schema,
-                &arguments.table,
-                &response,
-            ))),
-            Err(status) => Ok(ToolCallOutcome::ToolError {
-                operation: "Table description",
-                status,
-            }),
-        }
+            .and_then(|response| describe_value(&response));
+        Ok(ToolCallOutcome::from_value_result(
+            "Catalog item description",
+            result,
+        ))
     }
 
     async fn dispatch_tool(
@@ -805,10 +798,7 @@ impl CoralMcpServer {
                     .await
             }
             ToolName::Search => self.search_tool_result(request.arguments.as_ref()).await,
-            ToolName::DescribeTable => {
-                self.describe_table_tool_result(request.arguments.as_ref())
-                    .await
-            }
+            ToolName::Describe => self.describe_tool_result(request.arguments.as_ref()).await,
             ToolName::ListColumns => {
                 self.list_columns_tool_result(request.arguments.as_ref())
                     .await
@@ -878,29 +868,6 @@ impl CoralMcpServer {
             ))),
             Err(status) if status.code() == tonic::Code::InvalidArgument => {
                 Err(status_to_error_data(&status))
-            }
-            Err(status) if status.code() == tonic::Code::NotFound => {
-                match self
-                    .load_table_description(
-                        arguments.catalog.as_deref(),
-                        &arguments.schema,
-                        &arguments.table,
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        Ok(ToolCallOutcome::success(list_columns_table_fallback_value(
-                            arguments.catalog.as_deref(),
-                            &arguments.schema,
-                            &arguments.table,
-                            &response,
-                        )))
-                    }
-                    Err(status) => Ok(ToolCallOutcome::ToolError {
-                        operation: "Column listing",
-                        status,
-                    }),
-                }
             }
             Err(status) => Ok(ToolCallOutcome::ToolError {
                 operation: "Column listing",
