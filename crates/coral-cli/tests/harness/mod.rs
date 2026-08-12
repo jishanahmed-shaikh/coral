@@ -855,8 +855,8 @@ fn list_catalog_response(request: &ListCatalogRequest) -> ListCatalogResponse {
 #[derive(Default)]
 struct Captured {
     execute_sql: Mutex<Vec<ExecuteSqlRequest>>,
-    search: Mutex<Vec<SearchRequest>>,
     execute_sql_task_ids: Mutex<Vec<Option<String>>>,
+    search: Mutex<Vec<SearchRequest>>,
     rebuild_search_index: Mutex<Vec<RebuildSearchIndexRequest>>,
     drain_search_queue: Mutex<Vec<DrainSearchQueueRequest>>,
     clear_search_data: Mutex<Vec<ClearSearchDataRequest>>,
@@ -983,17 +983,17 @@ impl QueryService for MockQueryService {
             .get(CORAL_TASK_ID_METADATA_KEY)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        self.captured
+            .execute_sql_task_ids
+            .lock()
+            .expect("execute_sql task ID capture")
+            .push(task_id);
         let request = request.into_inner();
         self.captured
             .execute_sql
             .lock()
             .expect("execute_sql capture")
             .push(request.clone());
-        self.captured
-            .execute_sql_task_ids
-            .lock()
-            .expect("execute_sql task id capture")
-            .push(task_id);
         let sql = request.sql;
         if sql
             .trim_start()
@@ -1628,16 +1628,16 @@ impl MockServer {
             .clone()
     }
 
-    pub(crate) fn search_requests(&self) -> Vec<SearchRequest> {
-        self.captured.search.lock().expect("search capture").clone()
-    }
-
     pub(crate) fn execute_sql_task_ids(&self) -> Vec<Option<String>> {
         self.captured
             .execute_sql_task_ids
             .lock()
-            .expect("execute_sql task id capture")
+            .expect("execute_sql task ID capture")
             .clone()
+    }
+
+    pub(crate) fn search_requests(&self) -> Vec<SearchRequest> {
+        self.captured.search.lock().expect("search capture").clone()
     }
 
     pub(crate) fn rebuild_search_index_requests(&self) -> Vec<RebuildSearchIndexRequest> {

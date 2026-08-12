@@ -22,6 +22,7 @@
 //!     }),
 //!     sql: "select 1".to_string(),
 //!     guide_read_context: None,
+//!     task_attribution: None,
 //! };
 //! assert_eq!(request.sql, "select 1");
 //! ```
