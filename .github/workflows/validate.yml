@@ -477,6 +477,9 @@ jobs:
       - name: Build Reef
         run: npm run build --prefix apps/reef
 
+      - name: Smoke production Reef server
+        run: npm run test:server --prefix apps/reef
+
   desktop-checks:
     name: Desktop checks
     runs-on: blacksmith-4vcpu-ubuntu-2404
