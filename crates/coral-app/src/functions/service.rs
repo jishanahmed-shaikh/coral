@@ -7,9 +7,7 @@ use coral_api::v1::{
     FunctionTableFunctionPublish, FunctionWriteSurface as ProtoFunctionWriteSurface,
     ListFunctionsRequest, ListFunctionsResponse, TableFunctionResultColumn, function,
 };
-use coral_engine::{
-    UdfRuntimeDefinition, UdfRuntimeImplementation, UdfRuntimeTableFunctionPublish,
-};
+use coral_engine::{CoralSqlFunctionDefinition, CoralSqlTableFunctionPublish};
 use tonic::{Request, Response, Status};
 
 use crate::bootstrap::app_status;
@@ -51,8 +49,9 @@ impl FunctionServiceApi for FunctionService {
                 FunctionInstallMode::ReplaceExisting
             };
             let write_surface = function_write_surface_from_proto(inner.write_surface);
+            let artifact = inner.sql;
             let added = queries
-                .add_user_function(&workspace_name, &inner.sql, mode, write_surface)
+                .add_user_function(&workspace_name, &artifact, mode, write_surface)
                 .await
                 .map_err(query_status)?;
             Ok(Response::new(AddFunctionResponse {
@@ -132,13 +131,10 @@ fn function_listing_to_proto(workspace_name: &WorkspaceName, listing: FunctionLi
 
 fn runtime_function_to_proto(
     workspace_name: &WorkspaceName,
-    function: UdfRuntimeDefinition,
+    function: CoralSqlFunctionDefinition,
     write_surface: FunctionWriteSurface,
 ) -> Function {
     let name = function.name;
-    let UdfRuntimeImplementation::CoralSql { query: sql_body } = function.implementation else {
-        unreachable!("unsupported function runtime implementation")
-    };
     Function {
         workspace: Some(workspace_to_proto(workspace_name)),
         name,
@@ -152,9 +148,7 @@ fn runtime_function_to_proto(
                     data_type: argument.data_type.as_manifest_str().to_string(),
                 })
                 .collect(),
-            table_function: Some(function_table_function_publish_to_proto(
-                function.publish.table_function,
-            )),
+            table_function: Some(function_table_function_publish_to_proto(function.publish)),
             result_columns: function
                 .result_columns
                 .into_iter()
@@ -165,7 +159,7 @@ fn runtime_function_to_proto(
                     description: String::new(),
                 })
                 .collect(),
-            sql_body,
+            sql_body: function.query,
             source_names: function.source_names,
         })),
         write_surface: function_write_surface_to_proto(write_surface),
@@ -189,7 +183,7 @@ fn function_write_surface_to_proto(value: FunctionWriteSurface) -> i32 {
 }
 
 fn function_table_function_publish_to_proto(
-    publish: UdfRuntimeTableFunctionPublish,
+    publish: CoralSqlTableFunctionPublish,
 ) -> FunctionTableFunctionPublish {
     FunctionTableFunctionPublish {
         schema_name: publish.schema,
