@@ -1,4 +1,4 @@
-.PHONY: install ui-build docker-build reef-docker-build reef-docker-smoke reef-docker-test coral-docker-stub-build coral-docker-smoke coral-docker-stub-test rust-checks perf-check
+.PHONY: install ui-build docker-build coral-ui-docker-build coral-ui-docker-smoke coral-ui-docker-test coral-docker-stub-build coral-docker-smoke coral-docker-stub-test rust-checks perf-check
 .PHONY: postgres-start postgres-url postgres-stop postgres-clean postgres-tests
 .PHONY: license-check lint-proto lint-sources fix-sources
 .PHONY: docs-generate docs-check schema-generate schema-check
@@ -7,7 +7,7 @@ LOCAL_POSTGRES_IMAGE ?= postgres:17
 LOCAL_POSTGRES_CONTAINER ?= coral-test-postgres
 LOCAL_POSTGRES_PORT ?=
 DOCKER_IMAGE ?= coral:local
-REEF_DOCKER_IMAGE ?= reef:local
+CORAL_UI_DOCKER_IMAGE ?= coral-ui:local
 CORAL_DOCKER_IMAGE ?= coral:stub
 DOCKER_NO_CACHE ?= 0
 
@@ -87,22 +87,22 @@ docker-build:
 	"$$@"; \
 	echo "Built $(DOCKER_IMAGE)"
 
-reef-docker-build:
+coral-ui-docker-build:
 	@set -eu; \
-	$(call docker_build_preflight,Reef) \
-	set -- docker buildx build --platform "linux/$$image_arch" --provenance=false --file docker/Dockerfile.reef --load --tag "$(REEF_DOCKER_IMAGE)"; \
+	$(call docker_build_preflight,Coral UI) \
+	set -- docker buildx build --platform "linux/$$image_arch" --provenance=false --file docker/Dockerfile.coral-ui --load --tag "$(CORAL_UI_DOCKER_IMAGE)"; \
 	if [ "$$no_cache" -eq 1 ]; then set -- "$$@" --no-cache; fi; \
 	set -- "$$@" .; \
 	"$$@"; \
-	echo "Built $(REEF_DOCKER_IMAGE)"
+	echo "Built $(CORAL_UI_DOCKER_IMAGE)"
 
-reef-docker-smoke:
-	REEF_IMAGE="$(REEF_DOCKER_IMAGE)" docker/reef-smoke.sh
+coral-ui-docker-smoke:
+	CORAL_UI_IMAGE="$(CORAL_UI_DOCKER_IMAGE)" docker/coral-ui-smoke.sh
 
 # The smoke runs from the recipe, not as a second prerequisite: `make -j` runs
 # prerequisites concurrently and would start it against a half-built image.
-reef-docker-test: reef-docker-build
-	REEF_IMAGE="$(REEF_DOCKER_IMAGE)" docker/reef-smoke.sh
+coral-ui-docker-test: coral-ui-docker-build
+	CORAL_UI_IMAGE="$(CORAL_UI_DOCKER_IMAGE)" docker/coral-ui-smoke.sh
 
 # ----------------------------------------------------------------------------
 # Coral image entrypoint checks
