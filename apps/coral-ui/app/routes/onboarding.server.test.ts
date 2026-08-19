@@ -1,9 +1,11 @@
 import { create } from '@bufbuild/protobuf'
+import { createMemoryRouter, redirect } from 'react-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
   completeGuiOnboarding,
   firstWorkspaceForRequest,
+  getGuiOnboardingCompleted,
   listWorkspacesForRequest,
   loadOnboardingSampleQuery,
   loadSourcesRouteData,
@@ -11,6 +13,7 @@ const {
 } = vi.hoisted(() => ({
   completeGuiOnboarding: vi.fn(),
   firstWorkspaceForRequest: vi.fn(),
+  getGuiOnboardingCompleted: vi.fn(),
   listWorkspacesForRequest: vi.fn(),
   loadOnboardingSampleQuery: vi.fn(),
   loadSourcesRouteData: vi.fn(),
@@ -23,12 +26,15 @@ vi.mock('@/lib/workspaces.server', () => ({
   firstWorkspaceForRequest,
   listWorkspacesForRequest,
 }))
-vi.mock('@/lib/gui-onboarding.server', () => ({ completeGuiOnboarding }))
+vi.mock('@/lib/gui-onboarding.server', () => ({
+  completeGuiOnboarding,
+  getGuiOnboardingCompleted,
+}))
 vi.mock('@/lib/onboarding-query.server', () => ({ loadOnboardingSampleQuery }))
 vi.mock('./sources-loader', () => ({ loadSourcesRouteData }))
 vi.mock('./sources-action', () => ({ runSourcesAction }))
 
-import { authRouteTestArgs } from '@/auth/server-context.test-helper'
+import { authRouteTestArgs, authTestContext } from '@/auth/server-context.test-helper'
 import { WorkspaceSchema } from '@/generated/coral/v1/resources_pb'
 
 import { action, loader } from './onboarding'
@@ -39,9 +45,11 @@ beforeEach(() => {
   completeGuiOnboarding.mockReset()
   firstWorkspaceForRequest.mockReset()
   listWorkspacesForRequest.mockReset()
+  getGuiOnboardingCompleted.mockReset()
   loadOnboardingSampleQuery.mockReset()
   loadSourcesRouteData.mockReset()
   runSourcesAction.mockReset()
+  getGuiOnboardingCompleted.mockResolvedValue(false)
   firstWorkspaceForRequest.mockResolvedValue(workspace)
   listWorkspacesForRequest.mockResolvedValue([workspace])
   loadSourcesRouteData.mockResolvedValue({
@@ -104,9 +112,67 @@ describe('onboarding route authentication', () => {
 
     expect(completeGuiOnboarding).toHaveBeenCalledWith(expect.any(Request), 'coral-access-token')
   })
+
+  it('passes the hosted token through the completion-state check', async () => {
+    await loader(
+      authRouteTestArgs(new Request('http://coral-ui.test/onboarding'), {}, 'coral-token'),
+    )
+
+    expect(getGuiOnboardingCompleted).toHaveBeenCalledWith(expect.any(Request), 'coral-token')
+  })
 })
 
 describe('onboarding server route', () => {
+  it('replaces completed users directly into the normal app before loading onboarding data', async () => {
+    getGuiOnboardingCompleted.mockResolvedValue(true)
+    const request = new Request('http://coral-ui.test/onboarding')
+
+    const response = await loader(authRouteTestArgs(request, {}, null))
+
+    expect(response).toBeInstanceOf(Response)
+    expect((response as Response).status).toBe(302)
+    expect((response as Response).headers.get('Location')).toBe('/workspaces/analytics/traces')
+    expect((response as Response).headers.get('X-Remix-Replace')).toBe('true')
+    expect(firstWorkspaceForRequest).toHaveBeenCalledWith(request, null)
+    expect(listWorkspacesForRequest).not.toHaveBeenCalled()
+    expect(loadSourcesRouteData).not.toHaveBeenCalled()
+  })
+
+  it('does not trap completed users when they navigate back into onboarding history', async () => {
+    getGuiOnboardingCompleted.mockResolvedValue(true)
+    const router = createMemoryRouter(
+      [
+        { path: '/before' },
+        { loader: () => redirect(`/workspaces/${workspace.name}/traces`), path: '/' },
+        { loader, path: '/onboarding' },
+        { path: '/workspaces/:workspaceId/traces' },
+      ],
+      {
+        getContext: () => authTestContext(null),
+        initialEntries: [
+          '/before',
+          '/onboarding?step=query',
+          `/workspaces/${workspace.name}/traces`,
+        ],
+        initialIndex: 2,
+      },
+    )
+
+    try {
+      await router.navigate(-1)
+
+      expect(router.state.location.pathname).toBe(`/workspaces/${workspace.name}/traces`)
+      expect(router.state.historyAction).toBe('REPLACE')
+
+      await router.navigate(-1)
+
+      expect(router.state.location.pathname).toBe('/before')
+      expect(getGuiOnboardingCompleted).toHaveBeenCalledOnce()
+    } finally {
+      router.dispose()
+    }
+  })
+
   it('persists completion before redirecting to the normal app', async () => {
     completeGuiOnboarding.mockResolvedValue(undefined)
     const request = completionRequest()
