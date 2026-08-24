@@ -1,5 +1,7 @@
 //! Shared validation helpers for app-owned identifiers.
 
+pub(crate) mod spec_document;
+
 use std::fmt;
 
 use crate::bootstrap::AppError;
