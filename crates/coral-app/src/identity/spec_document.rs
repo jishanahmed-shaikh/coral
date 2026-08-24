@@ -19,8 +19,8 @@ use zeroize::Zeroizing;
 
 use crate::credentials::CredentialsError;
 use crate::credentials::encryption::{
-    CredentialKeyProvider, ENVELOPE_DOCUMENT_ALGORITHM, EnvelopeContext, open_envelope_document,
-    rewrap_envelope_document, seal_envelope_document,
+    CredentialEncryptionKey, CredentialKeyProvider, ENVELOPE_DOCUMENT_ALGORITHM, EnvelopeContext,
+    open_envelope_document, rewrap_envelope_document, seal_envelope_document,
 };
 use crate::encrypted_document::EncryptedEnvelopeDocument;
 use crate::state::db::IdentitySpecKey;
@@ -39,6 +39,7 @@ struct PlaintextIdentitySpecDocument<'a> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DecryptedIdentitySpecDocument {
     version: u32,
     values: BTreeMap<String, String>,
@@ -62,13 +63,16 @@ pub(crate) fn encrypt_identity_spec_document(
 }
 
 /// Decrypt identity-spec setup inputs for the exact durable spec key.
+///
+/// Takes the stored KEK the document names, so reading installed material can neither
+/// create nor rotate key material.
 pub(crate) fn decrypt_identity_spec_document(
     key: &IdentitySpecKey,
     document: &EncryptedEnvelopeDocument,
-    key_provider: &dyn CredentialKeyProvider,
+    kek: &CredentialEncryptionKey,
 ) -> Result<BTreeMap<String, String>, CredentialsError> {
     let context = identity_spec_document_context(document.binding_version, key)?;
-    let plaintext = open_envelope_document(&context, document, key_provider)?;
+    let plaintext = open_envelope_document(&context, document, kek)?;
     let decoded: DecryptedIdentitySpecDocument = serde_json::from_slice(&plaintext)
         .map_err(|error| CredentialsError::Parse(error.to_string()))?;
     if decoded.version != IDENTITY_SPEC_DOCUMENT_VERSION {
@@ -78,6 +82,16 @@ pub(crate) fn decrypt_identity_spec_document(
         )));
     }
     Ok(decoded.values)
+}
+
+#[cfg(test)]
+pub(crate) fn seal_identity_spec_plaintext_for_test(
+    key: &IdentitySpecKey,
+    plaintext: Vec<u8>,
+    key_provider: &dyn CredentialKeyProvider,
+) -> Result<EncryptedEnvelopeDocument, CredentialsError> {
+    let context = identity_spec_document_context(IDENTITY_SPEC_DOCUMENT_BINDING_VERSION, key)?;
+    seal_envelope_document(&context, Zeroizing::new(plaintext), key_provider)
 }
 
 /// Rewrap an identity-spec setup document after authenticating its exact durable key.
@@ -198,7 +212,7 @@ mod tests {
                 .expect_err("credential must not open as identity-spec material"),
         );
         assert_open_failed(
-            &decrypt_credential_values(&workspace, &source, &spec, &provider)
+            &decrypt_credential_values(&workspace, &source, &spec, &provider.key)
                 .expect_err("identity-spec material must not open as credentials"),
         );
     }
@@ -298,7 +312,8 @@ mod tests {
         document: &EncryptedEnvelopeDocument,
         provider: &dyn CredentialKeyProvider,
     ) -> Result<BTreeMap<String, String>, CredentialsError> {
-        decrypt_identity_spec_document(key, document, provider)
+        let kek = provider.key(&document.key_id)?;
+        decrypt_identity_spec_document(key, document, &kek)
     }
 
     fn assert_open_failed(error: &CredentialsError) {
