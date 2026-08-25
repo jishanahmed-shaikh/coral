@@ -419,11 +419,8 @@ impl SourceManager {
         workspace_name: &WorkspaceName,
         command: &ImportSourceCommand,
     ) -> Result<InstalledSource, AppError> {
-        let manifest = parse_source_manifest_yaml(&command.manifest_yaml)
-            .map_err(|error| AppError::InvalidInput(error.to_string()))?;
-        let manifest_yaml = durable_import_manifest_yaml(&command.manifest_yaml, &manifest)?;
-        let mut candidate = describe_manifest(&manifest_yaml, SourceOrigin::Imported, false)?;
-        candidate.installed = self.source_exists(workspace_name, &candidate.name)?;
+        let (manifest_yaml, candidate) =
+            self.prepare_imported_manifest(workspace_name, &command.manifest_yaml)?;
         self.install_validated_source(
             workspace_name,
             &candidate,
@@ -441,11 +438,8 @@ impl SourceManager {
         command: ImportSourceWithCredentialsCommand,
         events: ImportSourceEventSender,
     ) -> Result<InstalledSource, AppError> {
-        let manifest = parse_source_manifest_yaml(&command.manifest_yaml)
-            .map_err(|error| AppError::InvalidInput(error.to_string()))?;
-        let manifest_yaml = durable_import_manifest_yaml(&command.manifest_yaml, &manifest)?;
-        let mut candidate = describe_manifest(&manifest_yaml, SourceOrigin::Imported, false)?;
-        candidate.installed = self.source_exists(workspace_name, &candidate.name)?;
+        let (manifest_yaml, candidate) =
+            self.prepare_imported_manifest(workspace_name, &command.manifest_yaml)?;
         self.install_source_with_oauth(
             workspace_name.clone(),
             revision,
@@ -737,6 +731,36 @@ impl SourceManager {
             .clear_source(workspace_name, source_name);
         self.clear_source_lifecycle_search_state_best_effort(workspace_name, source_name);
         Ok(removed)
+    }
+
+    /// Parses one imported manifest and describes what installing it would
+    /// produce: the canonicalized YAML that gets persisted, and the candidate it
+    /// describes. Preview and both install paths share this so a preview cannot
+    /// describe a source that the install then builds differently.
+    fn prepare_imported_manifest(
+        &self,
+        workspace_name: &WorkspaceName,
+        manifest_yaml: &str,
+    ) -> Result<(String, CandidateSource), AppError> {
+        let manifest = parse_source_manifest_yaml(manifest_yaml)
+            .map_err(|error| AppError::InvalidInput(error.to_string()))?;
+        let manifest_yaml = durable_import_manifest_yaml(manifest_yaml, &manifest)?;
+        let mut candidate =
+            describe_manifest(manifest_yaml.as_str(), SourceOrigin::Imported, false)?;
+        candidate.installed = self.source_exists(workspace_name, &candidate.name)?;
+        Ok((manifest_yaml, candidate))
+    }
+
+    /// Describes one user-supplied manifest without installing it. Import applies
+    /// the same descriptor canonicalization, so running it here surfaces a relative
+    /// file descriptor while the user still has the manifest in front of them.
+    pub(crate) fn describe_source_manifest(
+        &self,
+        workspace_name: &WorkspaceName,
+        manifest_yaml: &str,
+    ) -> Result<CandidateSource, AppError> {
+        let (_, candidate) = self.prepare_imported_manifest(workspace_name, manifest_yaml)?;
+        Ok(candidate)
     }
 
     fn describe_bundled_source(
@@ -1789,6 +1813,7 @@ mod tests {
         SourceOAuthCredentialRetrieval, ValidatedBindings, materialization_inputs_from_bindings,
         normalize_binding_key, source_needs_stored_material_for_validation,
     };
+    use crate::bootstrap::AppError;
     use crate::credentials::{
         CredentialManager, CredentialSetId, CredentialStorageKind, CredentialStoragePreference,
         CredentialStore,
@@ -1802,7 +1827,9 @@ mod tests {
     use crate::sources::model::{CandidateSource, InstalledSource, SourceOrigin};
     use crate::state::{AppStateLayout, ConfigStore};
     use crate::workspaces::{WorkspaceLifecycleRevision, WorkspaceName};
-    use coral_spec::{ManifestInputKind, ManifestInputSpec};
+    use coral_spec::{
+        ManifestCredentialMethodKind, ManifestInputKind, ManifestInputSpec, ManifestOAuthFlowKind,
+    };
 
     fn default_workspace() -> WorkspaceName {
         WorkspaceName::default()
@@ -2010,6 +2037,168 @@ tables:
         type: Utf8
 "#
         .to_string()
+    }
+
+    fn manifest_with_oauth_credential_methods() -> String {
+        r"
+name: oauth_demo
+version: 1.0.0
+dsl_version: 3
+backend: http
+base_url: https://example.com
+inputs:
+  API_TOKEN:
+    kind: secret
+    credential:
+      methods:
+        - type: oauth
+          label: Connect with OAuth
+          oauth:
+            flow:
+              type: authorization_code
+              pkce: required
+            redirect_uri: http://127.0.0.1:53682/oauth/callback
+            redirect_uri_port_mode: fixed
+            endpoints:
+              authorization_url: https://example.com/authorize
+              token_url: https://example.com/token
+            client:
+              id:
+                input: DEMO_CLIENT_ID
+              secret:
+                input: DEMO_CLIENT_SECRET
+                transport: request_body
+        - type: source_config
+          label: Paste token
+auth:
+  type: HeaderAuth
+  headers:
+    - name: Authorization
+      from: template
+      template: Bearer {{input.API_TOKEN}}
+tables:
+  - name: messages
+    description: Demo messages
+    request:
+      method: GET
+      path: /messages
+    response: {}
+    columns:
+      - name: id
+        type: Utf8
+"
+        .to_string()
+    }
+
+    fn test_manager(temp: &TempDir) -> (SourceManager, AppStateLayout) {
+        let layout =
+            AppStateLayout::discover(Some(temp.path().join("coral-config"))).expect("layout");
+        layout.ensure().expect("ensure layout");
+        let config_store = ConfigStore::new(layout.clone());
+        let credential_manager = CredentialManager::new(CredentialStore::new(layout.clone()));
+        let manager = SourceManager::new(
+            config_store,
+            credential_manager,
+            layout.clone(),
+            crate::workspaces::WorkspaceLifecycleLock::default(),
+        );
+        (manager, layout)
+    }
+
+    #[test]
+    fn describe_source_manifest_reports_credential_methods_in_authored_order() {
+        let temp = TempDir::new().expect("temp dir");
+        let (manager, _layout) = test_manager(&temp);
+
+        let candidate = manager
+            .describe_source_manifest(
+                &default_workspace(),
+                &manifest_with_oauth_credential_methods(),
+            )
+            .expect("describe manifest");
+
+        assert_eq!(candidate.name.as_str(), "oauth_demo");
+        assert_eq!(candidate.origin, SourceOrigin::Imported);
+        assert!(!candidate.installed);
+
+        let input = candidate
+            .inputs
+            .iter()
+            .find(|input| input.key == "API_TOKEN")
+            .expect("secret input");
+        assert_eq!(input.kind, ManifestInputKind::Secret);
+        let methods = &input.credential.as_ref().expect("credential").methods;
+        // The UI submits a method index, so authored order has to survive the round trip.
+        let [oauth_method, config_method] = methods.as_slice() else {
+            panic!("expected an OAuth method and a source-config method");
+        };
+        assert_eq!(oauth_method.kind, ManifestCredentialMethodKind::OAuth);
+        assert_eq!(
+            config_method.kind,
+            ManifestCredentialMethodKind::SourceConfig
+        );
+        let oauth = oauth_method.oauth.as_ref().expect("oauth method");
+        assert_eq!(oauth.flow.kind, ManifestOAuthFlowKind::AuthorizationCode);
+    }
+
+    #[test]
+    fn describe_source_manifest_marks_an_installed_name() {
+        let temp = TempDir::new().expect("temp dir");
+        let (manager, _layout) = test_manager(&temp);
+        let workspace_name = default_workspace();
+        let manifest_yaml = manifest_without_secrets();
+
+        manager
+            .import_source(
+                &workspace_name,
+                &ImportSourceCommand {
+                    manifest_yaml: manifest_yaml.clone(),
+                    bindings: SourceBindings::default(),
+                },
+            )
+            .expect("import source");
+
+        let candidate = manager
+            .describe_source_manifest(&workspace_name, &manifest_yaml)
+            .expect("describe manifest");
+        assert!(candidate.installed);
+    }
+
+    #[test]
+    fn describe_source_manifest_rejects_a_relative_file_descriptor() {
+        let temp = TempDir::new().expect("temp dir");
+        let (manager, _layout) = test_manager(&temp);
+
+        let error = manager
+            .describe_source_manifest(
+                &default_workspace(),
+                r"
+name: relative_demo
+dsl_version: 4
+surface:
+  type: openapi
+  file: ./openapi.yaml
+",
+            )
+            .expect_err("relative descriptor must be rejected");
+        let AppError::InvalidInput(message) = error else {
+            panic!("expected InvalidInput, got {error:?}");
+        };
+        assert!(
+            message.contains("relative"),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn describe_source_manifest_rejects_unparseable_yaml() {
+        let temp = TempDir::new().expect("temp dir");
+        let (manager, _layout) = test_manager(&temp);
+
+        let error = manager
+            .describe_source_manifest(&default_workspace(), "name: [unclosed")
+            .expect_err("invalid yaml must be rejected");
+        assert!(matches!(error, AppError::InvalidInput(_)), "got {error:?}");
     }
 
     #[test]

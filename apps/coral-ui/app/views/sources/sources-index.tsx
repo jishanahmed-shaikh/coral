@@ -45,13 +45,14 @@ export function SourcesIndex({
         }
         headerAction={
           <ButtonContainer
+            ariaLabel="Add source"
             as={Link}
             size="36"
             to={routePath('workspaceSourceInstall', { workspaceId })}
             variant="primary"
           >
             <ButtonIcon name="Plus" />
-            <ButtonText>Create source</ButtonText>
+            <ButtonText>Add source</ButtonText>
           </ButtonContainer>
         }
         loadState={loadError ? 'error' : loading ? 'loading' : 'idle'}

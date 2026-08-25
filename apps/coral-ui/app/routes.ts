@@ -23,6 +23,7 @@ export default [
       route(routePattern('workspaces'), 'routes/workspaces-action.ts'),
       route(routePattern('workspaceSources'), 'routes/sources.tsx', [
         route('discover', 'routes/source-discovery.ts'),
+        route('describe', 'routes/source-describe.ts'),
         route('install', 'routes/source-install.tsx'),
         route('oauth-import', 'routes/source-oauth-import.ts'),
         route(':sourceName', 'routes/source-detail.tsx'),
