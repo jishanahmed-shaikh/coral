@@ -3,7 +3,42 @@
 // notifications. Structural types keep this module importable without the
 // electron runtime.
 
+import { isAbsolute } from 'node:path'
+
 import type { DesktopUpdateState, DesktopUpdateStateListener } from '../shared/types'
+
+// Shown wherever a build cannot update itself; see desktopUpdatesSupported in
+// auto-update.ts for the packages that can.
+export const UNSUPPORTED_UPDATE_DETAIL =
+  'Coral checks for updates from the released macOS app and the Linux AppImage only.'
+
+// The image file AppImageUpdater replaces on install, read from the same
+// variable the updater reads. electron-updater only checks that it is set before
+// offering an update, then demands an absolute, NUL-free path at install time —
+// after the download. Checking here keeps a value that cannot install from
+// enabling updates at all. Left unsanitised on purpose: the updater reads
+// process.env.APPIMAGE verbatim, so trimming would validate a different string.
+export function appImagePath(env: NodeJS.ProcessEnv): string | null {
+  const path = env.APPIMAGE
+  if (!path || !isAbsolute(path) || path.includes('\0')) return null
+  return path
+}
+
+// Where the replacement image actually landed. AppImageUpdater overwrites
+// $APPIMAGE only when the running basename equals the downloaded one or carries
+// no x.y.z; a user who keeps `coral-desktop-0.14.0.AppImage` gets the new image
+// written beside it under the artifact name, and the old path is unlinked either
+// way. `appimage-filename-updated` reports that destination, so prefer it and
+// fall back to $APPIMAGE for the in-place case, which emits nothing.
+export function relaunchImagePath(
+  env: NodeJS.ProcessEnv,
+  installedPath: string | null,
+): string | null {
+  if (installedPath && isAbsolute(installedPath) && !installedPath.includes('\0')) {
+    return installedPath
+  }
+  return appImagePath(env)
+}
 
 export const STARTUP_UPDATE_CHECK_DELAY_MS = 5000
 // Long-running desktop sessions would otherwise only see new releases after a
@@ -176,7 +211,7 @@ export function createDesktopUpdater(deps: DesktopUpdaterDeps): DesktopUpdater {
     if (!result) {
       await deps.showInfoDialog(
         'Update checks are unavailable for this build',
-        'Coral can check for desktop updates only from a packaged macOS release build.',
+        UNSUPPORTED_UPDATE_DETAIL,
       )
       return false
     }

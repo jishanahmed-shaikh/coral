@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   PERIODIC_UPDATE_CHECK_INTERVAL_MS,
   STARTUP_UPDATE_CHECK_DELAY_MS,
+  appImagePath,
   createDesktopUpdater,
+  relaunchImagePath,
   type DesktopUpdaterDeps,
   type UpdateCheckResultLike,
   type UpdaterLike,
@@ -111,7 +113,71 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+describe('appImagePath', () => {
+  it('accepts the absolute path an AppImage run exports', () => {
+    expect(appImagePath({ APPIMAGE: '/opt/coral-desktop-linux-x86_64.AppImage' })).toBe(
+      '/opt/coral-desktop-linux-x86_64.AppImage',
+    )
+  })
+
+  it.each([
+    ['unset', {}],
+    ['empty', { APPIMAGE: '' }],
+    // The updater rejects each of these, but only after the download.
+    ['relative', { APPIMAGE: 'coral-desktop.AppImage' }],
+    ['dot-relative', { APPIMAGE: './coral-desktop.AppImage' }],
+    ['blank', { APPIMAGE: '   ' }],
+    ['NUL-bearing', { APPIMAGE: '/opt/coral\0.AppImage' }],
+  ])('rejects a %s APPIMAGE', (_label, env) => {
+    expect(appImagePath(env)).toBe(null)
+  })
+
+  it('passes a leading space through rather than trimming it', () => {
+    // The updater reads APPIMAGE verbatim, so a value it rejects must not be
+    // repaired into one this accepts.
+    expect(appImagePath({ APPIMAGE: ' /opt/coral.AppImage' })).toBe(null)
+  })
+})
+
+describe('relaunchImagePath', () => {
+  const env = { APPIMAGE: '/home/dev/Apps/coral-desktop-0.14.0.AppImage' }
+
+  it('prefers the destination the updater reported', () => {
+    // AppImageUpdater unlinked APPIMAGE and wrote the new image beside it under
+    // the artifact name, because the old basename carried an x.y.z.
+    expect(relaunchImagePath(env, '/home/dev/Apps/coral-desktop-linux-x64.AppImage')).toBe(
+      '/home/dev/Apps/coral-desktop-linux-x64.AppImage',
+    )
+  })
+
+  it('falls back to APPIMAGE when the install overwrote it in place', () => {
+    // An in-place replacement emits no `appimage-filename-updated`.
+    expect(relaunchImagePath(env, null)).toBe(env.APPIMAGE)
+  })
+
+  it.each([
+    ['relative', 'coral-desktop.AppImage'],
+    ['NUL-bearing', '/home/dev/Apps/coral\0.AppImage'],
+    ['empty', ''],
+  ])('ignores a %s destination and falls back to APPIMAGE', (_label, installed) => {
+    expect(relaunchImagePath(env, installed)).toBe(env.APPIMAGE)
+  })
+
+  it('reports nothing when neither path is usable', () => {
+    expect(relaunchImagePath({}, null)).toBe(null)
+  })
+})
+
 describe('install', () => {
+  it('leaves every automatic step to the caller', () => {
+    const updater = createFakeUpdater()
+    createDesktopUpdater(createDeps(updater)).install()
+
+    // No download without a click, and no install on an ordinary quit.
+    expect(updater.autoDownload).toBe(false)
+    expect(updater.autoInstallOnAppQuit).toBe(false)
+  })
+
   it('checks shortly after startup and again every interval', async () => {
     const updater = createFakeUpdater()
     createDesktopUpdater(createDeps(updater)).install()

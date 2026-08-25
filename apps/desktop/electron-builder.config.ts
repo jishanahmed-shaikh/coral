@@ -2,6 +2,11 @@ import { accessSync, constants, statSync } from 'node:fs'
 
 import type { Configuration } from 'electron-builder'
 
+// Release mode ships an active updater, so it only applies where the app can
+// replace itself: the macOS app and the Linux AppImage. Windows has no updater
+// and no signing story yet.
+const RELEASE_PLATFORMS: NodeJS.Platform[] = ['darwin', 'linux']
+
 const API_KEY_NOTARIZATION_ENV = [
   'APPLE_API_KEY',
   'APPLE_API_KEY_ID',
@@ -40,23 +45,24 @@ export function createConfig(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): Configuration {
+  // Reject the flag up front, so the build fails on the flag rather than on a
+  // preflight it could never satisfy.
   const releaseBuild = env.CORAL_DESKTOP_RELEASE === '1'
-  if (releaseBuild) {
-    // Release mode is the Apple signing and notarization path, and macOS is the
-    // only platform with an update feed. Reject it on any other host so the
-    // build fails on the flag rather than on a credential preflight it could
-    // never satisfy.
-    if (platform !== 'darwin') {
-      throw new Error('CORAL_DESKTOP_RELEASE=1 is macOS-only; it drives Apple signing and notarization')
-    }
-    requireNotarizationCredentials(env)
+  if (releaseBuild && !RELEASE_PLATFORMS.includes(platform)) {
+    throw new Error(
+      `CORAL_DESKTOP_RELEASE=1 supports ${RELEASE_PLATFORMS.join(', ')} hosts only, not ${platform}`,
+    )
   }
+  // Signing and notarization are the macOS half of release mode; the AppImage
+  // updates itself unsigned.
+  const appleRelease = releaseBuild && platform === 'darwin'
+  if (appleRelease) requireNotarizationCredentials(env)
 
   return {
     appId: 'com.withcoral.desktop',
     productName: 'Coral',
     artifactName: 'coral-desktop-${os}-${arch}.${ext}',
-    forceCodeSigning: releaseBuild,
+    forceCodeSigning: appleRelease,
     publish: [
       {
         provider: 'github',
@@ -98,15 +104,15 @@ export function createConfig(
     ],
     mac: {
       category: 'public.app-category.developer-tools',
-      entitlements: releaseBuild ? 'resources/entitlements.mac.plist' : null,
-      entitlementsInherit: releaseBuild ? 'resources/entitlements.mac.inherit.plist' : null,
-      hardenedRuntime: releaseBuild,
+      entitlements: appleRelease ? 'resources/entitlements.mac.plist' : null,
+      entitlementsInherit: appleRelease ? 'resources/entitlements.mac.inherit.plist' : null,
+      hardenedRuntime: appleRelease,
       icon: 'resources/icons/icon.icns',
       // identity null makes non-release builds deterministically unsigned;
       // otherwise electron-builder auto-discovers a Developer ID certificate
       // from the developer's keychain and signs local packages.
-      identity: releaseBuild ? undefined : null,
-      notarize: releaseBuild,
+      identity: appleRelease ? undefined : null,
+      notarize: appleRelease,
       target: ['dmg', 'zip'],
     },
     linux: {
@@ -115,25 +121,16 @@ export function createConfig(
       // put a /usr/bin/coral symlink to the desktop app in the deb payload and
       // shadow the CLI the user installed.
       executableName: 'coral-desktop',
-      // The directory, not icon.png. electron-builder returns a lone .png
-      // source verbatim (iconConverter.js `set: source is already a .png`), so
-      // naming the file installs a single 1024x1024 icon — a size hicolor's
-      // index.theme does not declare, leaving launchers with no icon at all.
-      // A directory routes icon.png through the generator and yields a real set.
+      // The directory, not icon.png: electron-builder passes a lone .png through
+      // verbatim, installing one 1024x1024 icon at a size hicolor's index.theme
+      // does not declare. A directory routes it through the size generator.
       icon: 'resources/icons',
       // Debian requires a contact address for the Maintainer field, and fpm
       // refuses to build without one — `author` carries no email.
       maintainer: 'Coral Eng Team <eng@withcoral.com>',
-      // Linux has no updater (see desktopUpdatesSupported in src/main/auto-update.ts).
-      // `null` keeps electron-builder from writing a latest-linux.yml feed nobody
-      // serves and from embedding app-update.yml in the package.
-      publish: null,
       synopsis: 'Coral desktop app',
-      // Electron sets the window's WM_CLASS from `desktopName` in package.json,
-      // and electron-builder writes StartupWMClass from the same value. Without
-      // it the two disagree — WM_CLASS is `withcoral-desktop`, derived from the
-      // package name, while StartupWMClass would be `Coral` — and no desktop
-      // environment can link a running window to the installed launcher.
+      // Makes StartupWMClass match the WM_CLASS Electron takes from `desktopName`
+      // in package.json. Without it the launcher cannot claim its own window.
       syncDesktopName: true,
       target: [
         { target: 'AppImage', arch: ['x64'] },
@@ -144,6 +141,20 @@ export function createConfig(
       // Without this the package name falls back to the product name, `coral`,
       // which would collide with a future CLI package.
       packageName: 'coral-desktop',
+      // Keeps the deb out of latest-linux.yml. FpmTarget reports the deb with
+      // `isWriteUpdateInfo: true` whenever a publish config resolves, and
+      // writeUpdateInfoFiles() merges every reported artifact into the one feed.
+      // The sort there breaks ties by zip-vs-non-zip and then arch, which the
+      // deb and the AppImage tie on, so the top-level `path:` the updater reads
+      // would come from whichever target hashed first. A target-level null
+      // short-circuits getPublishConfigs() for the artifact event, so the feed
+      // names the AppImage and nothing else.
+      //
+      // It does not stop FpmTarget writing `resources/package-type` — that call
+      // passes the target options through but resolves against `linux.publish`
+      // and the global config only. auto-update.ts names the updater class for
+      // that reason.
+      publish: null,
     },
   }
 }

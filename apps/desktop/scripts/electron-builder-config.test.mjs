@@ -103,13 +103,18 @@ test('release packages require a readable, non-empty API key file', async () => 
   }
 })
 
-test('release mode is rejected off macOS before any credential preflight', () => {
-  for (const platform of ['linux', 'win32']) {
-    assert.throws(
-      () => createConfig({ CORAL_DESKTOP_RELEASE: '1', ...apiKeyCredentials }, platform),
-      /CORAL_DESKTOP_RELEASE=1 is macOS-only/,
-    )
-  }
+test('release mode is rejected off a release platform before any preflight', () => {
+  assert.throws(
+    () => createConfig({ CORAL_DESKTOP_RELEASE: '1', ...apiKeyCredentials }, 'win32'),
+    /CORAL_DESKTOP_RELEASE=1 supports darwin, linux hosts only, not win32/,
+  )
+})
+
+test('a Linux release build needs no Apple credentials', () => {
+  const config = createConfig({ CORAL_DESKTOP_RELEASE: '1' }, 'linux')
+
+  assert.equal(config.forceCodeSigning, false)
+  assert.equal(config.mac?.notarize, false)
 })
 
 test('non-release packaging config is identical on every host platform', () => {
@@ -119,16 +124,22 @@ test('non-release packaging config is identical on every host platform', () => {
   assert.deepEqual(linuxHost, createConfig({}, 'win32'))
 })
 
-test('linux packages target AppImage and deb without an update feed', () => {
-  const { linux, deb } = createConfig({}, 'linux')
+test('linux packages target AppImage and deb, and publish an AppImage-only feed', () => {
+  const { linux, deb, publish } = createConfig({}, 'linux')
 
   assert.deepEqual(linux?.target, [
     { target: 'AppImage', arch: ['x64'] },
     { target: 'deb', arch: ['x64'] },
   ])
-  // Linux has no updater, so electron-builder must not emit latest-linux.yml
-  // or embed app-update.yml.
-  assert.equal(linux?.publish, null)
+  // The AppImage updater reads latest-linux.yml and the app-update.yml the
+  // package embeds, so linux must inherit the GitHub publish config rather
+  // than override it.
+  assert.equal(linux?.publish, undefined)
+  assert.equal(publish?.[0]?.provider, 'github')
+  // The deb opts out at target level, so it stays out of latest-linux.yml.
+  // Nulling it on `linux` instead would take the AppImage's app-update.yml with
+  // it, since that file resolves against the platform config.
+  assert.equal(deb?.publish, null)
   // Neither the executable nor the deb may claim the `coral` name; the deb
   // symlinks its executable into /usr/bin and would shadow the CLI.
   assert.equal(linux?.executableName, 'coral-desktop')
