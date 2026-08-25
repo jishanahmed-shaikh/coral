@@ -27,13 +27,13 @@ uses `CORAL_ENDPOINT` to reach the supervised sidecar.
 - Coral UI documents rendered in-process from the staged React Router server build,
   with static assets served over the custom `coral-app://` scheme and a strict
   Content-Security-Policy
-- light and dark app icons (macOS and Linux; Windows icon assets are staged for a
-  future Windows target)
+- light and dark app icons on macOS, Linux, and Windows
 - Coral MCP configuration from Desktop Settings for supported stdio-capable
   clients, including before they are installed
 - macOS DMG and ZIP packaging via `electron-builder`, with a signed and
   notarized release mode
 - Linux AppImage and deb packaging (x64), unsigned
+- Windows NSIS installer packaging (x64), unsigned preview
 - GitHub Releases update metadata for packaged desktop auto-updates on macOS and
   on the Linux AppImage
 - macOS system theme support
@@ -89,6 +89,16 @@ which replaces its own image file on update; the deb belongs to dpkg, so
 `deb.publish` is null (which keeps it out of that feed),
 `desktopUpdatesSupported()` (`src/main/auto-update.ts`) returns false there, and
 deb users install a new release themselves.
+
+Use `npm run package:win --prefix apps/desktop` for the x64 Windows NSIS
+installer. It must run on Windows: NSIS builds its uninstaller by executing the
+freshly built installer, which off-Windows means wine. The installer is an
+unsigned preview, so SmartScreen shows an "unrecognized app" warning; ship it
+labelled as such. It installs per user under `%LOCALAPPDATA%` by default, needs no
+UAC prompt, and lets the user pick a directory. The install mode page also offers
+an all-users install, but `allowElevation: false` disables that choice unless the
+installer already runs elevated. Windows ships no updater, so the
+build writes no feed and no blockmap.
 
 `CORAL_DESKTOP_RELEASE=1` selects release mode: it bakes the updater into the main
 process, so only builds made with it check for updates. On macOS it also requires a

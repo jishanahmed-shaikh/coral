@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import test, { after } from 'node:test'
 
 import { createConfig } from '../electron-builder.config.ts'
+import { APP_ID } from '../src/shared/app-id.ts'
 
 const tempDir = mkdtempSync(join(tmpdir(), 'coral-desktop-signing-config-'))
 const apiKeyPath = join(tempDir, 'AuthKey_TEST.p8')
@@ -149,6 +150,36 @@ test('linux packages target AppImage and deb, and publish an AppImage-only feed'
   // A directory, so electron-builder generates a multi-size hicolor set;
   // naming a single .png would install only the 1024x1024 source.
   assert.equal(linux?.icon, 'resources/icons')
+})
+
+test('windows packages target a single NSIS installer with no updater', () => {
+  const { win, nsis } = createConfig({}, 'win32')
+
+  assert.deepEqual(win?.target, [{ target: 'nsis', arch: ['x64'] }])
+  // No updater on Windows, so no feed and no blockmap. The two are gated
+  // independently, so both settings are load-bearing.
+  assert.equal(win?.publish, null)
+  assert.equal(nsis?.differentialPackage, false)
+  // An assisted install that defaults to per-user: %LOCALAPPDATA% is writable
+  // without UAC. The mode page still offers all-users, so refusing elevation is
+  // what keeps a standard account off a UAC prompt it cannot answer.
+  assert.equal(nsis?.oneClick, false)
+  assert.equal(nsis?.perMachine, false)
+  assert.equal(nsis?.allowElevation, false)
+  assert.equal(nsis?.allowToChangeInstallationDirectory, true)
+  assert.equal(win?.icon, 'resources/icons/icon.ico')
+  // Only the deb needs a renamed executable, because it symlinks into /usr/bin.
+  assert.equal(win?.executableName, undefined)
+})
+
+test('the main process registers the app id electron-builder stamps on the shortcut', () => {
+  const main = readFileSync(new URL('../src/main/index.ts', import.meta.url), 'utf8')
+
+  // Windows reads two spellings of the id as two applications, so the id on the
+  // shortcut and the id the process registers have to be one string. The shared
+  // constant makes them one; this catches a re-inlined literal.
+  assert.match(main, /app\.setAppUserModelId\(APP_ID\)/)
+  assert.equal(createConfig({}, 'win32').appId, APP_ID)
 })
 
 test('deb metadata inputs that live in package.json are present', () => {

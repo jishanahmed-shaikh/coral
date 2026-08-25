@@ -1,6 +1,7 @@
 import { app, BrowserWindow, Menu, ipcMain, nativeTheme, shell } from 'electron'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { APP_ID } from '../shared/app-id'
 import type { DesktopUpdateState } from '../shared/types'
 import {
   configureMcpClient,
@@ -122,7 +123,6 @@ function createMainWindow(): BrowserWindow {
     minHeight: 520,
     title: 'Coral',
     icon: currentWindowIconPath(),
-    autoHideMenuBar: process.platform !== 'darwin',
     webPreferences: {
       preload: preloadPath,
       contextIsolation: true,
@@ -306,27 +306,40 @@ function installAboutPanel() {
 }
 
 function installMenu() {
+  const isMac = process.platform === 'darwin'
+  // `role: 'about'` would label itself from app.name, the package name in dev.
+  const about: Electron.MenuItemConstructorOptions = {
+    label: 'About Coral',
+    click: () => app.showAboutPanel(),
+  }
+  const updates: Electron.MenuItemConstructorOptions[] = desktopUpdatesSupported()
+    ? [
+        {
+          label: 'Check for Updates...',
+          click: () => {
+            void checkForDesktopUpdates({ interactive: true })
+          },
+        },
+      ]
+    : []
+
   const template: Electron.MenuItemConstructorOptions[] = [
-    {
-      label: 'Coral',
-      submenu: [
-        // `role: 'about'` would label itself from app.name, the package name in dev.
-        { label: 'About Coral', click: () => app.showAboutPanel() },
-        { type: 'separator' },
-        ...(desktopUpdatesSupported()
-          ? ([
-              {
-                label: 'Check for Updates...',
-                click: () => {
-                  void checkForDesktopUpdates({ interactive: true })
-                },
-              },
-              { type: 'separator' },
-            ] satisfies Electron.MenuItemConstructorOptions[])
-          : []),
-        { role: 'quit' },
-      ],
-    },
+    // macOS collects About, updates, and Quit in an application menu named
+    // after the app. Windows and Linux have no such menu, so they get the
+    // File and Help entries users look in there instead.
+    isMac
+      ? {
+          label: 'Coral',
+          submenu: [
+            about,
+            { type: 'separator' },
+            ...(updates.length > 0
+              ? ([...updates, { type: 'separator' }] satisfies Electron.MenuItemConstructorOptions[])
+              : []),
+            { role: 'quit' },
+          ],
+        }
+      : { label: 'File', submenu: [{ role: 'quit' }] },
     {
       label: 'Edit',
       submenu: [
@@ -356,11 +369,18 @@ function installMenu() {
         { role: 'zoomOut' },
       ],
     },
+    ...(isMac ? [] : [{ label: 'Help', submenu: [...updates, about] }]),
   ]
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
 
 function startApplication(): void {
+  // Windows keys toasts, taskbar grouping, and jump lists off this id, and
+  // silently drops a notification from a process that never set one. Shared with
+  // electron-builder, which stamps the same id on the shortcut. Must run before
+  // the app is ready. Inert elsewhere.
+  app.setAppUserModelId(APP_ID)
+
   const gotLock = app.requestSingleInstanceLock()
   if (!gotLock) {
     app.quit()

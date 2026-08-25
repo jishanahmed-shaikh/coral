@@ -2,9 +2,10 @@ import { accessSync, constants, statSync } from 'node:fs'
 
 import type { Configuration } from 'electron-builder'
 
+import { APP_ID } from './src/shared/app-id.ts'
+
 // Release mode ships an active updater, so it only applies where the app can
-// replace itself: the macOS app and the Linux AppImage. Windows has no updater
-// and no signing story yet.
+// replace itself: the macOS app and the Linux AppImage.
 const RELEASE_PLATFORMS: NodeJS.Platform[] = ['darwin', 'linux']
 
 const API_KEY_NOTARIZATION_ENV = [
@@ -59,7 +60,7 @@ export function createConfig(
   if (appleRelease) requireNotarizationCredentials(env)
 
   return {
-    appId: 'com.withcoral.desktop',
+    appId: APP_ID,
     productName: 'Coral',
     artifactName: 'coral-desktop-${os}-${arch}.${ext}',
     forceCodeSigning: appleRelease,
@@ -155,6 +156,37 @@ export function createConfig(
       // and the global config only. auto-update.ts names the updater class for
       // that reason.
       publish: null,
+    },
+    win: {
+      // The file, not the directory: the lone-.png trap the linux block works
+      // around is PNG-only, and electron-builder uses an .ico with a >=256
+      // entry as is.
+      icon: 'resources/icons/icon.ico',
+      // Windows ships no updater, so `null` keeps electron-builder from writing
+      // a latest.yml feed nobody serves and from embedding app-update.yml in the
+      // package. getPublishConfigs reads this block before the top-level
+      // `publish`, so it short-circuits there.
+      publish: null,
+      target: [{ target: 'nsis', arch: ['x64'] }],
+    },
+    nsis: {
+      // An assisted installer with `perMachine: false` still shows the install
+      // mode page, so the user can ask for an all-users install. Without this
+      // that choice tries to elevate, and a standard account hits a UAC prompt
+      // it cannot answer. With it the all-users radio is disabled and labelled
+      // "(must run as admin)", so only an already-elevated installer can pick
+      // Program Files.
+      allowElevation: false,
+      allowToChangeInstallationDirectory: true,
+      // Blockmaps are differential-update metadata, gated on this rather than on
+      // `publish`, so without it a .exe.blockmap lands in dist and release.yml's
+      // `coral-*.blockmap` glob sweeps it into the release.
+      differentialPackage: false,
+      oneClick: false,
+      // Default to per-user, under %LOCALAPPDATA%: a developer tool needs no UAC
+      // prompt. Nothing writes into resourcesPath, so a per-machine install
+      // works too — it just costs the prompt.
+      perMachine: false,
     },
   }
 }

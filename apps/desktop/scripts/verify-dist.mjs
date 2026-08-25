@@ -7,10 +7,12 @@
 //   linux  one AppImage, one deb, and latest-linux.yml. The deb has no updater
 //          and must stay out of the feed, and the AppImage carries its blockmap
 //          inside the image.
+//   win    one NSIS installer .exe, and neither a feed nor a blockmap, because
+//          Windows ships no updater.
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
-const PLATFORMS = ['mac', 'linux']
+const PLATFORMS = ['mac', 'linux', 'win']
 
 const distDir = resolve(process.argv[2] ?? 'apps/desktop/dist')
 const platform = process.argv[3] ?? 'mac'
@@ -111,6 +113,27 @@ function verifyLinux() {
   return `${appImages[0]}, ${debs[0]}, latest-linux.yml references ${referenced.join(', ')}`
 }
 
-const summary = { mac: verifyMac, linux: verifyLinux }[platform]()
+// Windows has no updater, so a feed or a blockmap here would be published and
+// served to nobody. The two are suppressed by separate settings (see the win and
+// nsis blocks in electron-builder.config.ts), so check both.
+function verifyWindows() {
+  const installers = artifacts('.exe')
+  if (installers.length !== 1) {
+    fail(`expected exactly one desktop installer .exe, got [${installers}]`)
+  }
+
+  const feeds = entries.filter((f) => /^latest(-\w+)?\.yml$/.test(f))
+  if (feeds.length > 0) {
+    fail(`windows ships no updater, but the build produced update metadata: ${feeds.join(', ')}`)
+  }
+  const blockmaps = entries.filter((f) => f.endsWith('.blockmap'))
+  if (blockmaps.length > 0) {
+    fail(`windows ships no updater, but the build produced blockmaps: ${blockmaps.join(', ')}`)
+  }
+
+  return installers[0]
+}
+
+const summary = { mac: verifyMac, linux: verifyLinux, win: verifyWindows }[platform]()
 
 console.log(`[verify-dist] ok (${platform}): ${summary}`)
