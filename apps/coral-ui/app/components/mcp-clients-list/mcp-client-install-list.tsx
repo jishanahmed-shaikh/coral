@@ -13,7 +13,9 @@ interface McpClientInstallListItemBase {
 export type McpClientInstallListItem =
   | (McpClientInstallListItemBase & {
       readonly installCommand: string
+      readonly installCommandLabel?: string
       readonly workspaceInstallCommand?: string
+      readonly workspaceInstallShell?: 'posix' | 'powershell'
     })
   | (McpClientInstallListItemBase & { readonly setupInstructions: string })
 
@@ -69,7 +71,7 @@ export function McpClientInstallList({
             'workspaceInstallCommand' in client && client.workspaceInstallCommand
           const installCommand =
             'workspaceInstallCommand' in client && client.workspaceInstallCommand && workspace
-              ? `${client.workspaceInstallCommand} --args ${quotePosix(`--workspace=${workspace}`)}`
+              ? `${client.workspaceInstallCommand} --args ${quoteShell(`--workspace=${workspace}`, client.workspaceInstallShell)}`
               : 'installCommand' in client
                 ? client.installCommand
                 : undefined
@@ -119,16 +121,23 @@ export function McpClientInstallList({
               ) : null}
               {/* Manual remote-client setup carries the endpoint and every
                       step, so it wraps instead of truncating. */}
-              <Table.Cell wrap={!installCommand}>
+              <Table.Cell wrap>
                 {installCommand ? (
-                  <div className={styles.installCommand}>
-                    <code>{installCommand}</code>
-                    <Button.CopyButton
-                      ariaLabel={`Copy the Coral install command for ${client.name}`}
-                      className={styles.copyButton}
-                      textToCopy={installCommand}
-                      variant="bare"
-                    />
+                  <div className={styles.installCommandContainer}>
+                    {'installCommandLabel' in client && client.installCommandLabel ? (
+                      <Typography.BodySmall variant="secondary">
+                        {client.installCommandLabel}
+                      </Typography.BodySmall>
+                    ) : null}
+                    <div className={styles.installCommand}>
+                      <code>{installCommand}</code>
+                      <Button.CopyButton
+                        ariaLabel={`Copy the Coral install command for ${client.name}`}
+                        className={styles.copyButton}
+                        textToCopy={installCommand}
+                        variant="bare"
+                      />
+                    </div>
                   </div>
                 ) : (
                   <Typography.BodySmall variant="secondary">
@@ -144,6 +153,8 @@ export function McpClientInstallList({
   )
 }
 
-function quotePosix(value: string): string {
-  return `'${value.replaceAll("'", "'\"'\"'")}'`
+function quoteShell(value: string, shell: 'posix' | 'powershell' = 'posix'): string {
+  return shell === 'powershell'
+    ? `'${value.replaceAll("'", "''")}'`
+    : `'${value.replaceAll("'", "'\"'\"'")}'`
 }
