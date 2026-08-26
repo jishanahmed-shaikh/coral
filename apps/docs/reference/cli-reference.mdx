@@ -20,9 +20,21 @@ These flags do not edit `config.toml`. Use `coral features enable <FEATURE>` or
 
 ## Global workspace selection
 
-Commands that operate on local source state run against the workspace you
-select. A fresh install has no workspaces, so create one with
-`coral workspace create <NAME>` before running them.
+Coral does not create a workspace for you. A fresh install has none, so create
+one before running a command that works on workspace state:
+
+```shellscript
+coral workspace create analytics
+```
+
+Commands that operate on workspace state resolve which workspace to use in this
+order:
+
+1. **`--workspace <NAME>`**, the global flag, wins over everything else.
+2. **`CORAL_WORKSPACE`**, when it holds a non-empty value. An empty value is
+   treated as unset, so an exported-but-blank variable falls through instead of
+   travelling to the server as a workspace named `""`.
+3. **The only workspace you have**, when you have exactly one.
 
 ```shellscript
 coral --workspace work source list
@@ -31,11 +43,43 @@ coral mcp-stdio --workspace work
 CORAL_WORKSPACE=work coral sql "select * from coral.tables"
 ```
 
-The `--workspace <NAME>` flag overrides `CORAL_WORKSPACE` for that process.
-Coral does not persist a separate active-workspace setting; set
-`CORAL_WORKSPACE` in your shell when you want a default for repeated commands.
-With neither set, commands fall back to a workspace named `default`, which is
-an ordinary workspace that exists only if you created it.
+A name you select explicitly is used exactly as you wrote it and is not checked
+against your workspaces first. The command that needs it reports an ordinary
+not-found error if no workspace by that name is available to you.
+
+### When Coral cannot pick for you
+
+Without an explicit selection, Coral resolves the workspace only when you have
+exactly one. Zero and several are different problems, so they are reported as
+different errors, and neither is settled by substituting a name.
+
+**You have none.** The error names every way to obtain one:
+
+```text
+no workspace is available. Run `coral workspace create NAME` to create one, or select an existing workspace with `--workspace NAME` or `CORAL_WORKSPACE`.
+```
+
+**You have several.** The error lists the candidates so you can copy one
+straight into the flag:
+
+```text
+multiple workspaces are available (analytics, work). Select one with `--workspace NAME` or `CORAL_WORKSPACE`.
+```
+
+In both cases the command exits without running; it never reaches the server
+with a guessed workspace.
+
+Coral does not persist an active-workspace setting. Set `CORAL_WORKSPACE` in
+your shell when you want the same workspace for repeated commands.
+
+### `default` is an ordinary workspace name
+
+`default` has no reserved status. Coral does not provision a workspace with
+that name, does not fall back to it, and does not protect it from removal.
+`default`, `default-team`, and `work` are all ordinary names that resolve only
+when a workspace you can reach actually has that name — so a command naming
+`default` on an install that never created one fails like any other unknown
+name.
 
 ## `coral sql`
 
@@ -315,36 +359,55 @@ installation in that workspace. Reusable global source specs and reusable
 credential references are separate concepts and are not represented by
 `coral workspace` today.
 
+These commands manage the workspaces on the Coral install running on this
+machine. They are not an administration tool for a shared deployment: a
+deployment that has `[auth]` configured has its own accounts, memberships, and
+roles, which are not managed from this CLI — see
+[Shared server access control](/guides/shared-server-access-control) for how
+membership is administered.
+
 ### `coral workspace list`
 
-List configured workspaces.
+List the workspaces available to you and your role in each.
 
 ```shellscript
 coral workspace list
 ```
 
+The output is a `Workspace` and `Role` table. When you have none — which is the
+state of a fresh install — it prints `No workspaces available.` instead.
+
 ### `coral workspace create <NAME>`
 
-Create an empty workspace. The workspace belongs to whoever creates it; on a
-deployment that authenticates no one, that is the local user.
+Create an empty workspace. This is the only way a workspace comes into
+existence: nothing provisions one at install, on first run, or on demand. The
+workspace belongs to whoever created it; on a deployment that authenticates no
+one, that is the local user.
 
 ```shellscript
 coral workspace create work
+coral workspace create default
 ```
+
+`default` is accepted here like any other name, and means nothing more than the
+five letters. A name is trimmed of surrounding whitespace and must be non-empty,
+must not be `.` or `..`, and must not contain `/` or `\`. Creating a name that
+already exists fails rather than adopting the existing workspace.
 
 ### `coral workspace remove <NAME>`
 
 Remove a workspace and its workspace-scoped source/artifact directory. When
 trace history is enabled, this also prunes local trace records attributed to
-that workspace. If trace cleanup fails, workspace removal fails and leaves the
-workspace configured.
+that workspace; trace pruning happens after the removal is committed, so a
+failure there is logged as a warning and does not bring the workspace back.
 
 ```shellscript
 coral workspace remove work
 ```
 
-No workspace name is reserved: `default` is an ordinary workspace and is
-removed like any other.
+Any workspace you can manage can be removed, including one named `default`. If
+you remove the last one, the install is back to having none, and
+workspace-scoped commands fail with the guidance above until you create another.
 
 ## `coral functions`
 
@@ -463,8 +526,8 @@ coral features disable feedback
 
 Start a long-running native gRPC server. Coral prints the selected endpoint and
 a `CORAL_ENDPOINT` hint for clients, then runs until you press `Ctrl-C` or send
-`SIGTERM` on Unix. When `[server.mcp_http]` is enabled, it also prints the bound
-MCP Streamable HTTP endpoint.
+`SIGTERM` on Unix. When `[server.mcp_http]` is enabled, it also prints the MCP
+Streamable HTTP listener's per-workspace URL template.
 
 ```shellscript
 coral server
@@ -474,6 +537,33 @@ The bind address comes from `[server].bind_addr`. Without a `[server]` section,
 Coral uses an ephemeral port on `127.0.0.1`. See
 [Configuration](/reference/configuration#server). To run the server as a
 container, see [Self-host Coral with Docker](/guides/self-host-with-docker).
+
+### Which workspace MCP HTTP serves
+
+`coral server` selects no workspace at all, and ignores `--workspace` and
+`CORAL_WORKSPACE`: every gRPC request names the workspace it targets, and the
+MCP Streamable HTTP listener it can start alongside gRPC serves every
+workspace at its own URL — `/mcp/workspace/{workspace}` on the listener, and
+`<public_url>/workspace/{workspace}` when `[auth]` is configured (the prefix
+comes from `server.mcp_http.public_url`). Which workspace an MCP session
+reaches is decided by the URL the client connects to — never by
+configuration, and never on the caller's behalf.
+
+Whether a URL serves is answered per handshake, not at startup: a workspace
+created while the server runs is immediately reachable at its URL, a deleted
+one immediately answers not-found to new sessions, and a fresh install with no
+workspaces starts fine and serves its first workspace the moment
+`coral workspace create` makes one. Creating more workspaces never changes how
+the server starts — it just adds URLs.
+
+Without `[auth]` the listener is unauthenticated and refuses non-loopback
+binds unless `server.mcp_http.allow_unauthenticated_non_loopback` explicitly
+opts in (see [Configuration](/reference/configuration#server)): requests
+act as the built-in local user, with full access to every workspace's URL.
+With `[auth]` the listener is authenticated and a session is admitted only
+when the URL's workspace is among the calling token's own memberships. See
+[Configuration](/reference/configuration#server) and
+[Shared server access control](/guides/shared-server-access-control).
 
 ## `coral mcp-stdio`
 
@@ -485,6 +575,14 @@ coral mcp-stdio --workspace work
 ```
 
 This command is intended to be launched by an MCP-capable client rather than used directly in an interactive shell.
+
+It selects a workspace the same way every other workspace-scoped command does:
+`--workspace NAME`, then `CORAL_WORKSPACE`, then your only workspace if you have
+exactly one. Because a client launches it non-interactively, the zero-workspace
+and several-workspaces errors surface as the server failing to start rather than
+as a prompt — so put `--workspace` in the client's args as soon as you have more
+than one workspace. See
+[Global workspace selection](#global-workspace-selection).
 
 By default, this server exposes:
 

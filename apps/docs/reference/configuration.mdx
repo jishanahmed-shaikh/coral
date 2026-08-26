@@ -45,16 +45,16 @@ export CORAL_DATABASE_URL="postgres://coral:secret@db.example.com:5432/coral?ssl
 
 ## Workspaces
 
-Workspace metadata is stored under `[workspaces]`. Coral provisions no workspace
-of its own — create and remove them yourself with `coral workspace create` and
-`coral workspace remove`. `default` is an ordinary name like any other; nothing
-creates it for you and nothing protects it.
+Which workspaces exist is recorded in Coral's database, not in `config.toml`.
+There is no automatically created workspace: a fresh install has none until you
+run `coral workspace create NAME`, and Coral never falls back to a name of its
+own. `default` is an ordinary name you may create, remove, and select like any
+other.
+
+What `config.toml` holds is the per-workspace installation state for the things
+you install into a workspace — sources and functions:
 
 ```toml
-[workspaces.analytics]
-
-[workspaces.work]
-
 [workspaces.work.sources.github]
 version = "1.0.0"
 variables = {}
@@ -62,12 +62,14 @@ secrets = ["GITHUB_TOKEN"]
 origin = "bundled"
 ```
 
-An empty workspace is represented by an explicit `[workspaces.<name>]` table.
-Installed sources for that workspace live under
-`[workspaces.<name>.sources.<source>]`.
+Coral writes these tables when you run commands such as `coral source add`.
+Creating an empty workspace writes no `[workspaces.<name>]` scaffolding, so a
+workspace with nothing installed in it appears in `coral workspace list` without
+appearing in `config.toml`.
 
-There is no separate active-workspace key in `config.toml`; use
-`CORAL_WORKSPACE` for a shell default or `--workspace <NAME>` for one command.
+There is no active-workspace key in `config.toml`; use `CORAL_WORKSPACE` for a
+shell default or `--workspace <NAME>` for one command, as described in
+[Global workspace selection](/reference/cli-reference#global-workspace-selection).
 Source specs imported from files and source credential material remain scoped
 to the source installation in a workspace. Reusable global source specs and
 reusable credential references are not config objects today.
@@ -86,7 +88,7 @@ bind_addr = "127.0.0.1:14555"
 `[server]` section, Coral binds an ephemeral port on `127.0.0.1`.
 
 <Warning>
-  Without `[auth]`, the native gRPC server does not authenticate clients: a non-loopback bind exposes Coral and its configured sources to any client that can reach the port. Protect access with a trusted network boundary or authenticating proxy. With `[auth]` configured, gRPC requests require a bearer access token; only the gRPC health service stays unauthenticated so orchestrator probes keep working.
+  Without `[auth]` configured, the native gRPC server does not authenticate clients: a non-loopback bind exposes Coral and its configured sources to any client that can reach the port. With `[auth]` configured, gRPC requests require a bearer access token — only the gRPC health service stays unauthenticated, so orchestrator probes keep working — but the listener still serves cleartext h2c, so those tokens can be read off the wire. Either way, protect a non-loopback bind with a trusted network boundary and terminate TLS in front of Coral.
 </Warning>
 
 Coral terminates no TLS on any listener. For any deployment that leaves
@@ -251,8 +253,9 @@ must forward the issuer origin to it at the root.
 ### `[auth.provider]`
 
 The single upstream OIDC provider Coral delegates login to. Who can sign in is
-decided entirely by this provider and `required_claims`; Coral has no user
-management of its own.
+decided entirely by this provider and `required_claims`; Coral keeps its own
+record of every user who has signed in, and its own per-workspace memberships,
+but delegates the sign-in decision itself.
 
 | Key                           | Type    | Default                          | Description                                                                                       |
 | ----------------------------- | ------- | -------------------------------- | ------------------------------------------------------------------------------------------------- |
@@ -269,8 +272,34 @@ management of its own.
 | `discovery_cache_ttl_seconds` | integer | `300`                            | How long provider discovery metadata is cached. Maximum one hour.                                  |
 
 <Note>
-  Every authenticated user has the same full access to the instance and all of its sources — there are no per-user roles. Restrict who can log in through the upstream provider and `required_claims`.
+  Signing in grants no workspace access by itself. Access is granted per
+  workspace, at Owner or Member level, through workspace memberships — see
+  [Shared server access control](/guides/shared-server-access-control) for what
+  each role may do. The provider and `required_claims` decide who can sign in
+  at all; membership decides what a signed-in user reaches.
 </Note>
+
+### MCP HTTP workspace URLs
+
+Nothing under `[server.mcp_http]` selects a workspace: every workspace is
+served at its own URL, `/mcp/workspace/{workspace}` under the listener (and
+under `public_url` when `[auth]` is configured). A `workspace` key is rejected
+at startup — earlier releases used it to bind the listener to one workspace,
+and a value that silently stopped meaning that would be worse than an error.
+
+Whether a URL serves is a per-handshake question, never a startup one. The
+server starts with zero workspaces, a workspace created while it runs is
+immediately reachable at its URL, and a deleted one immediately answers
+not-found to new sessions. Only URL-safe workspace names (ASCII letters and
+digits plus `-`, `.`, `_`, `~`) are reachable over HTTP; a workspace named
+outside that set stays fully usable over gRPC and stdio but has no URL until
+it is recreated under a URL-safe name.
+
+Without `[auth]`, requests act as the built-in local user with full access to
+every workspace URL. With `[auth]`, a session is admitted only when the URL's
+workspace is among the calling token's own memberships — see
+[Shared server access control](/guides/shared-server-access-control) for the
+admission and concealment contract.
 
 ## Runtime features
 
