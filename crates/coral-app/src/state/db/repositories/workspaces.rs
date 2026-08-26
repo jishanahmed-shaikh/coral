@@ -1,5 +1,6 @@
-use sea_query::{Expr, ExprTrait, OnConflict, Query};
+use sea_query::{Expr, ExprTrait, OnConflict, Order, Query, SelectStatement};
 
+use super::workspace_members::{non_local_owner_bearing_workspaces, owner_bearing_workspaces};
 use crate::state::db::schema::Workspaces;
 use crate::state::db::session::DbSession;
 use crate::state::db::{CoralTx, DbError};
@@ -8,6 +9,31 @@ use crate::state::db::{CoralTx, DbError};
 pub(crate) struct WorkspaceRecord {
     pub(crate) id: String,
     pub(crate) created_at_unix_nanos: i64,
+}
+
+/// The workspaces no authenticated caller can *own*, split by why.
+///
+/// The two categories are different operator situations — one needs an owner
+/// appointed, the other needs ownership moved off the local principal — so
+/// they are reported apart rather than merged into one list.
+///
+/// Deliberately about owners, not reachability. The classifying query looks
+/// only at owner rows, so a workspace can appear here while a Member still
+/// reads and queries it — a local host can grant membership to a directory
+/// user before the install is switched to shared mode. What both categories
+/// prove is that nobody left can *manage* the workspace, which is what makes
+/// operator action necessary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct InaccessibleWorkspaces {
+    /// Ids with no owner at all. These are concealed from every caller,
+    /// members included, because concealment treats ownerless exactly as it
+    /// treats nonexistent.
+    pub(crate) without_owner: Vec<String>,
+    /// Ids whose only owner is the synthetic local principal. Storage-wise
+    /// these are validly owned and preserve the owner floor, but no
+    /// authenticated caller can manage them until ownership is transferred.
+    /// Any member they already have keeps its read access.
+    pub(crate) local_owner_only: Vec<String>,
 }
 
 pub(crate) struct WorkspacesRepo<'a, S> {
@@ -79,6 +105,54 @@ where
         let statement = Query::delete().from_table(Workspaces::Table).to_owned();
         self.session.execute(statement).await
     }
+
+    /// Reports the workspaces no authenticated caller can manage.
+    ///
+    /// Neither half has a reachable owner, which is what management needs:
+    /// [`InaccessibleWorkspaces::without_owner`] has no owner at all and is
+    /// concealed from every caller, while
+    /// [`InaccessibleWorkspaces::local_owner_only`] is owned solely by the
+    /// synthetic local principal and stays unmanageable until ownership is
+    /// transferred — the members it already has keep their read access.
+    pub(crate) async fn inaccessible(&mut self) -> Result<InaccessibleWorkspaces, DbError> {
+        let without_owner = self
+            .ids(
+                select_workspace_ids()
+                    .and_where(
+                        Expr::col(Workspaces::Id).not_in_subquery(owner_bearing_workspaces()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        let local_owner_only = self
+            .ids(
+                select_workspace_ids()
+                    .and_where(Expr::col(Workspaces::Id).in_subquery(owner_bearing_workspaces()))
+                    .and_where(
+                        Expr::col(Workspaces::Id)
+                            .not_in_subquery(non_local_owner_bearing_workspaces()),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        Ok(InaccessibleWorkspaces {
+            without_owner,
+            local_owner_only,
+        })
+    }
+
+    async fn ids(&mut self, statement: SelectStatement) -> Result<Vec<String>, DbError> {
+        let rows: Vec<(String,)> = self.session.fetch_all(statement).await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+}
+
+fn select_workspace_ids() -> SelectStatement {
+    Query::select()
+        .column(Workspaces::Id)
+        .from(Workspaces::Table)
+        .order_by(Workspaces::Id, Order::Asc)
+        .to_owned()
 }
 
 impl WorkspacesRepo<'_, CoralTx<'_>> {

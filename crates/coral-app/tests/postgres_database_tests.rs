@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 
+use coral_client::default_workspace;
 use coral_client::local::ServerBuilder;
 use coral_engine::{
     CoralQuery, QueryRuntimeConfig, QuerySource, RuntimeSourceComponent, RuntimeSourcePackage,
@@ -34,12 +35,28 @@ async fn server_lifecycle_can_start_with_postgres_database_config() {
     )
     .expect("write config");
 
+    // `make postgres-tests` points every Postgres test at one database, where
+    // the legacy default name is now an ordinary one somebody may legitimately
+    // have created, so what is asserted is what this startup adds rather than
+    // what the database already held.
+    let legacy_default_before = count_legacy_default_workspaces(&database_url)
+        .await
+        .unwrap_or(0);
+
     let server = ServerBuilder::new()
         .with_config_dir(&config_dir)
         .start()
         .await
         .expect("start server with Postgres config");
-    assert_postgres_db_is_migrated(&database_url).await;
+    let legacy_default_after = count_legacy_default_workspaces(&database_url)
+        .await
+        .expect("startup should migrate the workspaces table");
+    assert_eq!(
+        legacy_default_after,
+        legacy_default_before,
+        "startup must not invent a '{}' workspace",
+        default_workspace().name
+    );
 
     server.shutdown().await.expect("shutdown server");
 }
@@ -154,7 +171,14 @@ fn postgres_source(database_url: &str) -> QuerySource {
     .expect("build Postgres inventory source")
 }
 
-async fn assert_postgres_db_is_migrated(database_url: &str) {
+/// Counts the workspace rows holding the name a fresh install used to be given.
+///
+/// Reports `None` while the schema is unmigrated, which is how a first run
+/// against an empty database tells "no table yet" from "no such row". Asking
+/// about that one name rather than about a total is deliberate: `make
+/// postgres-tests` points every Postgres test at a single database, so the row
+/// count belongs to no test in particular.
+async fn count_legacy_default_workspaces(database_url: &str) -> Option<i64> {
     let pool = PgPoolOptions::new()
         .connect(database_url)
         .await
@@ -164,7 +188,16 @@ async fn assert_postgres_db_is_migrated(database_url: &str) {
             .fetch_one(&pool)
             .await
             .expect("inspect migrated Postgres schema");
-    assert!(table_exists, "workspaces table should be migrated");
+    if !table_exists {
+        return None;
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspaces WHERE id = $1")
+        .bind(default_workspace().name)
+        .fetch_one(&pool)
+        .await
+        .expect("count the workspace rows holding the legacy default name");
+    Some(count)
 }
 
 #[expect(

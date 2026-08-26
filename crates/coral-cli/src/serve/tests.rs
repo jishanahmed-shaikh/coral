@@ -2,8 +2,10 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use coral_api::v1::{CatalogItemKind, ListCatalogRequest, PaginationRequest};
-use coral_client::default_workspace;
+use coral_api::v1::{
+    CatalogItemKind, CreateWorkspaceRequest, ListCatalogRequest, PaginationRequest, Workspace,
+};
+use coral_client::workspace;
 use coral_mcp::{McpSurface, McpSurfaceProvider, McpSurfaceProviderError, McpToolRoute};
 use jsonwebtoken::jwk::{Jwk, ThumbprintHash};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -195,9 +197,32 @@ async fn assert_grpc_rejects_unauthenticated(endpoint: &str) {
     assert_eq!(denied.code(), Code::Unauthenticated);
 }
 
+/// The ordinary workspace these fixtures name.
+///
+/// Nothing provisions a workspace any more, so naming one keeps these fixtures
+/// off the `DEFAULT_WORKSPACE_ID` fallback. Most call sites never create it: the
+/// probes below assert on authentication, which is decided before the workspace
+/// is ever looked up.
+fn test_workspace() -> Workspace {
+    workspace("analytics")
+}
+
+/// Creates [`test_workspace`] over the unauthenticated loopback gRPC endpoint.
+async fn create_test_workspace(endpoint: &str) {
+    AppClient::connect(endpoint)
+        .await
+        .expect("local gRPC client")
+        .workspace_client()
+        .create_workspace(Request::new(CreateWorkspaceRequest {
+            workspace: Some(test_workspace()),
+        }))
+        .await
+        .expect("create workspace");
+}
+
 fn catalog_request() -> ListCatalogRequest {
     ListCatalogRequest {
-        workspace: Some(default_workspace()),
+        workspace: Some(test_workspace()),
         catalog_name: String::new(),
         schema_name: String::new(),
         kind: CatalogItemKind::Unspecified as i32,
@@ -463,7 +488,10 @@ async fn auth_disabled_companion_serves_and_shuts_down() {
         ServerBuilder::configured_standalone_grpc()
             .with_config_dir(temp.path())
             .with_noop_feedback_uploads(),
-        McpOptions::default(),
+        McpOptions {
+            workspace: Some(test_workspace()),
+            ..McpOptions::default()
+        },
         Some(Arc::new(TestMcpProvider)),
     )
     .await
@@ -473,6 +501,9 @@ async fn auth_disabled_companion_serves_and_shuts_down() {
     assert!(!server.mcp_http_authentication_enabled());
     let mcp_addr = server.mcp_http_addr().expect("MCP HTTP endpoint");
     assert!(server.oauth_addr().is_none());
+    // The tools this asserts are workspace-scoped, and nothing provisions a
+    // workspace any more, so the fixture creates the one it scopes MCP to.
+    create_test_workspace(server.endpoint_uri()).await;
     assert_catalog_tool(format!("http://{mcp_addr}/mcp")).await;
     assert_cli_extension_filter(format!("http://{mcp_addr}/mcp")).await;
     server.shutdown().await.expect("shutdown composite server");
@@ -518,7 +549,10 @@ async fn opted_in_auth_disabled_companion_serves_off_loopback() {
         ServerBuilder::configured_standalone_grpc()
             .with_config_dir(temp.path())
             .with_noop_feedback_uploads(),
-        McpOptions::default(),
+        McpOptions {
+            workspace: Some(test_workspace()),
+            ..McpOptions::default()
+        },
         None,
     )
     .await
@@ -529,6 +563,9 @@ async fn opted_in_auth_disabled_companion_serves_off_loopback() {
     // Dial through loopback: the point here is that the listener started and
     // serves; reachability from other interfaces is the operator's affair.
     let dial = SocketAddr::from((Ipv4Addr::LOCALHOST, mcp_addr.port()));
+    // The tools this asserts are workspace-scoped, and nothing provisions a
+    // workspace any more, so the fixture creates the one it scopes MCP to.
+    create_test_workspace(server.endpoint_uri()).await;
     assert_catalog_tool(format!("http://{dial}/mcp")).await;
     server.shutdown().await.expect("shutdown composite server");
 }
@@ -546,6 +583,7 @@ async fn companion_uses_supplied_mcp_options() {
             .with_noop_feedback_uploads(),
         McpOptions {
             feedback_enabled: true,
+            workspace: Some(test_workspace()),
             ..McpOptions::default()
         },
         None,
@@ -553,6 +591,9 @@ async fn companion_uses_supplied_mcp_options() {
     .await
     .expect("start composite server");
     let mcp_addr = server.mcp_http_addr().expect("MCP HTTP endpoint");
+    // `tools/list` enumerates the workspace's table functions, so it needs the
+    // workspace MCP is scoped to actually exist.
+    create_test_workspace(server.endpoint_uri()).await;
     assert_feedback_tool(format!("http://{mcp_addr}/mcp")).await;
     server.shutdown().await.expect("shutdown composite server");
 }

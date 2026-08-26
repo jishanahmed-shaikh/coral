@@ -1,9 +1,13 @@
 use sea_query::{Alias, Expr, ExprTrait, OnConflict, Order, Query, SelectStatement};
 use uuid::Uuid;
 
+use crate::identity::LOCAL_PRINCIPAL_ID;
 use crate::state::db::DbError;
 use crate::state::db::schema::Users;
 use crate::state::db::session::DbSession;
+
+/// The display name the synthetic local directory row carries.
+const LOCAL_USER_DISPLAY_NAME: &str = "Local";
 
 /// One directory row for an authenticated upstream identity.
 ///
@@ -95,6 +99,49 @@ where
                 stored_issuer: record.issuer,
             })
         }
+    }
+
+    /// Ensures the synthetic directory row a single-user deployment owns its
+    /// workspaces through.
+    ///
+    /// The row's `user_id` and `issuer` are both `coral:local` and its subject
+    /// is empty. A verified upstream identity always carries a non-empty
+    /// `sub`, so the empty subject cannot collide with a real login even
+    /// though `users.subject` is unique. Re-running leaves an existing row
+    /// exactly as it stands, so a retried migration never rewrites the local
+    /// user's timestamps.
+    ///
+    /// Returning `Ok` means the row is there. The insert alone cannot promise
+    /// that — a corrupted directory row squatting on the empty subject
+    /// swallows it — and a caller that writes nothing referencing the local
+    /// user would otherwise take a silent no-op for success and commit a
+    /// migration marker that retires itself without the row ever existing.
+    pub(crate) async fn ensure_local(&mut self, now_unix_nanos: i64) -> Result<(), DbError> {
+        let statement = Query::insert()
+            .into_table(Users::Table)
+            .columns(user_columns())
+            .values_panic([
+                Expr::val(LOCAL_PRINCIPAL_ID),
+                Expr::val(LOCAL_PRINCIPAL_ID),
+                Expr::val(""),
+                Expr::val(LOCAL_USER_DISPLAY_NAME),
+                Expr::val(now_unix_nanos),
+                Expr::val(now_unix_nanos),
+            ])
+            // The primary key and the unique subject both identify this same
+            // one row, so the untargeted form absorbs whichever of the two a
+            // re-run trips instead of guessing which arbiter fires first.
+            .on_conflict(OnConflict::new().do_nothing().to_owned())
+            .to_owned();
+        self.session.execute(statement).await?;
+
+        if self.get_by_user_id(LOCAL_PRINCIPAL_ID).await?.is_none() {
+            return Err(DbError::CorruptData(
+                "the local user row is absent after its upsert; another directory row holds its identity"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn get_by_user_id(

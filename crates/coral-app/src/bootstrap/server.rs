@@ -58,7 +58,10 @@ use crate::search::service::SearchService;
 use crate::sources::manager::SourceManager;
 use crate::sources::materialization::SourceDiagnosticReporter;
 use crate::sources::service::SourceService;
-use crate::state::db::{CoralDb, DatabaseConfig, ResolvedDatabaseConfig, run_state_migrations};
+use crate::state::db::{
+    CoralDb, DatabaseConfig, InaccessibleWorkspaces, ResolvedDatabaseConfig,
+    inaccessible_workspaces, migrate_local_ownership_once, run_state_migrations,
+};
 use crate::state::{AppStateLayout, ConfigStore};
 use crate::task::manager::TaskManager;
 use crate::task::service::TaskService;
@@ -383,6 +386,7 @@ impl ServerBuilder {
             bootstrap_database(&layout, &config_store, session_auth).await?;
         let (telemetry_config, active_trace_store) =
             init_server_telemetry(&layout, self.config.enable_stderr_logs)?;
+        apply_local_principal_policy(&coral_db, local_principal).await?;
         let active_trace_store_dir = active_trace_store.as_ref().map(|store| store.dir.clone());
         let credential_config = CredentialStorageConfig::load(&layout)?;
         let credential_store =
@@ -455,6 +459,7 @@ impl ServerBuilder {
         );
         let mut server = start_server(
             ServerDependencies {
+                database: Arc::clone(&coral_db),
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&coral_db)),
                 source: source_manager,
                 workspace: workspace_manager,
@@ -498,6 +503,70 @@ async fn bootstrap_database(
         .map(|session_auth| build_authorization_server(*session_auth, &coral_db))
         .transpose()?;
     Ok((coral_db, authorization_server))
+}
+
+/// Settles what this deployment's local-principal policy means for the
+/// durable ownership already on disk.
+///
+/// Placed after [`bootstrap_database`] because the workspaces it reasons about
+/// only exist once the schema migration and the legacy cutover have run, and
+/// after [`init_server_telemetry`] because the shared-deployment warning is
+/// only worth emitting into an installed subscriber.
+///
+/// A shared deployment keeps serving whatever it can: workspaces nobody can
+/// reach are an operator's job to fix, not a reason to deny every other
+/// workspace its server.
+async fn apply_local_principal_policy(
+    coral_db: &CoralDb,
+    local_principal: LocalPrincipalPolicy,
+) -> Result<(), AppError> {
+    match local_principal {
+        LocalPrincipalPolicy::ImplicitOwner => {
+            let report = migrate_local_ownership_once(coral_db).await?;
+            if report.performed {
+                tracing::info!(
+                    workspaces_claimed = report.workspaces_claimed,
+                    "gave the built-in local user ownership of this install's existing workspaces"
+                );
+            }
+        }
+        LocalPrincipalPolicy::NoLocalPrincipal => {
+            if let Some(warning) =
+                inaccessible_workspaces_warning(&inaccessible_workspaces(coral_db).await?)
+            {
+                tracing::warn!("{warning}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Describes, by category, the workspaces this deployment currently serves to
+/// nobody, or `None` when every workspace has a reachable owner.
+///
+/// The two categories need different operator actions - appoint an owner
+/// versus transfer ownership off the local principal - so a single warning
+/// names both rather than collapsing them into one count.
+fn inaccessible_workspaces_warning(report: &InaccessibleWorkspaces) -> Option<String> {
+    let mut categories = Vec::new();
+    if !report.without_owner.is_empty() {
+        categories.push(format!(
+            "with no owner at all: {}",
+            report.without_owner.join(", ")
+        ));
+    }
+    if !report.local_owner_only.is_empty() {
+        categories.push(format!(
+            "owned only by the built-in local user: {}",
+            report.local_owner_only.join(", ")
+        ));
+    }
+    (!categories.is_empty()).then(|| {
+        format!(
+            "no authenticated caller can manage these workspaces until an operator grants ownership - {}",
+            categories.join("; ")
+        )
+    })
 }
 
 /// Prepares the one access decision every workspace-scoped service shares.
@@ -739,6 +808,8 @@ struct TraceServerComponents {
 }
 
 struct ServerDependencies {
+    /// The app database, which the readiness probe answers out of.
+    database: Arc<CoralDb>,
     gui_onboarding: GuiOnboardingManager,
     source: SourceManager,
     workspace: WorkspaceManager,
@@ -755,13 +826,14 @@ struct ServerDependencies {
     active_features: Features,
 }
 
-/// Builds the gRPC routes for every application service, and returns the query
-/// manager the health service reads readiness from.
+/// Builds the gRPC routes for every application service, and returns the probe
+/// the health service reads readiness from.
 fn application_routes(
     dependencies: ServerDependencies,
     trace_service: Option<TraceService>,
-) -> (Routes, QueryManager) {
+) -> (Routes, EngineReadiness) {
     let ServerDependencies {
+        database,
         gui_onboarding,
         source,
         workspace,
@@ -782,7 +854,7 @@ fn application_routes(
         ),
         None => (source, query),
     };
-    let health_queries = query.clone();
+    let readiness = EngineReadiness::from_database(database);
     let source_service = SourceService::new(
         source,
         query.clone(),
@@ -833,7 +905,7 @@ fn application_routes(
                 .max_encoding_message_size(TRACE_RESPONSE_MAX_MESSAGE_SIZE),
         );
     }
-    (routes, health_queries)
+    (routes, readiness)
 }
 
 async fn start_server(
@@ -850,7 +922,7 @@ async fn start_server(
     // `RunningServer` owns both for shutdown; the routes only borrow them.
     let search = dependencies.search.clone();
     let search_observations = dependencies.search_observations.clone();
-    let (application_routes, health_queries) = application_routes(dependencies, trace_service);
+    let (application_routes, readiness) = application_routes(dependencies, trace_service);
     let routes = Routes::from(
         application_routes
             .into_axum_router()
@@ -859,7 +931,7 @@ async fn start_server(
     // Health must not depend on principal selection: it is the readiness signal
     // an orchestrator reaches without a credential.
     .add_service(tonic_health::pb::health_server::HealthServer::new(
-        AggregateHealthService::new(EngineReadiness::from_query_manager(health_queries)),
+        AggregateHealthService::new(readiness),
     ));
 
     let listener = match grpc_listener {
@@ -957,7 +1029,7 @@ mod tests {
 
     use super::{
         RunningServer, ServerBuilder, ServerDependencies, ServerMode, SessionAuthSettings,
-        TraceServerComponents, start_server,
+        TraceServerComponents, inaccessible_workspaces_warning, start_server,
     };
     use crate::auth::session::test_signing_key;
     use crate::bootstrap::AppError;
@@ -966,6 +1038,7 @@ mod tests {
     use crate::features::{Feature, FeatureOverrides, FeatureStore, Features};
     use crate::feedback::manager::FeedbackManager;
     use crate::gui_onboarding::manager::GuiOnboardingManager;
+    use crate::identity::LOCAL_PRINCIPAL_ID;
     use crate::query::manager::QueryManager;
     use crate::search::manager::SearchManager;
     use crate::search::observed::{
@@ -973,22 +1046,40 @@ mod tests {
         SqliteObservedValuesStore,
     };
     use crate::sources::manager::SourceManager;
-    use crate::state::db::{CoralDb, DatabaseConfig, ResolvedDatabaseConfig, run_state_migrations};
+    use crate::state::db::{
+        CoralDb, DatabaseConfig, DbRepos as _, InaccessibleWorkspaces,
+        LOCAL_WORKSPACE_OWNERSHIP_MIGRATION_ID, ResolvedDatabaseConfig, run_state_migrations,
+    };
     use crate::state::{AppStateLayout, ConfigStore};
     use crate::task::manager::TaskManager;
     use crate::task::store::TaskStore;
     use crate::telemetry::{TraceManager, service::TraceService};
+    use crate::test_support::{create_workspace, test_workspace};
     use crate::transport::workspace_to_proto;
     use crate::users::manager::UserManager;
     use crate::workspaces::authorization::{LocalPrincipalPolicy, WorkspaceAuthorizer};
-    use crate::workspaces::{WorkspaceManager, WorkspaceName};
+    use crate::workspaces::{MemberRole, WorkspaceManager};
     use crate::{
         AwsEngineExtensionsProvider, LocalPrincipalProvider, NoopEngineExtensionsProvider,
         PrincipalKind,
     };
 
-    fn default_workspace() -> Workspace {
-        workspace_to_proto(&WorkspaceName::default())
+    fn workspace() -> Workspace {
+        workspace_to_proto(&test_workspace())
+    }
+
+    /// Creates the workspace a `ServerBuilder` fixture runs in, in the state
+    /// the server is about to open.
+    ///
+    /// It has to happen up front: the server owns its state once it is
+    /// serving, and the RPCs under test are the ones that need the workspace
+    /// to already be there. Call it after any config file the fixture writes,
+    /// because the state migrations read that config.
+    async fn create_test_workspace_in(config_dir: &Path) {
+        let layout = AppStateLayout::discover(Some(config_dir.to_path_buf())).expect("layout");
+        layout.ensure().expect("layout dirs");
+        let config_store = ConfigStore::new(layout.clone());
+        drop(test_db(&layout, &config_store).await);
     }
 
     fn disable_internal_tracing(config_dir: &Path) {
@@ -1044,7 +1135,9 @@ enabled = false
         run_state_migrations(&db, config_store, layout)
             .await
             .expect("run state migrations");
-        Arc::new(db)
+        let db = Arc::new(db);
+        create_workspace(&db, &test_workspace()).await;
+        db
     }
 
     fn test_user_manager(db: &Arc<CoralDb>) -> UserManager {
@@ -1095,7 +1188,7 @@ enabled = false
             CatalogDiscovery::new(query_manager),
             lifecycle_lock,
         );
-        let workspace = WorkspaceName::default();
+        let workspace = test_workspace();
         let store = SqliteObservedValuesStore::new(layout.clone());
         let generation = store
             .capture_epoch(&workspace, "github")
@@ -1405,6 +1498,168 @@ redirect_uri = 'https://auth.example.test/auth/oidc/callback'
         );
     }
 
+    /// Writes a legacy config whose only workspace exists in `config.toml`, so
+    /// the workspace under test comes into being during the very startup that
+    /// is supposed to give it an owner.
+    fn configure_legacy_workspace(config_dir: &Path) {
+        std::fs::create_dir_all(config_dir).expect("create config dir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            r"
+version = 1
+
+[trace_history]
+enabled = false
+
+[workspaces.legacy]
+",
+        )
+        .expect("write legacy workspace config");
+    }
+
+    /// Adds a legacy workspace to a config another fixture already wrote.
+    fn append_legacy_workspace(config_dir: &Path) {
+        let path = config_dir.join("config.toml");
+        let mut config = std::fs::read_to_string(&path).expect("read config");
+        config.push_str("\n[workspaces.legacy]\n");
+        std::fs::write(&path, config).expect("append legacy workspace");
+    }
+
+    /// Opens the state a server just wrote, to read what its startup did.
+    async fn open_started_state(config_dir: &Path) -> CoralDb {
+        let layout = AppStateLayout::discover(Some(config_dir.to_path_buf())).expect("layout");
+        let DatabaseConfig::Sqlite { path } = DatabaseConfig::load(&layout).expect("db config")
+        else {
+            panic!("default test config should be sqlite");
+        };
+        CoralDb::open(ResolvedDatabaseConfig::Sqlite { path })
+            .await
+            .expect("open sqlite")
+    }
+
+    async fn local_role_for(db: &CoralDb, workspace_id: &str) -> Option<MemberRole> {
+        let mut session = db;
+        session
+            .workspace_members()
+            .role_for_user_id(workspace_id, LOCAL_PRINCIPAL_ID)
+            .await
+            .expect("read the local principal's role")
+    }
+
+    async fn local_ownership_migrated(db: &CoralDb) -> bool {
+        let mut session = db;
+        session
+            .state_migrations()
+            .has_completed(LOCAL_WORKSPACE_OWNERSHIP_MIGRATION_ID)
+            .await
+            .expect("read the migration marker")
+    }
+
+    /// The upgrade adopts the workspaces the legacy cutover imports, which it
+    /// can only do by running after it. Ordering them the other way round
+    /// leaves this install's one workspace ownerless forever, because the
+    /// marker retires the upgrade whether or not it found anything.
+    #[tokio::test]
+    async fn local_ownership_migration_adopts_the_workspaces_cutover_just_imported() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.path().join("coral-config");
+        configure_legacy_workspace(&config_dir);
+
+        let server = ServerBuilder::new()
+            .with_config_dir(config_dir.clone())
+            .start()
+            .await
+            .expect("start a deployment with no login configured");
+        server.shutdown().await.expect("shutdown gRPC server");
+
+        let db = open_started_state(&config_dir).await;
+        assert_eq!(
+            local_role_for(&db, "legacy").await,
+            Some(MemberRole::Owner),
+            "a workspace that only existed in config.toml must come out of startup owned"
+        );
+        assert!(local_ownership_migrated(&db).await);
+    }
+
+    /// A shared deployment leaves ownership entirely alone - it neither claims
+    /// the upgrade nor provisions the local user - and keeps serving, because
+    /// workspaces awaiting an owner are an operator's task rather than grounds
+    /// to deny every other workspace its server.
+    #[tokio::test]
+    async fn local_ownership_is_untouched_by_a_shared_deployment_that_still_serves() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.path().join("coral-config");
+        configure_serve_session_auth(&config_dir);
+        append_legacy_workspace(&config_dir);
+        let (builder, session_auth) = serve_session_auth(&config_dir);
+
+        let server = builder
+            .with_session_auth(session_auth)
+            .start()
+            .await
+            .expect("an ownerless workspace must not refuse a shared server its startup");
+        server.shutdown().await.expect("shutdown gRPC server");
+
+        let db = open_started_state(&config_dir).await;
+        assert!(
+            !local_ownership_migrated(&db).await,
+            "claiming the marker here would retire the upgrade for a later single-user start"
+        );
+        assert_eq!(local_role_for(&db, "legacy").await, None);
+        let mut session = &db;
+        assert!(
+            session
+                .users()
+                .get_by_user_id(LOCAL_PRINCIPAL_ID)
+                .await
+                .expect("read the local user")
+                .is_none(),
+            "a shared deployment must not even provision the local principal"
+        );
+    }
+
+    /// The one warning has to say which of the two operator situations each
+    /// workspace is in, and stay silent when there is nothing to fix.
+    #[test]
+    fn local_ownership_warning_reports_each_inaccessible_category_separately() {
+        assert_eq!(
+            inaccessible_workspaces_warning(&InaccessibleWorkspaces::default()),
+            None,
+            "a deployment every workspace of which has a reachable owner has nothing to say"
+        );
+
+        let both = inaccessible_workspaces_warning(&InaccessibleWorkspaces {
+            without_owner: vec!["orphan".to_string()],
+            local_owner_only: vec!["adopted".to_string()],
+        })
+        .expect("a warning covering both categories");
+        assert!(both.contains("with no owner at all: orphan"), "{both}");
+        assert!(
+            both.contains("owned only by the built-in local user: adopted"),
+            "{both}"
+        );
+
+        let ownerless_only = inaccessible_workspaces_warning(&InaccessibleWorkspaces {
+            without_owner: vec!["orphan".to_string()],
+            local_owner_only: Vec::new(),
+        })
+        .expect("a warning for the category that has workspaces");
+        assert!(
+            !ownerless_only.contains("built-in local user"),
+            "an empty category must not be named: {ownerless_only}"
+        );
+
+        let local_only = inaccessible_workspaces_warning(&InaccessibleWorkspaces {
+            without_owner: Vec::new(),
+            local_owner_only: vec!["adopted".to_string()],
+        })
+        .expect("a warning for the category that has workspaces");
+        assert!(
+            !local_only.contains("no owner at all"),
+            "an empty category must not be named: {local_only}"
+        );
+    }
+
     #[tokio::test]
     async fn start_without_session_auth_prepares_no_authorization_server() {
         let temp = TempDir::new().expect("temp dir");
@@ -1666,6 +1921,7 @@ backend = "unsupported"
         let temp = TempDir::new().expect("temp dir");
         let config_dir = temp.path().join("coral-config");
         disable_internal_tracing(&config_dir);
+        create_test_workspace_in(&config_dir).await;
         let server = ServerBuilder::new()
             .with_config_dir(config_dir)
             .start()
@@ -1680,7 +1936,7 @@ backend = "unsupported"
 
         let task = task_client
             .start_task(Request::new(StartTaskRequest {
-                workspace: Some(default_workspace()),
+                workspace: Some(workspace()),
                 intent: "find the HR onboarding form".to_string(),
             }))
             .await
@@ -1692,7 +1948,7 @@ backend = "unsupported"
 
         let task_end = task_client
             .end_task(Request::new(EndTaskRequest {
-                workspace: Some(default_workspace()),
+                workspace: Some(workspace()),
                 task_id: task.task_id.clone(),
                 task_status: TaskStatus::Success as i32,
             }))
@@ -1711,9 +1967,10 @@ backend = "unsupported"
         let temp = TempDir::new().expect("temp dir");
         let config_dir = temp.path().join("coral-config");
         configure_observed_values_search(&config_dir, true);
+        create_test_workspace_in(&config_dir).await;
         let layout = AppStateLayout::discover(Some(config_dir.clone())).expect("layout");
         layout.ensure().expect("layout dirs");
-        let workspace = WorkspaceName::default();
+        let workspace = test_workspace();
         let store = SqliteObservedValuesStore::new(layout);
         let generation = store
             .capture_epoch(&workspace, "github")
@@ -1759,9 +2016,10 @@ backend = "unsupported"
         let temp = TempDir::new().expect("temp dir");
         let config_dir = temp.path().join("coral-config");
         disable_internal_tracing(&config_dir);
+        create_test_workspace_in(&config_dir).await;
         let layout = AppStateLayout::discover(Some(config_dir.clone())).expect("layout");
         layout.ensure().expect("layout dirs");
-        let workspace = WorkspaceName::default();
+        let workspace = test_workspace();
         let store = SqliteObservedValuesStore::new(layout);
         let generation = store
             .capture_epoch(&workspace, "github")
@@ -1851,6 +2109,7 @@ backend = "unsupported"
         );
         let server = start_server(
             ServerDependencies {
+                database: Arc::clone(&db),
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&db)),
                 source: source_manager,
                 workspace: workspace_manager,
@@ -1926,7 +2185,7 @@ backend = "unsupported"
 
         let status = SourceServiceClient::new(channel.clone())
             .list_sources(Request::new(ListSourcesRequest {
-                workspace: Some(default_workspace()),
+                workspace: Some(workspace()),
             }))
             .await
             .expect_err("request should be rejected");
@@ -2010,6 +2269,7 @@ backend = "unsupported"
         );
         let running = start_server(
             ServerDependencies {
+                database: Arc::clone(&db),
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&db)),
                 source: source_manager,
                 workspace: workspace_manager,
@@ -2042,7 +2302,7 @@ backend = "unsupported"
 
         let mut import_stream = source_client
             .import_source(Request::new(ImportSourceRequest {
-                workspace: Some(default_workspace()),
+                workspace: Some(workspace()),
                 manifest_yaml: r#"
 name: tilde_demo
 version: 0.1.0
@@ -2082,7 +2342,7 @@ tables:
 
         let response = query_client
             .execute_sql(Request::new(ExecuteSqlRequest {
-                workspace: Some(default_workspace()),
+                workspace: Some(workspace()),
                 sql: "SELECT text FROM tilde_demo.messages ORDER BY text".to_string(),
                 guide_read_context: None,
                 task_attribution: None,
@@ -2144,6 +2404,7 @@ tables:
         );
         let running = start_server(
             ServerDependencies {
+                database: Arc::clone(&db),
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&db)),
                 source: source_manager,
                 workspace: workspace_manager,
@@ -2178,7 +2439,7 @@ tables:
         let sql = "SELECT repeat('x', 5000000) AS pad";
         let response = query_client
             .execute_sql(Request::new(ExecuteSqlRequest {
-                workspace: Some(default_workspace()),
+                workspace: Some(workspace()),
                 sql: sql.to_string(),
                 guide_read_context: None,
                 task_attribution: None,
@@ -2278,6 +2539,7 @@ tables:
         );
         let running = start_server(
             ServerDependencies {
+                database: Arc::clone(&db),
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&db)),
                 source: source_manager,
                 workspace: workspace_manager,
@@ -2310,7 +2572,7 @@ tables:
 
         let mut import_stream = source_client
             .import_source(Request::new(ImportSourceRequest {
-                workspace: Some(default_workspace()),
+                workspace: Some(workspace()),
                 manifest_yaml: manifest,
                 variables: Vec::new(),
                 secrets: Vec::new(),
@@ -2332,7 +2594,7 @@ tables:
 
         let status = query_client
             .execute_sql(Request::new(ExecuteSqlRequest {
-                workspace: Some(default_workspace()),
+                workspace: Some(workspace()),
                 sql: "SELECT bogus_column FROM wide_demo.wide LIMIT 0".to_string(),
                 guide_read_context: None,
                 task_attribution: None,

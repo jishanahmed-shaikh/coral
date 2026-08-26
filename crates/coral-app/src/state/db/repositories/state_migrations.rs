@@ -5,6 +5,13 @@ use sea_query::{Expr, OnConflict, Query};
 use crate::state::db::schema::AppStateMigrations;
 use crate::state::db::{CoralTx, DbError, DbSession};
 
+/// Identifies the one-time migration that gives legacy ownerless workspaces
+/// their local owner.
+///
+/// The id is part of the on-disk contract: it is what an already-upgraded
+/// state directory matches against, so it must never change.
+pub(crate) const LOCAL_WORKSPACE_OWNERSHIP_MIGRATION_ID: &str = "local_workspace_ownership_v1";
+
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub(crate) struct StateMigrationRecord {

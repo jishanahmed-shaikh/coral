@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use coral_api::v1::{
     AddWorkspaceMemberRequest, AddWorkspaceMemberResponse, CreateWorkspaceRequest,
@@ -20,6 +20,7 @@ use coral_client::{
 use serde_json::{Value, json};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
+use toml_edit::{DocumentMut, Item, Table};
 use tonic::{Code, Request, Response, Status};
 use tonic_types::{ErrorDetail, StatusExt as _};
 
@@ -39,10 +40,26 @@ pub(crate) struct FailingHttpFixture {
 }
 
 impl GrpcHarness {
+    /// Starts a server on empty state, the way a fresh install comes up: it
+    /// owns no workspace until someone creates one.
     pub(crate) async fn new() -> Self {
         let temp_dir = TempDir::new().expect("temp dir");
         let config_dir = temp_dir.path().join("coral-config");
         Self::start_with_parts(temp_dir, config_dir, FeatureOverrides::default()).await
+    }
+
+    /// Starts a server and creates the one workspace the fixture works in.
+    ///
+    /// This is what a suite that is about something else wants: nearly every
+    /// scoped fixture pairs [`Self::new`] with [`Self::seed_workspace`], and a
+    /// test that copies the surrounding style but forgets the second call
+    /// compiles and then fails deep inside an RPC with an unknown-workspace
+    /// error that does not point back at the missing setup. [`Self::new`]
+    /// stays for the suites whose subject is the fresh install itself.
+    pub(crate) async fn with_workspace() -> Self {
+        let harness = Self::new().await;
+        harness.seed_workspace().await;
+        harness
     }
 
     pub(crate) async fn new_with_observed_values_search() -> Self {
@@ -110,6 +127,17 @@ impl GrpcHarness {
             app,
             _server: server,
         }
+    }
+
+    /// Creates the one workspace the scoped fixtures work in.
+    ///
+    /// Nothing provisions it: a fixture that needs workspace state asks for it
+    /// here, through the same public RPC any client would use, and
+    /// `default_workspace()` then names it on every request that follows.
+    pub(crate) async fn seed_workspace(&self) {
+        create_workspace(&self.app, &default_workspace().name)
+            .await
+            .expect("seed the workspace this fixture works in");
     }
 
     pub(crate) fn temp_path(&self) -> &Path {
@@ -244,6 +272,156 @@ impl GrpcHarness {
     }
 }
 
+/// The configuration an unauthenticated deployment reads: no `[auth]` at all,
+/// which is what leaves the local principal owning everything.
+const LOCAL_PRINCIPAL_CONFIG: &str = "[credentials]\nstorage = \"file\"\n";
+
+/// Rewrites `config.toml` so the install runs under `mode`, keeping the rest of
+/// the file.
+///
+/// Only the tables that say how callers are admitted are replaced. Everything
+/// else — the legacy workspace tables a test seeds, the sources a running
+/// server installed — survives, because moving an install between modes is a
+/// change to its auth configuration rather than a new install.
+///
+/// The admission tables a previous mode wrote are removed rather than merged
+/// over, so an `[auth]` section cannot linger and contradict the mode being
+/// started now.
+fn write_config(config_dir: &Path, mode: &str) {
+    std::fs::create_dir_all(config_dir).expect("create config dir");
+    let config_file = config_dir.join("config.toml");
+    let mut config: DocumentMut = std::fs::read_to_string(&config_file)
+        .unwrap_or_default()
+        .parse()
+        .expect("the install's config.toml is valid TOML");
+
+    config.remove("auth");
+    if let Some(server) = config.get_mut("server").and_then(Item::as_table_mut) {
+        server.remove("mcp_http");
+        if server.is_empty() {
+            config.remove("server");
+        }
+    }
+
+    let incoming: DocumentMut = mode.parse().expect("the mode's config is valid TOML");
+    for (key, value) in incoming.iter() {
+        merge_config_table(config.as_table_mut(), key, value);
+    }
+
+    std::fs::write(config_file, config.to_string()).expect("write the deployment config");
+}
+
+/// Puts `value` into `table` under `key`, descending one level into a table the
+/// two share.
+///
+/// Descending rather than overwriting is what lets a mode name
+/// `[server.mcp_http]` without taking the rest of `[server]` with it. One level
+/// is all the admission configuration nests, and stopping there keeps what a
+/// deeper merge would have to guess at out of the harness.
+fn merge_config_table(table: &mut Table, key: &str, value: &Item) {
+    let (Some(incoming), Some(existing)) = (value.as_table(), table.get_mut(key)) else {
+        table.insert(key, value.clone());
+        return;
+    };
+    let Some(existing) = existing.as_table_mut() else {
+        table.insert(key, value.clone());
+        return;
+    };
+    for (nested_key, nested_value) in incoming {
+        existing.insert(nested_key, nested_value.clone());
+    }
+}
+
+#[cfg(test)]
+mod write_config_tests {
+    use super::{LOCAL_PRINCIPAL_CONFIG, write_config};
+    use crate::session_auth::SessionAuthFixture;
+    use tempfile::TempDir;
+
+    fn config_after(seed: &str, modes: &[&str]) -> String {
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.path().join("coral-config");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        std::fs::write(config_dir.join("config.toml"), seed).expect("seed config");
+        for mode in modes {
+            write_config(&config_dir, mode);
+        }
+        std::fs::read_to_string(config_dir.join("config.toml")).expect("read config")
+    }
+
+    /// What a running server persisted between two starts has to outlive the
+    /// second one, or a restart silently undoes work the deployment did. This
+    /// is the case a snapshot taken before the first start cannot express.
+    #[test]
+    fn a_restart_keeps_what_the_running_server_persisted() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.path().join("coral-config");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config_file = config_dir.join("config.toml");
+        std::fs::write(&config_file, "[workspaces.analytics]\n").expect("seed config");
+
+        write_config(&config_dir, LOCAL_PRINCIPAL_CONFIG);
+
+        // The server comes up and installs a source, which it persists here.
+        let running = std::fs::read_to_string(&config_file).expect("read config");
+        std::fs::write(
+            &config_file,
+            format!("{running}\n[workspaces.analytics.sources.installed]\norigin = \"imported\"\n"),
+        )
+        .expect("persist a source the way a running server would");
+
+        write_config(&config_dir, LOCAL_PRINCIPAL_CONFIG);
+
+        let written = std::fs::read_to_string(&config_file).expect("read config");
+        assert!(
+            written.contains("[workspaces.analytics.sources.installed]"),
+            "a source installed between starts must survive the next one: {written}"
+        );
+        assert!(
+            written.contains("[credentials]"),
+            "the mode's own tables must still be written: {written}"
+        );
+    }
+
+    /// Moving back to single-user has to take the login configuration with it,
+    /// or the next start reads an `[auth]` section the mode does not want.
+    #[test]
+    fn leaving_token_admission_removes_what_it_wrote() {
+        let written = config_after(
+            "[workspaces.analytics]\n",
+            &[&SessionAuthFixture::config_toml(), LOCAL_PRINCIPAL_CONFIG],
+        );
+
+        assert!(
+            !written.contains("[auth"),
+            "an auth section must not linger into single-user mode: {written}"
+        );
+        assert!(
+            !written.contains("mcp_http"),
+            "the shared listener must not linger either: {written}"
+        );
+        assert!(
+            written.contains("[workspaces.analytics]"),
+            "the install's own tables survive the mode change: {written}"
+        );
+    }
+
+    /// The mode names one key inside `[server]`, so the rest of that table is
+    /// not its to take away.
+    #[test]
+    fn swapping_the_listener_leaves_the_rest_of_server_alone() {
+        let written = config_after(
+            "[server]\nbind = '127.0.0.1:7777'\n",
+            &[&SessionAuthFixture::config_toml(), LOCAL_PRINCIPAL_CONFIG],
+        );
+
+        assert!(
+            written.contains("bind = '127.0.0.1:7777'"),
+            "an unrelated server key must survive the listener being removed: {written}"
+        );
+    }
+}
+
 fn ensure_file_credentials_config(config_dir: &Path) {
     std::fs::create_dir_all(config_dir).expect("create config dir");
     let config_file = config_dir.join("config.toml");
@@ -264,15 +442,121 @@ fn ensure_file_credentials_config(config_dir: &Path) {
 /// leaked one would be recognizable on the wire.
 pub(crate) const TEST_ISSUER: &str = "https://issuer.test/authorization";
 
-/// A running server that authenticates its callers, plus the directory rows
-/// login provisioning would have written for them.
-pub(crate) struct SharedDeployment {
-    _temp: Option<TempDir>,
+/// How a deployment admits its callers, which is also what settles whether it
+/// honors the built-in local principal: installing any provider retires it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// Nothing authenticates callers, so every request arrives as the host.
+    LocalPrincipal,
+    /// Bearer tokens name each caller, the way a shared deployment admits them.
+    Tokens,
+}
+
+/// One install's state directory, which outlives the servers started over it.
+///
+/// A deployment's mode is settled when its server starts, so moving an install
+/// between modes means shutting one server down and starting the next over the
+/// same directory.
+pub(crate) struct Install {
+    temp: Mutex<Option<TempDir>>,
     config_dir: PathBuf,
+}
+
+impl Install {
+    pub(crate) fn new() -> Arc<Self> {
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.path().join("coral-config");
+        Arc::new(Self {
+            temp: Mutex::new(Some(temp)),
+            config_dir,
+        })
+    }
+
+    pub(crate) fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
+    /// Starts a server over whatever this install already holds, so a restart
+    /// reads the state the previous one left behind.
+    ///
+    /// The error is reported as text rather than swallowed: a startup that
+    /// refuses because of the state on disk is itself part of the contract.
+    pub(crate) async fn start(
+        self: &Arc<Self>,
+        admission: Admission,
+    ) -> Result<SharedDeployment, String> {
+        // What admits a deployment's callers is what its configuration says, so
+        // moving an install between modes rewrites that configuration rather
+        // than varying how the server is built. The `[auth]` section is the
+        // whole of the difference: with it the server authenticates session
+        // tokens, and without it the local principal owns everything.
+        let session_auth = match admission {
+            Admission::LocalPrincipal => {
+                write_config(&self.config_dir, LOCAL_PRINCIPAL_CONFIG);
+                None
+            }
+            Admission::Tokens => {
+                let session_auth = SessionAuthFixture::key_in(&self.config_dir);
+                write_config(&self.config_dir, &SessionAuthFixture::config_toml());
+                Some(session_auth)
+            }
+        };
+        let server = match &session_auth {
+            Some(session_auth) => session_authenticated_server(session_auth)
+                .await
+                .map_err(|error| error.to_string())?,
+            None => ServerBuilder::new()
+                .with_config_dir(&self.config_dir)
+                .start()
+                .await
+                .map_err(|error| error.to_string())?,
+        };
+        let trace_store_dir = server.local_trace_store_dir().map(Path::to_path_buf);
+        self.keep_when_it_holds_the_installed_trace_store(trace_store_dir.as_deref());
+        Ok(SharedDeployment {
+            endpoint_uri: server.endpoint_uri().to_string(),
+            trace_store_dir,
+            install: Arc::clone(self),
+            session_auth,
+            server,
+        })
+    }
+
+    /// The local trace store is installed once per process, by whichever server
+    /// starts first, and the trace-history tests write into whatever directory
+    /// that turned out to be. When it is this install's, the directory must
+    /// outlive every server started over it: removing it would delete the
+    /// installed store out from under a concurrently running test.
+    fn keep_when_it_holds_the_installed_trace_store(&self, trace_store_dir: Option<&Path>) {
+        let mut temp = self.temp.lock().expect("install state directory");
+        let Some(owned) = temp.take() else {
+            return;
+        };
+        if trace_store_dir.is_some_and(|dir| dir.starts_with(owned.path())) {
+            let _installed_store_root: PathBuf = owned.keep();
+        } else {
+            *temp = Some(owned);
+        }
+    }
+}
+
+/// One running server over an [`Install`], plus the directory rows login
+/// provisioning would have written for its callers.
+///
+/// It authenticates its callers under [`Admission::Tokens`], which is how
+/// [`SharedDeployment::start`] builds it and what every test predating the
+/// mode-transition work gets. Started under [`Admission::LocalPrincipal`] the
+/// same server admits unauthenticated requests as the built-in local principal
+/// instead — see [`SharedDeployment::as_host`] — because a mode transition has
+/// to bring one install up both ways.
+pub(crate) struct SharedDeployment {
+    install: Arc<Install>,
     endpoint_uri: String,
     trace_store_dir: Option<PathBuf>,
-    session_auth: SessionAuthFixture,
-    _server: RunningServer,
+    /// Present only while this deployment authenticates its callers; a
+    /// local-principal deployment has no tokens to mint.
+    session_auth: Option<SessionAuthFixture>,
+    server: RunningServer,
 }
 
 /// What one workspace has on record from work its callers asked for.
@@ -289,40 +573,20 @@ pub(crate) struct WorkspaceWork {
 
 impl SharedDeployment {
     pub(crate) async fn start() -> Self {
-        let temp = TempDir::new().expect("temp dir");
-        let config_dir = temp.path().join("coral-config");
-        // Configuring session authentication is what makes a deployment a
-        // shared one: it retires the implicit local owner, so each request over
-        // this transport arrives as a distinct person or agent rather than as
-        // the host. The fixture writes the credentials config too.
-        let session_auth = SessionAuthFixture::write(&config_dir);
-        let server = session_authenticated_server(&session_auth)
+        Install::new()
+            .start(Admission::Tokens)
             .await
-            .expect("start an authenticated server");
-        let endpoint_uri = server.endpoint_uri().to_string();
-        let trace_store_dir = server.local_trace_store_dir().map(Path::to_path_buf);
-        // The local trace store is installed once per process, by whichever
-        // server starts first, and the trace-history tests write into whatever
-        // directory that turned out to be. When it is this one's, the temp dir
-        // must outlive the deployment: removing it would delete the installed
-        // store out from under a concurrently running test.
-        let temp = if trace_store_dir
-            .as_ref()
-            .is_some_and(|dir| dir.starts_with(temp.path()))
-        {
-            let _installed_store_root: PathBuf = temp.keep();
-            None
-        } else {
-            Some(temp)
-        };
-        Self {
-            _temp: temp,
-            config_dir,
-            endpoint_uri,
-            trace_store_dir,
-            session_auth,
-            _server: server,
-        }
+            .expect("start an authenticated server")
+    }
+
+    /// Shuts this server down and hands back the install it ran over, so the
+    /// next start can bring the same state up under another admission mode.
+    pub(crate) async fn shutdown(self) -> Arc<Install> {
+        let Self {
+            install, server, ..
+        } = self;
+        server.shutdown().await.expect("shut the server down");
+        install
     }
 
     /// Writes one directory row the way a completed login would, and returns
@@ -332,6 +596,20 @@ impl SharedDeployment {
     /// not the OIDC round trip — that these transport tests need. Authorization
     /// never sees the upstream subject: it is stored here and nowhere else.
     pub(crate) async fn seed_user(&self, handle: &str, display_name: &str) -> String {
+        self.seed_user_with_subject(handle, &format!("upstream-subject-{handle}"), display_name)
+            .await
+    }
+
+    /// Writes a directory row carrying `subject` verbatim.
+    ///
+    /// A verified identity always carries a non-empty `sub`, so this is the
+    /// only way to put on record the corrupted rows a login could not produce.
+    pub(crate) async fn seed_user_with_subject(
+        &self,
+        handle: &str,
+        subject: &str,
+        display_name: &str,
+    ) -> String {
         let user_id = format!("user-{handle}");
         let pool = self.app_database().await;
         sqlx::query(
@@ -339,7 +617,7 @@ impl SharedDeployment {
         )
         .bind(&user_id)
         .bind(TEST_ISSUER)
-        .bind(format!("upstream-subject-{handle}"))
+        .bind(subject)
         .bind(display_name)
         .bind(1_i64)
         .bind(1_i64)
@@ -348,6 +626,62 @@ impl SharedDeployment {
         .expect("seed a provisioned login");
         pool.close().await;
         user_id
+    }
+
+    /// Removes one directory row, for the corrupted state an operator repairs
+    /// between two starts.
+    pub(crate) async fn remove_user(&self, user_id: &str) {
+        let pool = self.app_database().await;
+        sqlx::query("DELETE FROM users WHERE user_id = ?")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("remove a directory row");
+        pool.close().await;
+    }
+
+    /// Writes the workspace row a pre-membership install left behind: one that
+    /// exists with no memberships at all, which is what the upgrade adopts.
+    pub(crate) async fn seed_ownerless_workspace(&self, name: &str) {
+        let pool = self.app_database().await;
+        sqlx::query("INSERT INTO workspaces (id, created_at_unix_nanos) VALUES (?, ?)")
+            .bind(name)
+            .bind(1_i64)
+            .execute(&pool)
+            .await
+            .expect("seed an ownerless workspace");
+        pool.close().await;
+    }
+
+    /// Every membership on record as `(workspace, user, role)`, read from the
+    /// deployment's own state rather than through a listing that answers only
+    /// for the caller who asked — and which the local principal is answered
+    /// without any membership row existing at all.
+    pub(crate) async fn memberships(&self) -> Vec<(String, String, String)> {
+        let pool = self.app_database().await;
+        let rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT workspace_id, user_id, role FROM workspace_members ORDER BY workspace_id, user_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read the memberships this deployment holds");
+        pool.close().await;
+        rows
+    }
+
+    /// Whether the one-time local-ownership upgrade has been claimed against
+    /// this state directory. A claim that a failed upgrade rolled back leaves
+    /// no row, which is what lets a later start retry it.
+    pub(crate) async fn local_ownership_migration_claimed(&self) -> bool {
+        let pool = self.app_database().await;
+        let claims = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM app_state_migrations WHERE id = 'local_workspace_ownership_v1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read the migration marker");
+        pool.close().await;
+        claims == 1
     }
 
     pub(crate) async fn as_person(&self, user_id: &str) -> AppClient {
@@ -365,6 +699,14 @@ impl SharedDeployment {
         self.connect(agent_id, PrincipalKind::Agent).await
     }
 
+    /// Connects the way a no-login install's only caller does: unauthenticated,
+    /// and therefore admitted as the built-in local principal.
+    pub(crate) async fn as_host(&self) -> AppClient {
+        AppClient::connect(self.endpoint_uri())
+            .await
+            .expect("connect a test client")
+    }
+
     /// The address to dial for a service `AppClient` does not carry, such as
     /// `TraceService` or `FeatureService`.
     pub(crate) fn endpoint_uri(&self) -> &str {
@@ -380,17 +722,38 @@ impl SharedDeployment {
     /// The bearer credential an actor of `principal_kind` presents for
     /// `user_id`, for tests that dial a service `AppClient` does not carry.
     pub(crate) fn credential(&self, user_id: &str, principal_kind: PrincipalKind) -> String {
-        self.session_auth.access_token_for(user_id, principal_kind)
+        self.session_auth
+            .as_ref()
+            .expect("a local-principal deployment admits the host, not a named caller")
+            .access_token_for(user_id, principal_kind)
     }
 
     async fn connect(&self, user_id: &str, principal_kind: PrincipalKind) -> AppClient {
+        let session_auth = self
+            .session_auth
+            .as_ref()
+            .expect("a local-principal deployment admits the host, not a named caller");
         connect_with_loopback_bearer(
             self.endpoint_uri(),
-            BearerToken::new(self.session_auth.access_token_for(user_id, principal_kind))
+            BearerToken::new(session_auth.access_token_for(user_id, principal_kind))
                 .expect("test bearer token"),
         )
         .await
         .expect("connect a test client")
+    }
+
+    /// Every workspace this deployment holds, read from its own state rather
+    /// than through a listing that answers only for the caller who asked. Each
+    /// deployment keeps its own database, so this counts nothing another test
+    /// owns.
+    pub(crate) async fn workspace_names(&self) -> Vec<String> {
+        let pool = self.app_database().await;
+        let names = sqlx::query_scalar::<_, String>("SELECT id FROM workspaces ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("read the workspaces this deployment holds");
+        pool.close().await;
+        names
     }
 
     /// Reads what `workspace_name` has on record, straight from the state the
@@ -446,7 +809,9 @@ impl SharedDeployment {
 
     async fn app_database(&self) -> sqlx::SqlitePool {
         SqlitePoolOptions::new()
-            .connect_with(SqliteConnectOptions::new().filename(self.config_dir.join("coral.db")))
+            .connect_with(
+                SqliteConnectOptions::new().filename(self.install.config_dir().join("coral.db")),
+            )
             .await
             .expect("open the app database")
     }

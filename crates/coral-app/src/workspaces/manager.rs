@@ -5,12 +5,13 @@ use tracing::warn;
 
 use crate::bootstrap::AppError;
 use crate::credentials::{CredentialManager, CredentialSetId};
+use crate::identity::Principal;
 use crate::sources::materialization::SourceDiagnosticReporter;
-use crate::state::ConfigStore;
 use crate::state::db::{
-    AddMemberOutcome, CoralDb, CreateWorkspaceOutcome, DbRepos, RemoveMemberOutcome,
-    WorkspaceMemberRecord, now_unix_nanos_i64,
+    AddMemberOutcome, CoralDb, CreateWorkspaceOutcome, DbError, DbRepos, RemoveMemberOutcome,
+    WorkspaceDeletion, WorkspaceMemberRecord, now_unix_nanos_i64,
 };
+use crate::state::{ConfigStore, RemovedWorkspaceConfig};
 use crate::storage::fs::DirectoryBackup;
 use crate::workspaces::{
     DeletedWorkspace, MemberRole, WorkspaceLifecycleLock, WorkspaceLifecycleRevision,
@@ -29,6 +30,12 @@ pub(crate) struct WorkspaceManager {
     db: Arc<CoralDb>,
     diagnostic_reporter: SourceDiagnosticReporter,
     pool_registry: Arc<WorkspacePoolRegistry>,
+    /// Makes the deletion transaction refuse to commit, so a test can drive
+    /// the recovery that puts the removed config entries back.
+    #[cfg(test)]
+    deletion_commit_fails: bool,
+    #[cfg(test)]
+    config_restore_fails: bool,
 }
 
 impl WorkspaceManager {
@@ -69,11 +76,27 @@ impl WorkspaceManager {
             db,
             diagnostic_reporter,
             pool_registry: Arc::new(WorkspacePoolRegistry::default()),
+            #[cfg(test)]
+            deletion_commit_fails: false,
+            #[cfg(test)]
+            config_restore_fails: false,
         }
     }
 
     pub(crate) fn with_pool_registry(mut self, pool_registry: Arc<WorkspacePoolRegistry>) -> Self {
         self.pool_registry = pool_registry;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_failing_deletion_commit(mut self) -> Self {
+        self.deletion_commit_fails = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_failing_config_restore(mut self) -> Self {
+        self.config_restore_fails = true;
         self
     }
 
@@ -124,46 +147,10 @@ impl WorkspaceManager {
         self.lifecycle_lock.clone()
     }
 
-    pub(crate) async fn create_workspace(
-        &self,
-        workspace_name: &WorkspaceName,
-    ) -> Result<WorkspaceRecord, AppError> {
-        let _lifecycle_guard = self.lifecycle_lock.lock_async().await;
-        let mut tx = self.db.begin().await?;
-        if tx
-            .workspaces()
-            .get(workspace_name.as_str())
-            .await?
-            .is_some()
-        {
-            return Err(AppError::WorkspaceAlreadyExists(workspace_name.to_string()));
-        }
-        if let Err(error) = tx
-            .workspaces()
-            .create(workspace_name.as_str(), now_unix_nanos_i64()?)
-            .await
-        {
-            if error.is_unique_violation() {
-                return Err(AppError::WorkspaceAlreadyExists(workspace_name.to_string()));
-            }
-            return Err(error.into());
-        }
-        tx.commit().await?;
-        Ok(WorkspaceRecord {
-            name: workspace_name.clone(),
-        })
-    }
-
     pub(crate) async fn delete_workspace(
         &self,
         workspace_name: &WorkspaceName,
     ) -> Result<WorkspaceRecord, AppError> {
-        if workspace_name.is_default() {
-            return Err(AppError::FailedPrecondition(
-                "default workspace cannot be removed".to_string(),
-            ));
-        }
-
         let deletion_marker = self
             .lifecycle_lock
             .mark_workspace_deleting(workspace_name)
@@ -182,29 +169,55 @@ impl WorkspaceManager {
             else {
                 return Err(AppError::WorkspaceNotFound(workspace_name.to_string()));
             };
-            let deleted = self
+            let removed = match self
                 .config_store
-                .remove_workspace_config_entries(workspace_name);
-            let deleted = match deleted {
-                Ok(deleted) => deleted.unwrap_or_else(|| DeletedWorkspace {
+                .remove_workspace_config_entries(workspace_name)
+            {
+                Ok(removed) => removed,
+                Err(error) => {
+                    Self::roll_back_workspace_deletion(workspace_name, deletion).await;
+                    return Err(error);
+                }
+            };
+            if let Err(commit_error) = self.commit_workspace_deletion(deletion).await {
+                // The transaction rolled back, so the workspace is still in
+                // the catalog while its config entries are already gone. The
+                // removal is durable and carries everything it took away, so
+                // put it back rather than leave the two disagreeing.
+                if let Err(restore_error) = self.restore_workspace_config_entries(removed) {
+                    // Both halves failed, which is the split this restore
+                    // exists to prevent. Report it instead of the commit
+                    // failure alone, so the caller knows the deployment needs
+                    // attention rather than a retry.
+                    return Err(AppError::Internal(format!(
+                        "deleting workspace '{workspace_name}' failed to commit ({commit_error}), \
+                         and its config entries could not be put back ({restore_error}); the \
+                         workspace is still in the catalog while its sources and functions are \
+                         missing from config.toml"
+                    )));
+                }
+                return Err(commit_error.into());
+            }
+            let deleted = removed.map_or_else(
+                || DeletedWorkspace {
                     workspace: WorkspaceRecord {
                         name: workspace_name.clone(),
                     },
                     sources: Vec::new(),
-                }),
-                Err(error) => {
-                    if let Err(rollback_error) = deletion.rollback().await {
-                        warn!(
-                            workspace = %workspace_name,
-                            "workspace config cleanup failed, and database rollback also failed: {rollback_error}"
-                        );
-                    }
-                    return Err(error);
-                }
-            };
-            deletion.commit().await?;
+                },
+                RemovedWorkspaceConfig::into_deleted_workspace,
+            );
             self.pool_registry.remove(workspace_name);
             self.remove_deleted_workspace_credentials(&deleted);
+            // Staging comes last, and failing to move the directory only
+            // warns. Everything above it is already durable, so an abort here
+            // would report a failure for a deletion that happened. The cost is
+            // an accepted one: a directory left in the workspaces root carries
+            // no evidence that it was deleted, so a later scan — the legacy
+            // catalog cutover — reads it as a live workspace and resurrects it.
+            // Staging before the commit would close that, but a crash between
+            // the rename and the commit would then leave a live workspace with
+            // no directory at all, which is worse.
             let workspace_dir_backup = self.stage_deleted_workspace_dir(&deleted.workspace.name);
             (deleted, workspace_dir_backup)
         };
@@ -219,6 +232,12 @@ impl WorkspaceManager {
         Ok(deleted.workspace)
     }
 
+    /// Erases the credential material of a workspace that has just been deleted.
+    ///
+    /// Runs while the workspace directory is still in place, because staging
+    /// it aside is the step after this one: file-backed material is where the
+    /// live layout says it is, and keychain material lives outside the
+    /// directory either way.
     fn remove_deleted_workspace_credentials(&self, deleted: &DeletedWorkspace) {
         let workspace_name = &deleted.workspace.name;
         for source in &deleted.sources {
@@ -253,12 +272,75 @@ impl WorkspaceManager {
         }
     }
 
+    async fn roll_back_workspace_deletion(
+        workspace_name: &WorkspaceName,
+        deletion: WorkspaceDeletion<'_>,
+    ) {
+        if let Err(rollback_error) = deletion.rollback().await {
+            warn!(
+                workspace = %workspace_name,
+                "workspace deletion was aborted, and the database rollback also failed: {rollback_error}"
+            );
+        }
+    }
+
+    /// Commits the deletion transaction.
+    ///
+    /// A seam rather than a call at the one site that needs it, because
+    /// nothing a test can do to a real transaction makes its commit fail on
+    /// demand, and the recovery that failure drives — putting the config
+    /// entries back — is the part worth pinning.
+    async fn commit_workspace_deletion(
+        &self,
+        deletion: WorkspaceDeletion<'_>,
+    ) -> Result<(), DbError> {
+        #[cfg(test)]
+        if self.deletion_commit_fails {
+            deletion.rollback().await?;
+            return Err(DbError::Config(
+                "workspace deletion commit failed for tests".to_string(),
+            ));
+        }
+        deletion.commit().await
+    }
+
+    /// Undoes the config removal of a deletion that could not go through.
+    ///
+    /// Best effort, like every other recovery here: a restore that fails
+    /// leaves the divergence it was meant to close, and saying so is all that
+    /// is left to do about it.
+    /// Puts back what the aborted deletion removed from `config.toml`.
+    ///
+    /// The failure is returned rather than logged: it is the one that leaves
+    /// the database holding a workspace whose sources and functions are gone
+    /// from the file, and a caller that only hears about the step which
+    /// triggered the abort would never learn the two now disagree.
+    fn restore_workspace_config_entries(
+        &self,
+        removed: Option<RemovedWorkspaceConfig>,
+    ) -> Result<(), AppError> {
+        let Some(removed) = removed else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        if self.config_restore_fails {
+            return Err(AppError::Internal(
+                "workspace config restore failed for tests".to_string(),
+            ));
+        }
+        self.config_store.restore_workspace_config_entries(removed)
+    }
+
     fn stage_deleted_workspace_dir(
         &self,
         workspace_name: &WorkspaceName,
     ) -> Option<DirectoryBackup> {
         let workspace_dir = self.workspace_dir(workspace_name);
-        match DirectoryBackup::move_for_delete(&workspace_dir, workspace_name) {
+        match DirectoryBackup::move_for_delete_into(
+            &workspace_dir,
+            &self.paths.deleted_workspaces_root(),
+            workspace_name,
+        ) {
             Ok(backup) => Some(backup),
             Err(error) => {
                 warn!(
@@ -349,10 +431,38 @@ impl WorkspaceManager {
         }
     }
 
+    /// Lists what `principal` holds, which is not always what the membership
+    /// rows say.
+    ///
+    /// A deployment that admits the local principal treats it as owner of
+    /// everything, and it holds no membership rows a listing could be read
+    /// from for the workspaces it never created. Which of the two readings
+    /// applies is a property of the principal and the deployment, so it is
+    /// settled here rather than at the transport, where it would be one more
+    /// thing every caller of this had to remember.
+    pub(crate) async fn list_memberships_for_principal(
+        &self,
+        principal: &Principal,
+    ) -> Result<Vec<WorkspaceMembership>, AppError> {
+        if principal.is_local() {
+            return Ok(self
+                .list_workspaces()
+                .await?
+                .into_iter()
+                .map(|workspace| WorkspaceMembership {
+                    workspace,
+                    role: MemberRole::Owner,
+                })
+                .collect());
+        }
+        self.list_memberships_for_user(principal.id().as_str())
+            .await
+    }
+
     /// Lists the workspaces `user_id` belongs to, with the role they hold.
     ///
-    /// This is the caller's own view rather than the deployment's: it is what
-    /// one person may reach, while [`Self::list_workspaces`] stays the
+    /// This is one user's own view rather than the deployment's: it is what
+    /// that person may reach, while [`Self::list_workspaces`] stays the
     /// host-wide inventory that only the local principal and host-scoped work
     /// may read.
     pub(crate) async fn list_memberships_for_user(
@@ -613,6 +723,141 @@ mod tests {
     /// Every valid name takes one path. `default` and the `default-*` shapes
     /// are ordinary caller-chosen names, so a caller cannot reach a workspace
     /// they never created by guessing a reserved-looking one.
+    #[tokio::test]
+    async fn deleting_a_workspace_owns_every_valid_name_alike() {
+        let (_temp, db, manager) = membership_manager().await;
+        let creator = seed_user(&db, "creator").await;
+
+        for name in [
+            "default".to_string(),
+            format!("default-{}", uuid::Uuid::new_v4()),
+            "default-team".to_string(),
+            "work".to_string(),
+        ] {
+            let workspace = workspace(&name);
+            manager
+                .create_workspace_for_user(&workspace, &creator)
+                .await
+                .expect("create workspace");
+
+            assert_eq!(
+                manager
+                    .delete_workspace(&workspace)
+                    .await
+                    .unwrap_or_else(|error| panic!("'{name}' should be deletable: {error}"))
+                    .name,
+                workspace
+            );
+            assert!(
+                matches!(
+                    manager.delete_workspace(&workspace).await,
+                    Err(AppError::WorkspaceNotFound(_))
+                ),
+                "'{name}' must be gone once deleted"
+            );
+            manager
+                .create_workspace_for_user(&workspace, &creator)
+                .await
+                .unwrap_or_else(|error| panic!("'{name}' should be creatable again: {error}"));
+        }
+    }
+
+    /// Both halves of the recovery can fail. When they do, the caller must
+    /// hear that the two disagree rather than only that the commit failed,
+    /// because the deployment needs attention and a retry will not give it.
+    #[tokio::test]
+    async fn a_deletion_that_cannot_put_its_config_back_reports_the_split() {
+        let temp = TempDir::new().expect("temp dir");
+        let layout = test_layout(&temp);
+        let store = ConfigStore::new(layout.clone());
+        let db = test_db(&layout).await;
+        let manager = WorkspaceManager::new_for_tests(
+            store.clone(),
+            CredentialManager::new(CredentialStore::new(layout.clone())),
+            layout,
+            None,
+            Arc::clone(&db),
+        )
+        .with_failing_deletion_commit()
+        .with_failing_config_restore();
+        let workspace_name = workspace("work");
+        let owner = seed_user(&db, "owner").await;
+        manager
+            .create_workspace_for_user(&workspace_name, &owner)
+            .await
+            .expect("create workspace");
+        store
+            .upsert_source(&workspace_name, installed_source("github"))
+            .expect("upsert source");
+
+        let error = manager
+            .delete_workspace(&workspace_name)
+            .await
+            .expect_err("a deletion that cannot restore its config must report the failure");
+
+        let reported = error.to_string();
+        assert!(
+            reported.contains("could not be put back"),
+            "the failure must name the unrestored config, not just the commit: {reported}"
+        );
+        assert!(
+            reported.contains("missing from config.toml"),
+            "the failure must say what state the deployment is left in: {reported}"
+        );
+    }
+
+    /// The config removal is durable the moment it returns, while the
+    /// transaction it accompanies is not. A commit that fails after it has to
+    /// put the entries back, or the workspace stays in the catalog with its
+    /// sources missing from `config.toml`.
+    #[tokio::test]
+    async fn a_deletion_whose_commit_fails_leaves_config_and_database_agreeing() {
+        let temp = TempDir::new().expect("temp dir");
+        let layout = test_layout(&temp);
+        let store = ConfigStore::new(layout.clone());
+        let db = test_db(&layout).await;
+        let manager = WorkspaceManager::new_for_tests(
+            store.clone(),
+            CredentialManager::new(CredentialStore::new(layout.clone())),
+            layout,
+            None,
+            Arc::clone(&db),
+        )
+        .with_failing_deletion_commit();
+        let workspace_name = workspace("work");
+        let owner = seed_user(&db, "owner").await;
+        manager
+            .create_workspace_for_user(&workspace_name, &owner)
+            .await
+            .expect("create workspace");
+        store
+            .upsert_source(&workspace_name, installed_source("github"))
+            .expect("upsert source");
+
+        manager
+            .delete_workspace(&workspace_name)
+            .await
+            .expect_err("a deletion whose commit fails must report the failure");
+
+        assert_eq!(
+            manager.list_workspaces().await.expect("list workspaces"),
+            vec![WorkspaceRecord {
+                name: workspace_name.clone()
+            }],
+            "a failed commit leaves the workspace in the catalog"
+        );
+        assert_eq!(
+            store
+                .list_workspace_sources(&workspace_name)
+                .expect("list workspace sources")
+                .into_iter()
+                .map(|source| source.name)
+                .collect::<Vec<_>>(),
+            vec![SourceName::parse("github").expect("source")],
+            "a workspace still in the catalog keeps its sources in the config"
+        );
+    }
+
     #[tokio::test]
     async fn creating_a_workspace_owns_every_valid_name_alike() {
         let (_temp, db, manager) = membership_manager().await;
@@ -909,9 +1154,10 @@ mod tests {
         let source = installed_source("github");
         let source_name = source.name.clone();
         let credential_set_id = CredentialSetId::for_source(&source.name);
+        let owner = seed_user(&db, "owner").await;
 
         manager
-            .create_workspace(&workspace_name)
+            .create_workspace_for_user(&workspace_name, &owner)
             .await
             .expect("create workspace");
         store
@@ -997,7 +1243,7 @@ mod tests {
             diagnostic_reporter.clone(),
         )
         .with_pool_registry(Arc::clone(&pool_registry));
-        let workspace_name = WorkspaceName::default();
+        let workspace_name = WorkspaceName::parse("work").expect("workspace");
         let pool_registry_before_delete = pool_registry.for_workspace(&workspace_name);
         let source_name = SourceName::parse("github").expect("source name");
         diagnostic_reporter.report_source_load_failure(
@@ -1007,10 +1253,12 @@ mod tests {
             "test failure",
         );
 
+        // The workspace was never created, so deletion fails before it can
+        // touch any of the state a successful deletion sweeps.
         manager
             .delete_workspace(&workspace_name)
             .await
-            .expect_err("default workspace deletion should fail");
+            .expect_err("deleting a workspace that was never created should fail");
 
         assert!(diagnostic_reporter.tracks_diagnostic(
             &workspace_name,
