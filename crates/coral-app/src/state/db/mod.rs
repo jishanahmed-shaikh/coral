@@ -14,6 +14,7 @@ mod task_query_state;
 mod task_state;
 mod trace_search_response_state;
 mod transaction;
+mod user_state;
 mod workspace_state;
 
 pub(crate) use clock::now_unix_nanos_i64;
@@ -34,3 +35,7 @@ pub(crate) use task_query_state::{TaskQueryRelationWrite, TaskQueryWrite, TaskQu
 pub(crate) use task_state::TaskMutationBarrier;
 pub(crate) use task_state::{TaskCreation, TaskCreationResult};
 pub(crate) use transaction::CoralTx;
+pub(crate) use user_state::{LoginIdentity, LoginProvisioning};
+pub(crate) use workspace_state::{
+    AddMemberOutcome, CreateWorkspaceOutcome, RemoveMemberOutcome, WorkspaceMemberRecord,
+};

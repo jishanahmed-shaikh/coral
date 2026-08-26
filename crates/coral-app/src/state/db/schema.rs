@@ -48,6 +48,26 @@ pub(in crate::state::db) enum TaskQueryRelations {
 }
 
 #[derive(Iden)]
+pub(in crate::state::db) enum Users {
+    Table,
+    UserId,
+    Issuer,
+    Subject,
+    DisplayName,
+    CreatedAtUnixNanos,
+    LastLoginAtUnixNanos,
+}
+
+#[derive(Iden)]
+pub(in crate::state::db) enum WorkspaceMembers {
+    Table,
+    WorkspaceId,
+    UserId,
+    Role,
+    CreatedAtUnixNanos,
+}
+
+#[derive(Iden)]
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "next stack layer wires capture")

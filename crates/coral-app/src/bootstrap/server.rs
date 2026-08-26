@@ -15,6 +15,7 @@ use coral_api::v1::search_service_server::SearchServiceServer;
 use coral_api::v1::source_service_server::SourceServiceServer;
 use coral_api::v1::task_service_server::TaskServiceServer;
 use coral_api::v1::trace_service_server::TraceServiceServer;
+use coral_api::v1::user_service_server::UserServiceServer;
 use coral_api::v1::workspace_service_server::WorkspaceServiceServer;
 use coral_api::{
     CATALOG_RESPONSE_MAX_MESSAGE_SIZE, HTTP2_MAX_HEADER_LIST_SIZE, QUERY_RESPONSE_MAX_MESSAGE_SIZE,
@@ -31,8 +32,9 @@ use tonic::transport::Server;
 use super::env::AppEnvironment;
 use super::error::AppError;
 use super::health::{AggregateHealthService, EngineReadiness};
-use super::server_config::{LoadedServerConfig, ServeSettings};
+use super::server_config::{LoadedServerConfig, ServeSettings, SessionAuthSettings};
 use crate::EngineExtensionsProvider;
+use crate::auth::CoralAuthorizationServer;
 use crate::catalog::discovery::CatalogDiscovery;
 use crate::catalog::service::CatalogService;
 use crate::credentials::config::CredentialStorageConfig;
@@ -64,6 +66,9 @@ use crate::task::store::TaskStore;
 use crate::telemetry::service::TraceService;
 use crate::telemetry::{TelemetryConfig, TraceManager};
 use crate::transport::GrpcRequestContextLayer;
+use crate::users::manager::UserManager;
+use crate::users::service::UserService;
+use crate::workspaces::authorization::{LocalPrincipalPolicy, WorkspaceAuthorizer};
 use crate::workspaces::{
     WorkspaceLifecycleLock, WorkspaceManager, WorkspacePoolRegistry, WorkspaceService,
 };
@@ -80,12 +85,6 @@ pub(crate) struct ServerConfig {
     config_dir: Option<PathBuf>,
     mode: ServerModeSelection,
     engine_extensions_providers: Vec<Arc<dyn EngineExtensionsProvider>>,
-    /// Provider every request's principal is resolved through.
-    ///
-    /// Always present, defaulting to [`LocalPrincipalProvider`], so nothing
-    /// downstream of the builder has to handle a server that might have no way
-    /// to name its caller.
-    principal_provider: Arc<dyn PrincipalProvider>,
     feedback_publisher: Arc<dyn FeedbackPublisher>,
     feature_overrides: FeatureOverrides,
     enable_stderr_logs: bool,
@@ -108,7 +107,6 @@ impl ServerConfig {
             config_dir: None,
             mode: ServerModeSelection::Explicit(ServerMode::EphemeralGrpc),
             engine_extensions_providers: Vec::new(),
-            principal_provider: Arc::new(LocalPrincipalProvider),
             feedback_publisher: Arc::new(HostedFeedbackPublisher::new()),
             feature_overrides: FeatureOverrides::default(),
             enable_stderr_logs: false,
@@ -193,9 +191,14 @@ impl ServerMode {
 }
 
 /// Builder for the Coral server runtime.
-#[derive(Clone, Default)]
+///
+/// This is not [`Clone`]: session authentication hands the builder resolved
+/// signing-key and provider material, and one instance's authorization server
+/// is built from it exactly once.
+#[derive(Default)]
 pub struct ServerBuilder {
     config: ServerConfig,
+    session_auth: Option<Box<SessionAuthSettings>>,
 }
 
 impl ServerBuilder {
@@ -204,6 +207,7 @@ impl ServerBuilder {
     pub fn new() -> Self {
         Self {
             config: ServerConfig::new(),
+            session_auth: None,
         }
     }
 
@@ -224,6 +228,7 @@ impl ServerBuilder {
     pub fn configured_standalone_grpc() -> Self {
         Self {
             config: ServerConfig::new().with_configured_standalone_grpc(),
+            session_auth: None,
         }
     }
 
@@ -243,9 +248,11 @@ impl ServerBuilder {
 
     /// Resolves the settings for companions served beside this gRPC server.
     ///
-    /// Only settings are returned. Constructing the session providers and the
-    /// authorization server, and running the transports they belong to, is the
-    /// caller's job: this builder starts a gRPC server and nothing else.
+    /// Only settings are returned. The caller chooses the companion topology
+    /// and each public surface's session policy. Passing the resolved session
+    /// authentication back through [`ServerBuilder::with_session_auth`] lets
+    /// app startup prepare an authorization server against the one migrated
+    /// database without starting its transport.
     ///
     /// # Errors
     ///
@@ -271,21 +278,18 @@ impl ServerBuilder {
     }
 
     #[must_use]
-    /// Sets the server-side principal provider.
+    /// Configures session authentication for this server.
     ///
-    /// The default provider returns the local principal for every
-    /// request. Product runtimes can authenticate inbound metadata and select
-    /// any canonical principal by installing their own provider.
+    /// Startup derives the private gRPC policy from every configured public
+    /// audience and prepares the authorization server once the app database has
+    /// been opened and migrated, so the two share the single app bootstrap.
+    /// Taking that server from the returned [`RunningServer`] and running its
+    /// transport stays the caller's job.
     ///
-    /// Whoever resolves `[auth]` composes the provider it asks for and installs
-    /// it here — `coral-cli`'s `serve::compose_session_policies` does this for
-    /// `coral server`. Without this call a standalone listener serves the local
+    /// Without this call a standalone listener serves the built-in local
     /// principal to every caller its address is reachable from.
-    pub fn with_principal_provider(
-        mut self,
-        principal_provider: Arc<dyn PrincipalProvider>,
-    ) -> Self {
-        self.config.principal_provider = principal_provider;
+    pub fn with_session_auth(mut self, session_auth: SessionAuthSettings) -> Self {
+        self.session_auth = Some(Box::new(session_auth));
         self
     }
 
@@ -328,6 +332,28 @@ impl ServerBuilder {
         self
     }
 
+    /// Selects the one provider every request's principal is resolved through,
+    /// together with the local-principal policy that follows from it.
+    ///
+    /// The policy is not a separate choice: `coral:local` is precisely the
+    /// principal the default provider hands to every caller, so a deployment
+    /// admits it exactly when nothing else authenticates them. Deriving both
+    /// from the same match is what keeps a server that authenticates its
+    /// callers from also honoring the built-in principal, and keeps a
+    /// no-login install in full control of its own host.
+    fn resolve_authentication(&self) -> (Arc<dyn PrincipalProvider>, LocalPrincipalPolicy) {
+        match &self.session_auth {
+            Some(session_auth) => (
+                session_auth.principal_provider(session_auth.public_audiences().to_vec()),
+                LocalPrincipalPolicy::NoLocalPrincipal,
+            ),
+            None => (
+                Arc::new(LocalPrincipalProvider),
+                LocalPrincipalPolicy::ImplicitOwner,
+            ),
+        }
+    }
+
     /// Starts the Coral gRPC server on TCP.
     ///
     /// By default, Coral keeps a real local gRPC boundary here so the public
@@ -338,19 +364,23 @@ impl ServerBuilder {
     /// Returns [`AppError`] if the config directory cannot be determined,
     /// required directories cannot be created, the config or credential backends
     /// fail to initialize, or the gRPC server cannot be started.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the composition root constructs every app manager in one place, so it grows by one line per service the server gains"
+    )]
     pub async fn start(self) -> Result<RunningServer, AppError> {
+        let (principal_provider, local_principal) = self.resolve_authentication();
+        let session_auth = self.session_auth;
         let env = AppEnvironment::discover();
         let layout = env.app_state_layout(self.config.config_dir.clone())?;
         let mode = self.config.resolved_mode(&layout)?;
-        let principal_provider = self.config.principal_provider.clone();
         let grpc_listener = self.config.grpc_listener.clone();
         layout.ensure()?;
         let feature_store = FeatureStore::from_layout(layout.clone());
         let features = feature_store.load_with_overrides(&self.config.feature_overrides)?;
-        let coral_db = init_database(&layout).await?;
         let config_store = ConfigStore::new(layout.clone());
-        run_state_migrations(&coral_db, &config_store, &layout).await?;
-        let coral_db = Arc::new(coral_db);
+        let (coral_db, authorization_server) =
+            bootstrap_database(&layout, &config_store, session_auth).await?;
         let (telemetry_config, active_trace_store) =
             init_server_telemetry(&layout, self.config.enable_stderr_logs)?;
         let active_trace_store_dir = active_trace_store.as_ref().map(|store| store.dir.clone());
@@ -418,11 +448,14 @@ impl ServerBuilder {
             workspace_lifecycle_lock,
         );
         let trace_components = trace_components_for_store(active_trace_store);
-        start_server(
+        let workspace_authorizer = deployment_authorizer(&coral_db, local_principal);
+        let mut server = start_server(
             ServerDependencies {
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&coral_db)),
                 source: source_manager,
                 workspace: workspace_manager,
+                users: UserManager::new(Arc::clone(&coral_db), workspace_authorizer.clone()),
+                workspace_authorizer,
                 query: query_manager,
                 search: search_manager,
                 search_observations,
@@ -436,8 +469,60 @@ impl ServerBuilder {
             mode,
             grpc_listener,
         )
-        .await
+        .await?;
+        server.authorization_server = authorization_server;
+        Ok(server)
     }
+}
+
+/// Opens and migrates the one app database, and prepares the components that
+/// must exist before this server has a listener.
+///
+/// The authorization server is built here because it is the other component
+/// that needs the migrated database at startup. Building it now means a failure
+/// aborts app startup instead of leaving a public surface running beside a
+/// login path that was never prepared.
+async fn bootstrap_database(
+    layout: &AppStateLayout,
+    config_store: &ConfigStore,
+    session_auth: Option<Box<SessionAuthSettings>>,
+) -> Result<(Arc<CoralDb>, Option<Box<CoralAuthorizationServer>>), AppError> {
+    let coral_db = init_database(layout).await?;
+    run_state_migrations(&coral_db, config_store, layout).await?;
+    let coral_db = Arc::new(coral_db);
+    let authorization_server = session_auth
+        .map(|session_auth| build_authorization_server(*session_auth, &coral_db))
+        .transpose()?;
+    Ok((coral_db, authorization_server))
+}
+
+/// Prepares the one access decision every workspace-scoped service shares.
+///
+/// It is built once so the directory and the workspace control plane cannot
+/// drift onto different policies, and it carries the local-principal policy
+/// [`ServerBuilder::resolve_authentication`] settled for this deployment rather
+/// than re-deciding it per request.
+fn deployment_authorizer(
+    coral_db: &Arc<CoralDb>,
+    local_principal: LocalPrincipalPolicy,
+) -> WorkspaceAuthorizer {
+    WorkspaceAuthorizer::with_local_principal_policy(Arc::clone(coral_db), local_principal)
+}
+
+/// Prepares the authorization server this instance's logins are provisioned by.
+///
+/// It never opens a database of its own: the app bootstrap owns the single pool
+/// and attaches it here, which is what lets the OIDC callback record a verified
+/// login before issuing an authorization code for it.
+fn build_authorization_server(
+    session_auth: SessionAuthSettings,
+    coral_db: &Arc<CoralDb>,
+) -> Result<Box<CoralAuthorizationServer>, AppError> {
+    Ok(Box::new(
+        session_auth
+            .into_authorization_server()?
+            .with_database(Arc::clone(coral_db)),
+    ))
 }
 
 fn init_server_telemetry(
@@ -515,6 +600,7 @@ pub struct RunningServer {
     endpoint_uri: String,
     local_addr: SocketAddr,
     local_trace_store_dir: Option<PathBuf>,
+    authorization_server: Option<Box<CoralAuthorizationServer>>,
     search: SearchManager,
     search_observations: Mutex<Option<SearchObservationHandle>>,
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
@@ -544,6 +630,17 @@ impl RunningServer {
     /// trace history is enabled for this process.
     pub fn local_trace_store_dir(&self) -> Option<&std::path::Path> {
         self.local_trace_store_dir.as_deref()
+    }
+
+    /// Takes the authorization server prepared from this server's session
+    /// authentication, when it was configured with any.
+    ///
+    /// Preparing it during app startup is what lets it share the one migrated
+    /// state database. Whether and how its transport runs is the caller's
+    /// decision, so it transfers out — and only the first caller receives it.
+    #[must_use]
+    pub fn take_authorization_server(&mut self) -> Option<CoralAuthorizationServer> {
+        self.authorization_server.take().map(|server| *server)
     }
 
     /// Waits until the background server task exits.
@@ -638,6 +735,8 @@ struct ServerDependencies {
     gui_onboarding: GuiOnboardingManager,
     source: SourceManager,
     workspace: WorkspaceManager,
+    users: UserManager,
+    workspace_authorizer: WorkspaceAuthorizer,
     query: QueryManager,
     search: SearchManager,
     search_observations: Option<SearchObservationHandle>,
@@ -659,6 +758,8 @@ fn application_routes(
         gui_onboarding,
         source,
         workspace,
+        users,
+        workspace_authorizer,
         query,
         search,
         search_observations,
@@ -676,7 +777,8 @@ fn application_routes(
     };
     let health_queries = query.clone();
     let source_service = SourceService::new(source, query.clone(), workspace.clone());
-    let workspace_service = WorkspaceService::new(workspace);
+    let workspace_service = WorkspaceService::new(workspace, workspace_authorizer);
+    let user_service = UserService::new(users);
     let catalog_service = CatalogService::new(query.clone(), task.clone());
     let function_service = FunctionService::new(query.clone());
     let query_service = QueryService::new(query, task.clone());
@@ -693,6 +795,7 @@ fn application_routes(
                 .max_encoding_message_size(SOURCE_RESPONSE_MAX_MESSAGE_SIZE),
         )
         .add_service(WorkspaceServiceServer::new(workspace_service))
+        .add_service(UserServiceServer::new(user_service))
         .add_service(
             CatalogServiceServer::new(catalog_service)
                 .max_encoding_message_size(CATALOG_RESPONSE_MAX_MESSAGE_SIZE),
@@ -769,6 +872,7 @@ async fn start_server(
         endpoint_uri,
         local_addr,
         local_trace_store_dir,
+        authorization_server: None,
         search,
         search_observations: Mutex::new(search_observations),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
@@ -837,9 +941,10 @@ mod tests {
     use tonic::{Code, Request};
 
     use super::{
-        RunningServer, ServerBuilder, ServerDependencies, ServerMode, TraceServerComponents,
-        start_server,
+        RunningServer, ServerBuilder, ServerDependencies, ServerMode, SessionAuthSettings,
+        TraceServerComponents, start_server,
     };
+    use crate::auth::session::test_signing_key;
     use crate::bootstrap::AppError;
     use crate::catalog::discovery::CatalogDiscovery;
     use crate::credentials::{CredentialManager, CredentialStore};
@@ -859,10 +964,12 @@ mod tests {
     use crate::task::store::TaskStore;
     use crate::telemetry::{TraceManager, service::TraceService};
     use crate::transport::workspace_to_proto;
+    use crate::users::manager::UserManager;
+    use crate::workspaces::authorization::{LocalPrincipalPolicy, WorkspaceAuthorizer};
     use crate::workspaces::{WorkspaceManager, WorkspaceName};
     use crate::{
         AwsEngineExtensionsProvider, LocalPrincipalProvider, NoopEngineExtensionsProvider,
-        Principal, PrincipalProvider, PrincipalProviderError,
+        PrincipalKind,
     };
 
     fn default_workspace() -> Workspace {
@@ -910,21 +1017,6 @@ enabled = false
             .is_some()
     }
 
-    #[derive(Debug)]
-    struct RejectingPrincipalProvider;
-
-    #[tonic::async_trait]
-    impl PrincipalProvider for RejectingPrincipalProvider {
-        async fn principal_for_metadata(
-            &self,
-            _metadata: &tonic::metadata::MetadataMap,
-        ) -> Result<Principal, PrincipalProviderError> {
-            Err(PrincipalProviderError::unauthenticated(
-                "rejected principal",
-            ))
-        }
-    }
-
     async fn test_db(layout: &AppStateLayout, config_store: &ConfigStore) -> Arc<CoralDb> {
         let config = DatabaseConfig::load(layout).expect("db config");
         let DatabaseConfig::Sqlite { path } = config else {
@@ -938,6 +1030,10 @@ enabled = false
             .await
             .expect("run state migrations");
         Arc::new(db)
+    }
+
+    fn test_user_manager(db: &Arc<CoralDb>) -> UserManager {
+        UserManager::new(Arc::clone(db), WorkspaceAuthorizer::new(Arc::clone(db)))
     }
 
     #[tokio::test]
@@ -1011,6 +1107,7 @@ enabled = false
             endpoint_uri: "http://127.0.0.1:0".to_string(),
             local_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             local_trace_store_dir: None,
+            authorization_server: None,
             search,
             search_observations: Mutex::new(Some(search_observations)),
             shutdown_tx: Mutex::new(None),
@@ -1143,6 +1240,164 @@ redirect_uri = 'https://auth.example.test/auth/oidc/callback'
 ",
         )
         .expect("write auth config");
+    }
+
+    /// Writes a config an authenticated `coral serve` resolves completely: a
+    /// real signing key and an authenticated MCP HTTP surface, so session auth
+    /// can be taken from it and handed back to the builder.
+    fn configure_serve_session_auth(config_dir: &Path) {
+        std::fs::create_dir_all(config_dir).expect("create config dir");
+        std::fs::write(config_dir.join("session.key"), test_signing_key())
+            .expect("write session key");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            r"
+[trace_history]
+enabled = false
+
+[server.mcp_http]
+enabled = true
+bind = '127.0.0.1:0'
+public_url = 'https://mcp.example.test'
+
+[auth.authorization_server]
+issuer = 'https://auth.example.test'
+
+[auth.session]
+signing_key_file = 'session.key'
+
+[auth.provider]
+issuer = 'https://accounts.example.test'
+client_id = 'upstream-client'
+client_secret = 'test-secret'
+redirect_uri = 'https://auth.example.test/auth/oidc/callback'
+",
+        )
+        .expect("write auth config");
+    }
+
+    fn serve_session_auth(config_dir: &Path) -> (ServerBuilder, SessionAuthSettings) {
+        let builder = ServerBuilder::ephemeral_grpc().with_config_dir(config_dir);
+        let session_auth = builder
+            .serve_settings()
+            .expect("resolve serve settings")
+            .take_session_auth()
+            .expect("configured session auth");
+        (builder, session_auth)
+    }
+
+    #[tokio::test]
+    async fn session_auth_prepares_an_authorization_server_on_the_app_database() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.path().join("coral-config");
+        configure_serve_session_auth(&config_dir);
+        let (builder, session_auth) = serve_session_auth(&config_dir);
+
+        let mut grpc = builder
+            .with_session_auth(session_auth)
+            .start()
+            .await
+            .expect("start authenticated gRPC server");
+
+        let authorization_server = grpc
+            .take_authorization_server()
+            .expect("authorization server prepared during startup");
+        assert!(
+            authorization_server.has_database(),
+            "logins have nowhere to be provisioned without the app database"
+        );
+        // Transferring it out is what hands over its lifecycle, so a second
+        // caller must not receive a second server over the same state.
+        assert!(
+            grpc.take_authorization_server().is_none(),
+            "the authorization server transfers at most once"
+        );
+        authorization_server
+            .start()
+            .await
+            .expect("start the prepared authorization server")
+            .shutdown()
+            .await
+            .expect("shutdown authorization server");
+        grpc.shutdown().await.expect("shutdown gRPC server");
+    }
+
+    /// The private API is reached through every public surface in front of it,
+    /// so a token minted for any of them authenticates. Which surface it came
+    /// through says nothing about the caller: the identity in the token is a
+    /// person's, so that is who authenticates.
+    #[tokio::test]
+    async fn session_auth_admits_a_token_minted_for_any_fronting_surface() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.path().join("coral-config");
+        configure_serve_session_auth(&config_dir);
+        let (builder, session_auth) = serve_session_auth(&config_dir);
+        let user_id = "1f0d2b8a-6d51-4f6e-9a0d-3c8f21b4e7a5";
+        let token = session_auth
+            .session_tokens
+            .issue_access_token(
+                user_id,
+                "https://client.example/client.json",
+                "https://mcp.example.test",
+            )
+            .expect("session token")
+            .access_token;
+        let (private_api, _) = builder
+            .with_session_auth(session_auth)
+            .resolve_authentication();
+
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            "authorization",
+            tonic::metadata::MetadataValue::try_from(format!("Bearer {token}"))
+                .expect("authorization metadata"),
+        );
+        let principal = private_api
+            .principal_for_metadata(&metadata)
+            .await
+            .expect("token minted for the MCP surface");
+        assert_eq!(principal.id().as_str(), user_id);
+        assert_eq!(principal.kind(), PrincipalKind::User);
+    }
+
+    /// The built-in `coral:local` principal is what the default provider hands
+    /// out, so admitting it must track whether anything else authenticates
+    /// callers. Getting this backwards on a no-login install locks the only
+    /// user out of their own workspaces.
+    #[test]
+    fn only_an_unauthenticated_deployment_admits_the_local_principal() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.path().join("coral-config");
+        configure_serve_session_auth(&config_dir);
+        let (with_session_auth, session_auth) = serve_session_auth(&config_dir);
+        let policy = |builder: ServerBuilder| builder.resolve_authentication().1;
+
+        assert_eq!(
+            policy(ServerBuilder::new()),
+            LocalPrincipalPolicy::ImplicitOwner,
+            "a deployment with no login configured keeps full control of its host"
+        );
+        assert_eq!(
+            policy(with_session_auth.with_session_auth(session_auth)),
+            LocalPrincipalPolicy::NoLocalPrincipal,
+            "session authentication is an identity system the local principal bypasses"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_without_session_auth_prepares_no_authorization_server() {
+        let temp = TempDir::new().expect("temp dir");
+        let config_dir = temp.path().join("coral-config");
+        disable_internal_tracing(&config_dir);
+
+        let mut grpc = ServerBuilder::ephemeral_grpc()
+            .with_config_dir(config_dir)
+            .start()
+            .await
+            .expect("start unauthenticated gRPC server");
+
+        assert!(grpc.take_authorization_server().is_none());
+        grpc.shutdown().await.expect("shutdown gRPC server");
     }
 
     /// Both standalone entry points bind a real address, so neither may serve
@@ -1577,6 +1832,8 @@ backend = "unsupported"
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&db)),
                 source: source_manager,
                 workspace: workspace_manager,
+                users: test_user_manager(&db),
+                workspace_authorizer: WorkspaceAuthorizer::new(Arc::clone(&db)),
                 query: query_manager,
                 search: search_manager,
                 search_observations: Some(search_observations),
@@ -1625,12 +1882,17 @@ backend = "unsupported"
             .add_engine_extensions_provider(Arc::new(NoopEngineExtensionsProvider));
     }
 
+    /// The provider startup derives is what the ephemeral gRPC listener is
+    /// actually wrapped in, so an authenticated server must refuse a call that
+    /// carries no credential rather than falling back to the local principal.
     #[tokio::test]
-    async fn server_builder_applies_injected_provider_to_ephemeral_grpc() {
+    async fn server_builder_applies_the_resolved_provider_to_ephemeral_grpc() {
         let temp = TempDir::new().expect("temp dir");
-        let server = ServerBuilder::new()
-            .with_config_dir(temp.path().join("coral-config"))
-            .with_principal_provider(Arc::new(RejectingPrincipalProvider))
+        let config_dir = temp.path().join("coral-config");
+        configure_serve_session_auth(&config_dir);
+        let (builder, session_auth) = serve_session_auth(&config_dir);
+        let server = builder
+            .with_session_auth(session_auth)
             .start()
             .await
             .expect("start server");
@@ -1662,6 +1924,10 @@ backend = "unsupported"
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end scenario built over the full ServerDependencies set, which grows by a line per manager the server gains"
+    )]
     async fn file_tilde_sources_resolve_from_app_owned_runtime_context() {
         if !loopback_sockets_available() {
             return;
@@ -1725,6 +1991,8 @@ backend = "unsupported"
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&db)),
                 source: source_manager,
                 workspace: workspace_manager,
+                users: test_user_manager(&db),
+                workspace_authorizer: WorkspaceAuthorizer::new(Arc::clone(&db)),
                 query: query_manager,
                 search: search_manager,
                 search_observations: Some(search_observations),
@@ -1857,6 +2125,8 @@ tables:
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&db)),
                 source: source_manager,
                 workspace: workspace_manager,
+                users: test_user_manager(&db),
+                workspace_authorizer: WorkspaceAuthorizer::new(Arc::clone(&db)),
                 query: query_manager,
                 search: search_manager,
                 search_observations: Some(search_observations),
@@ -1989,6 +2259,8 @@ tables:
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&db)),
                 source: source_manager,
                 workspace: workspace_manager,
+                users: test_user_manager(&db),
+                workspace_authorizer: WorkspaceAuthorizer::new(Arc::clone(&db)),
                 query: query_manager,
                 search: search_manager,
                 search_observations: Some(search_observations),

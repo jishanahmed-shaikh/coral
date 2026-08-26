@@ -361,7 +361,7 @@ pub struct SessionAuthSettings {
 }
 
 impl SessionAuthSettings {
-    /// Resource identifiers of the instance's public surfaces, canonicalized.
+    /// The instance's public surfaces, canonicalized.
     #[must_use]
     pub fn public_audiences(&self) -> &[String] {
         &self.public_audiences
@@ -388,6 +388,10 @@ impl SessionAuthSettings {
     /// Every public surface is registered as an authorization resource clients
     /// may request a token for.
     ///
+    /// The server returned here has no database attached and so fails every
+    /// login closed. `ServerBuilder::with_session_auth` is the path that
+    /// attaches the migrated app database to it.
+    ///
     /// # Errors
     ///
     /// Returns [`AppError`] when the server cannot be built from these settings.
@@ -395,7 +399,7 @@ impl SessionAuthSettings {
         let mut server =
             CoralAuthorizationServer::from_resolved_settings(self.settings, self.session_tokens)
                 .map_err(|error| AppError::FailedPrecondition(error.to_string()))?;
-        for audience in self.public_audiences {
+        for audience in &self.public_audiences {
             server = server
                 .with_authorization_resource(audience)
                 .map_err(AppError::FailedPrecondition)?;
@@ -414,6 +418,10 @@ impl SessionAuthSettings {
 /// The gRPC API has no resource identity of its own and instead accepts every
 /// identifier returned here. At least one is therefore required: with none, no
 /// token can be minted for anything and every login would fail at authorization.
+///
+/// An identifier names a surface, not an actor: either kind of caller can arrive
+/// through any of them, so nothing here says what kind a caller is. Actor kind
+/// comes from the authenticated principal instead.
 fn public_surface_audiences(
     mcp_http: Option<&McpHttpServeConfig>,
     allowed_audiences: &[String],
@@ -767,9 +775,14 @@ redirect_uri = 'https://auth.example.test/auth/oidc/callback'
         // providers and the authorization server from it is the composition
         // root's job, covered in `bootstrap::server`.
         let session_auth = companions.session_auth.expect("session auth");
+        // Both surfaces front the private API, so both audiences are admitted;
+        // neither says anything about what kind of actor arrives through it.
         assert_eq!(
             session_auth.public_audiences,
-            ["https://mcp.example.test", "https://coral-ui.example.test"]
+            [
+                "https://mcp.example.test".to_string(),
+                "https://coral-ui.example.test".to_string(),
+            ]
         );
     }
 
@@ -791,7 +804,7 @@ redirect_uri = 'https://auth.example.test/auth/oidc/callback'
         let session_auth = companions.session_auth.expect("session auth");
         assert_eq!(
             session_auth.public_audiences,
-            ["https://coral-ui.example.test"]
+            ["https://coral-ui.example.test".to_string()]
         );
 
         let authorization_server = session_auth

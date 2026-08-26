@@ -14,6 +14,8 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::identity::{PrincipalId, PrincipalKind};
+
 const DEFAULT_ISSUER: &str = "coral";
 const CLOCK_SKEW: Duration = Duration::from_mins(1);
 const SESSION_TOKEN_ALGORITHM: Algorithm = Algorithm::ES256;
@@ -98,14 +100,54 @@ impl SessionTokenIssuer {
         })
     }
 
+    /// Mints an access token whose `sub` is Coral's internal `user_id`.
+    ///
+    /// No upstream identifier reaches the token: the issuer, the raw OIDC
+    /// subject, and the configured principal claim all stop at login
+    /// provisioning, which exchanges them for this id. The id must already be a
+    /// canonical [`PrincipalId`], because that is what authenticates the token
+    /// back into a request principal — minting one that cannot parse would
+    /// hand out a token no surface can ever accept.
     pub(crate) fn issue_access_token(
         &self,
-        subject: &str,
+        user_id: &str,
         client_id: &str,
         audience: &str,
     ) -> Result<IssuedAccessToken, SessionTokenError> {
-        if subject.trim().is_empty() {
-            return Err(config_error("subject must not be empty"));
+        self.mint(user_id, client_id, audience, PrincipalKind::User)
+    }
+
+    /// Mints a token for an actor kind the caller names.
+    ///
+    /// Not reachable outside tests, and that is the point. The kind a token
+    /// carries has to agree with what the subject actually is, and the only
+    /// principals this deployment registers are the people in its directory —
+    /// nothing records that an identifier belongs to an agent, so nothing could
+    /// check such a claim. Until something does, the issuer asserts the one kind
+    /// it can substantiate, and a token that says otherwise cannot be minted by
+    /// a running server at all.
+    #[cfg(any(test, feature = "test-session-tokens"))]
+    pub(crate) fn issue_access_token_as(
+        &self,
+        user_id: &str,
+        client_id: &str,
+        audience: &str,
+        principal_kind: PrincipalKind,
+    ) -> Result<IssuedAccessToken, SessionTokenError> {
+        self.mint(user_id, client_id, audience, principal_kind)
+    }
+
+    fn mint(
+        &self,
+        user_id: &str,
+        client_id: &str,
+        audience: &str,
+        principal_kind: PrincipalKind,
+    ) -> Result<IssuedAccessToken, SessionTokenError> {
+        if PrincipalId::parse(user_id).is_err() {
+            return Err(config_error(
+                "access token subject must be a canonical Coral user id",
+            ));
         }
         if client_id.trim().is_empty()
             || client_id.trim() != client_id
@@ -123,12 +165,13 @@ impl SessionTokenIssuer {
         let claims = SessionTokenClaims {
             iss: self.issuer.clone(),
             aud: audience.to_string(),
-            sub: subject.to_string(),
+            sub: user_id.to_string(),
             jti: Uuid::new_v4().to_string(),
             client_id: client_id.to_string(),
             exp: expires_at,
             iat: issued_at,
             nbf: issued_at,
+            principal_kind: principal_kind.into(),
         };
         let mut header = Header::new(SESSION_TOKEN_ALGORITHM);
         header.kid = Some(self.signing_key_id.clone());
@@ -255,18 +298,26 @@ impl SessionTokenVerifier {
             token_id: claims.jti,
             audience: claims.aud,
             client_id: claims.client_id,
-            subject: claims.sub,
+            user_id: claims.sub,
+            principal_kind: claims.principal_kind.into(),
         })
     }
 
     fn validate_claims(&self, claims: &SessionTokenClaims) -> Result<(), SessionTokenError> {
         let invalid = |message: &str| format!("invalid Coral access token: {message}");
-        if claims.sub.trim().is_empty()
-            || claims.client_id.trim().is_empty()
+        if claims.client_id.trim().is_empty()
             || claims.client_id.trim() != claims.client_id
             || claims.jti.trim().is_empty()
             || claims.jti.trim() != claims.jti
         {
+            return Err(invalid("subject, client_id, and jti must be valid"));
+        }
+        // Issuance refuses a subject that is not a canonical principal id, so
+        // verification refuses one too. A token is only ever as good as what it
+        // authenticates into, and admitting a subject the request principal
+        // cannot be built from would hand the services an id no other part of
+        // the deployment could have produced.
+        if PrincipalId::parse(&claims.sub).is_err() {
             return Err(invalid("subject, client_id, and jti must be valid"));
         }
         let now = unix_timestamp()?;
@@ -357,7 +408,48 @@ pub(crate) struct ValidatedSession {
     pub(crate) token_id: String,
     pub(crate) audience: String,
     pub(crate) client_id: String,
-    pub(crate) subject: String,
+    /// Coral's internal `user_id`, carried in the token's `sub` claim.
+    pub(crate) user_id: String,
+    /// The kind of actor the token was minted for, from its own claim.
+    ///
+    /// The subject names who is calling; this names what they are. Neither is
+    /// inferred from the audience, which records only the surface the request
+    /// arrived through.
+    pub(crate) principal_kind: PrincipalKind,
+}
+
+/// What kind of actor a token was minted for, in the token's own vocabulary.
+///
+/// This is deliberately not [`PrincipalKind`] itself. A claim is a wire format
+/// that outlives the code that reads it: tokens already minted keep whatever
+/// spelling they were signed with, so the names here cannot follow a rename of
+/// the domain enum without invalidating them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ActorKindClaim {
+    /// A person, authenticated through their own login.
+    #[default]
+    User,
+    /// An agent acting under its own identity.
+    Agent,
+}
+
+impl From<ActorKindClaim> for PrincipalKind {
+    fn from(kind: ActorKindClaim) -> Self {
+        match kind {
+            ActorKindClaim::User => Self::User,
+            ActorKindClaim::Agent => Self::Agent,
+        }
+    }
+}
+
+impl From<PrincipalKind> for ActorKindClaim {
+    fn from(kind: PrincipalKind) -> Self {
+        match kind {
+            PrincipalKind::User => Self::User,
+            PrincipalKind::Agent => Self::Agent,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -370,6 +462,13 @@ struct SessionTokenClaims {
     exp: u64,
     iat: u64,
     nbf: u64,
+    /// The actor kind the token was minted for.
+    ///
+    /// Absent on tokens minted before the claim existed, and those authenticate
+    /// a user — which is the only kind the issuer minted at the time, so the
+    /// default reproduces their behaviour exactly rather than widening it.
+    #[serde(default)]
+    principal_kind: ActorKindClaim,
 }
 
 fn normalized_or_default<'a>(value: Option<&'a str>, default: &'a str) -> &'a str {
@@ -408,11 +507,13 @@ pub(crate) fn test_signing_key() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::LOCAL_PRINCIPAL_ID;
 
     const ISSUER: &str = "https://coral.example.test/";
     const MCP_AUDIENCE: &str = "https://coral.example.test/mcp";
     const BFF_AUDIENCE: &str = "https://app.example.test";
     const CLIENT_ID: &str = "https://client.example.test/client.json";
+    const USER_ID: &str = "4f1a0f2c-4c8a-4d21-9a9b-2b1f2f0a5c33";
 
     fn signing_key() -> Vec<u8> {
         test_signing_key()
@@ -437,6 +538,7 @@ mod tests {
             exp: now + issuer.access_token_ttl.as_secs(),
             iat: now,
             nbf: now,
+            principal_kind: ActorKindClaim::User,
         }
     }
 
@@ -502,7 +604,7 @@ mod tests {
         let issuer = test_issuer();
         let verifier = issuer.verifier();
         let access = issuer
-            .issue_access_token("opaque:subject/123", CLIENT_ID, MCP_AUDIENCE)
+            .issue_access_token_as(USER_ID, CLIENT_ID, MCP_AUDIENCE, PrincipalKind::User)
             .unwrap();
         let header = decode_header(&access.access_token).unwrap();
         assert_eq!(header.alg, Algorithm::ES256);
@@ -520,9 +622,80 @@ mod tests {
         assert_eq!(session.token_id, token_id);
         assert_eq!(session.audience, MCP_AUDIENCE);
         assert_eq!(session.client_id, CLIENT_ID);
-        // The subject is the upstream `sub` claim verbatim: a single OIDC provider
-        // is ever configured, so nothing prefixes an issuer onto it.
-        assert_eq!(session.subject, "opaque:subject/123");
+        // The subject is Coral's internal `user_id`. No upstream issuer, `sub`,
+        // or display name is minted into the token or recoverable from it.
+        assert_eq!(session.user_id, USER_ID);
+        assert_eq!(string_claim(&claims, "sub"), USER_ID);
+        // The spelling on the wire is part of the format: tokens already signed
+        // keep it, so a rename here would silently stop matching them.
+        assert_eq!(string_claim(&claims, "principal_kind"), "user");
+        assert_eq!(session.principal_kind, PrincipalKind::User);
+    }
+
+    /// The issuer decides what a token authenticates, and the verifier reports
+    /// back exactly that. Nothing between them re-derives the kind from the
+    /// audience, the client, or the subject's spelling.
+    #[test]
+    fn the_actor_kind_a_token_was_minted_for_survives_validation() {
+        let issuer = test_issuer();
+        let verifier = issuer.verifier();
+        for (kind, wire) in [
+            (PrincipalKind::User, "user"),
+            (PrincipalKind::Agent, "agent"),
+        ] {
+            let access = issuer
+                .issue_access_token_as(USER_ID, CLIENT_ID, MCP_AUDIENCE, kind)
+                .expect("session token");
+            assert_eq!(
+                string_claim(
+                    &decode_unverified_claims(&access.access_token),
+                    "principal_kind"
+                ),
+                wire
+            );
+            let session = verifier
+                .validate_access_token(&access.access_token, &[MCP_AUDIENCE])
+                .expect("validated session");
+            assert_eq!(session.principal_kind, kind);
+            assert_eq!(session.user_id, USER_ID, "the subject is untouched by kind");
+        }
+    }
+
+    /// Tokens minted before the claim existed are still in flight when a server
+    /// carrying it starts. They authenticated a user then, and the issuer minted
+    /// nothing else, so reading them as anything but a user would change what an
+    /// already-signed token means.
+    #[test]
+    fn a_token_without_the_actor_kind_claim_authenticates_a_user() {
+        let issuer = test_issuer();
+        let mut predating = serde_json::to_value(claims(&issuer)).expect("claims as json");
+        predating
+            .as_object_mut()
+            .expect("claims object")
+            .remove("principal_kind")
+            .expect("the claim is present before it is removed");
+        let mut header = Header::new(SESSION_TOKEN_ALGORITHM);
+        header.kid = Some(issuer.signing_key_id.clone());
+        header.typ = Some("at+jwt".to_string());
+        let token = encode(&header, &predating, &issuer.signing_key).expect("signed token");
+
+        let session = issuer
+            .verifier()
+            .validate_access_token(&token, &[MCP_AUDIENCE])
+            .expect("a token predating the claim still validates");
+        assert_eq!(session.principal_kind, PrincipalKind::User);
+    }
+
+    #[test]
+    fn issuance_rejects_subjects_that_could_never_authenticate() {
+        let issuer = test_issuer();
+        for user_id in ["", "   ", "user id", "user\tid", LOCAL_PRINCIPAL_ID] {
+            let Err(_error) =
+                issuer.issue_access_token_as(user_id, CLIENT_ID, MCP_AUDIENCE, PrincipalKind::User)
+            else {
+                panic!("token issuance should reject the subject {user_id:?}");
+            };
+        }
     }
 
     #[test]
@@ -534,6 +707,11 @@ mod tests {
             changed(original.clone(), |c| c.iss = "other".into()),
             changed(original.clone(), |c| c.aud = "other".into()),
             changed(original.clone(), |c| c.sub = " ".into()),
+            // Issuance refuses these two, so verification must refuse them as
+            // well: a signed token is not a reason to admit a subject no
+            // request principal could be built from.
+            changed(original.clone(), |c| c.sub = LOCAL_PRINCIPAL_ID.into()),
+            changed(original.clone(), |c| c.sub = "user\u{7f}id".into()),
             changed(original.clone(), |c| c.client_id = " ".into()),
             changed(original.clone(), |c| c.jti = " ".into()),
         ];
@@ -632,10 +810,10 @@ mod tests {
         let issuer = test_issuer();
         let verifier = issuer.verifier();
         let mcp = issuer
-            .issue_access_token("user-123", "mcp-client", MCP_AUDIENCE)
+            .issue_access_token_as("user-123", "mcp-client", MCP_AUDIENCE, PrincipalKind::User)
             .unwrap();
         let bff = issuer
-            .issue_access_token("user-123", "bff-client", BFF_AUDIENCE)
+            .issue_access_token_as("user-123", "bff-client", BFF_AUDIENCE, PrincipalKind::User)
             .unwrap();
 
         verifier
@@ -665,7 +843,9 @@ mod tests {
             (CLIENT_ID, ""),
             (CLIENT_ID, "audience "),
         ] {
-            let Err(_error) = issuer.issue_access_token("user-123", client_id, audience) else {
+            let Err(_error) =
+                issuer.issue_access_token_as("user-123", client_id, audience, PrincipalKind::User)
+            else {
                 panic!(
                     "token issuance should reject client_id={client_id:?}, audience={audience:?}"
                 );
@@ -677,7 +857,7 @@ mod tests {
     fn public_jwks_support_detached_validation() {
         let issuer = test_issuer();
         let token = issuer
-            .issue_access_token("user-123", CLIENT_ID, MCP_AUDIENCE)
+            .issue_access_token_as("user-123", CLIENT_ID, MCP_AUDIENCE, PrincipalKind::User)
             .unwrap();
         let expected = issuer
             .verifier()

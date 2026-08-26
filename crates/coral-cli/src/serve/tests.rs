@@ -204,6 +204,7 @@ fn session_token(signing_key: &[u8], audience: &str) -> String {
         "alice",
         "https://client.example/client.json",
         audience,
+        coral_app::PrincipalKind::User,
     )
     .expect("session token")
 }
@@ -676,6 +677,50 @@ async fn session_authenticated_companion_gates_grpc_and_mcp() {
         .shutdown()
         .await
         .expect("shutdown OAuth server");
+}
+
+/// MCP HTTP is a public surface, so it admits only its own audience: a token
+/// minted for a sibling surface must not be replayable at it.
+///
+/// This asserts on the authenticator the running MCP surface is handed, composed
+/// from an on-disk config by the same function `start` calls, and starts the
+/// server that composition configured. The regression it guards is `coral serve`
+/// handing MCP the private API's full audience allowlist, which would let a
+/// token minted for the BFF be presented here.
+#[tokio::test]
+async fn session_auth_composes_an_mcp_only_audience_for_mcp() {
+    let temp = TempDir::new().expect("temp dir");
+    let signing_key =
+        EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
+            .expect("P-256 signing key");
+    write_session_config(&temp, signing_key.as_ref());
+    let builder = ServerBuilder::configured_standalone_grpc()
+        .with_config_dir(temp.path())
+        .with_noop_feedback_uploads();
+    let mut settings = builder.serve_settings().expect("resolve serve settings");
+    let mcp_config = settings.mcp_http().cloned();
+    let (builder, mcp_authenticator) =
+        compose_session_policies(builder, settings.take_session_auth(), mcp_config.as_ref());
+    let mcp_authenticator = mcp_authenticator.expect("composed MCP authenticator");
+
+    let mut grpc = builder.start().await.expect("start composed gRPC server");
+    assert!(
+        grpc.take_authorization_server().is_some(),
+        "app startup owns the authorization server this composition runs"
+    );
+
+    mcp_authenticator
+        .principal_for_bearer(&session_token(signing_key.as_ref(), SESSION_RESOURCE))
+        .await
+        .expect("token minted for the MCP surface");
+    mcp_authenticator
+        .principal_for_bearer(&session_token(signing_key.as_ref(), CORAL_UI_RESOURCE))
+        .await
+        .expect_err("MCP must refuse a token minted for a sibling surface");
+
+    grpc.shutdown()
+        .await
+        .expect("shutdown composed gRPC server");
 }
 
 #[tokio::test]

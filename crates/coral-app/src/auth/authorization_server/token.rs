@@ -86,6 +86,10 @@ pub(super) async fn oauth_token(
             return token_error(TokenError::ServerError);
         }
     };
+    // This endpoint completes an interactive login, which only a person can
+    // perform: the code being redeemed was issued to a browser that carried
+    // someone through their identity provider. An agent obtains its own
+    // credential elsewhere, and whatever mints one declares it there.
     let issued = match state.session_tokens.issue_access_token(
         &authorization.user_id,
         &authorization.client_id,
@@ -381,6 +385,7 @@ redirect_uri = "{AUTH_ISSUER}/auth/oidc/callback"
             provider_client: OidcProviderClient::new().expect("client"),
             authorization_resources,
             client_metadata_resolver,
+            database: None,
         };
         (state, store, session_tokens)
     }
@@ -691,7 +696,7 @@ redirect_uri = "{AUTH_ISSUER}/auth/oidc/callback"
             .expect("valid access token");
         assert_eq!(validated.audience, RESOURCE);
         assert_eq!(validated.client_id, CLIENT);
-        assert_eq!(validated.subject, "raw/provider/subject");
+        assert_eq!(validated.user_id, "raw/provider/subject");
         // Single use is the store's guarantee rather than this handler's:
         // `take_authorization_code_for_request` does its get-check-remove under
         // one lock, so two redemptions of a code cannot both observe it. This

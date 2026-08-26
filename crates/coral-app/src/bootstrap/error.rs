@@ -19,6 +19,20 @@ pub enum AppError {
     /// The request did not present valid authentication.
     #[error("unauthenticated: {0}")]
     Unauthenticated(String),
+    /// The caller authenticated but may not perform the operation.
+    ///
+    /// It is the deliberate opposite of [`Self::WorkspaceNotFound`], which
+    /// conceals. Raising it is only safe where the answer does not depend on
+    /// whether the named resource exists — because the caller has already been
+    /// shown to reach it, or because the rule denies them every resource alike.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+    /// A requested user was not found in the local directory.
+    #[error("user '{0}' not found")]
+    UserNotFound(String),
+    /// Removing or demoting this member would leave a workspace with no owner.
+    #[error("workspace '{0}' must retain at least one owner")]
+    LastWorkspaceOwner(String),
     /// A requested source was not found in config.
     #[error("source '{0}' not found")]
     SourceNotFound(String),
@@ -157,6 +171,15 @@ pub enum AppError {
 
 impl From<DbError> for AppError {
     fn from(error: DbError) -> Self {
+        // A writer that lost a lock or serialization race did nothing wrong, so
+        // it is classified before the driver-error catch-all below: the caller
+        // is told to try again rather than handed an internal fault carrying a
+        // raw driver string.
+        if error.is_serialization_conflict() {
+            return Self::Unavailable(
+                "the request lost a write race and can be retried".to_string(),
+            );
+        }
         match error {
             DbError::Config(detail) => {
                 Self::FailedPrecondition(format!("database configuration is invalid: {detail}"))
@@ -305,15 +328,18 @@ fn grpc_code(status: StatusCode) -> Code {
 fn app_code(error: &AppError) -> Code {
     match error {
         AppError::Unauthenticated(_) => Code::Unauthenticated,
+        AppError::PermissionDenied(_) => Code::PermissionDenied,
         AppError::SourceNotFound(_)
         | AppError::FunctionNotFound(_)
         | AppError::IdentitySpecNotFound { .. }
+        | AppError::UserNotFound(_)
         | AppError::WorkspaceNotFound(_) => Code::NotFound,
         AppError::FunctionAlreadyExists(_) | AppError::WorkspaceAlreadyExists(_) => {
             Code::AlreadyExists
         }
         AppError::InvalidInput(_) => Code::InvalidArgument,
         AppError::FailedPrecondition(_)
+        | AppError::LastWorkspaceOwner(_)
         | AppError::MissingSourceInputs { .. }
         | AppError::UnsupportedV4IdentityRequirements { .. }
         | AppError::MissingOrIncompatibleV4Materialization { .. }
@@ -367,6 +393,150 @@ mod tests {
         assert_eq!(status.code(), Code::Unauthenticated);
         assert!(status.message().len() <= MAX_STATUS_DETAIL_BYTES);
         assert!(status.message().ends_with("… (truncated)"));
+    }
+
+    /// The gRPC code is the binding half of the workspace access-control error
+    /// contract: clients branch on it, so a variant that drifts to another code
+    /// silently changes what a caller is told about their own access.
+    #[test]
+    fn app_status_binds_the_workspace_access_control_codes() {
+        let cases = [
+            (
+                AppError::PermissionDenied("owner access is required".to_string()),
+                Code::PermissionDenied,
+            ),
+            (
+                AppError::UserNotFound("11111111-2222-3333-4444-555555555555".to_string()),
+                Code::NotFound,
+            ),
+            (
+                AppError::LastWorkspaceOwner("work".to_string()),
+                Code::FailedPrecondition,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let rendered = error.to_string();
+            assert_eq!(
+                app_status(error).code(),
+                expected,
+                "unexpected code for {rendered}"
+            );
+        }
+    }
+
+    /// Two membership mutations on one workspace contend for the same parent
+    /// row, so one of them loses the race and its driver error reaches this
+    /// boundary. Mapped through the `Sqlx` catch-all it would read as an
+    /// internal defect and carry the raw driver string; the caller needs to be
+    /// told the request can simply be tried again.
+    #[test]
+    fn a_lost_write_race_answers_retryable_rather_than_internal() {
+        let lost_race = AppError::from(DbError::Sqlx(sqlx::Error::Database(Box::new(
+            StubDatabaseError("5"),
+        ))));
+        assert!(
+            matches!(lost_race, AppError::Unavailable(_)),
+            "unexpected error for a lost write race: {lost_race}"
+        );
+        assert_eq!(app_status(lost_race).code(), Code::Unavailable);
+
+        // Every other driver failure keeps its existing classification.
+        let fault = AppError::from(DbError::Sqlx(sqlx::Error::Database(Box::new(
+            StubDatabaseError("23505"),
+        ))));
+        assert!(
+            matches!(fault, AppError::Database(_)),
+            "unexpected error for a driver fault: {fault}"
+        );
+        assert_eq!(app_status(fault).code(), Code::Internal);
+    }
+
+    /// A driver error carrying one chosen code, so the classification can be
+    /// driven without provoking a real race.
+    #[derive(Debug)]
+    struct StubDatabaseError(&'static str);
+
+    impl std::fmt::Display for StubDatabaseError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("stub driver error")
+        }
+    }
+
+    impl std::error::Error for StubDatabaseError {}
+
+    impl sqlx::error::DatabaseError for StubDatabaseError {
+        fn message(&self) -> &'static str {
+            "stub driver error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.0))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// Concealment and denial must stay distinguishable in the structured
+    /// reason too: a concealed workspace carries `WORKSPACE_NOT_FOUND`, and a
+    /// denial carries no Coral reason that would confirm the workspace exists.
+    #[test]
+    fn app_status_reasons_separate_concealment_from_denial() {
+        let concealed = app_status(AppError::WorkspaceNotFound("work".to_string()));
+        let denied = app_status(AppError::PermissionDenied(
+            "owner access is required".to_string(),
+        ));
+
+        assert_eq!(
+            concealed
+                .get_error_details_vec()
+                .iter()
+                .find_map(|detail| match detail {
+                    ErrorDetail::ErrorInfo(info) => Some(info.reason.clone()),
+                    _ => None,
+                }),
+            Some(CORAL_ERROR_REASON_WORKSPACE_NOT_FOUND.to_string())
+        );
+        assert!(
+            denied.get_error_details_vec().is_empty(),
+            "a denial must not carry a Coral reason detail"
+        );
+    }
+
+    /// Telemetry reasons are the other half of the contract, and the mapping is
+    /// exhaustive, so an unmapped variant must be a compile error rather than a
+    /// span attribute that quietly reads `INTERNAL`.
+    #[test]
+    fn telemetry_names_each_workspace_access_control_error() {
+        use crate::telemetry::app_error_type;
+
+        for (error, expected) in [
+            (
+                AppError::PermissionDenied(String::new()),
+                "PERMISSION_DENIED",
+            ),
+            (AppError::UserNotFound(String::new()), "USER_NOT_FOUND"),
+            (
+                AppError::LastWorkspaceOwner(String::new()),
+                "LAST_WORKSPACE_OWNER",
+            ),
+        ] {
+            assert_eq!(app_error_type(&error), expected);
+        }
     }
 
     #[test]
