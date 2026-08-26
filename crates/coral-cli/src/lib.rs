@@ -33,14 +33,14 @@ use coral_api::v1::{
     DeleteWorkspaceRequest, DrainSearchQueueRequest, ExecuteSqlRequest, Function,
     FunctionRuntimeReady, FunctionWriteSurface, ListFunctionsRequest, ListWorkspacesRequest,
     RebuildSearchIndexRequest, SearchClearTarget, SearchDataScope, SearchIndexProvider,
-    SearchProvider, SearchRequest, Workspace, WorkspaceRole, function, search_clear_target,
-    search_maintenance_result,
+    SearchProvider, SearchRequest, Source, SourceInfo, Workspace, WorkspaceRole, function,
+    search_clear_target, search_maintenance_result,
 };
 use coral_app::{EngineExtensionsProvider, bootstrap::is_loopback_ip};
 use coral_client::{
-    AppClient, DEFAULT_WORKSPACE_ID, decode_execute_sql_response, format_batches_json,
-    format_batches_table, format_search_response_json, format_search_response_text,
-    manifest_input_from_proto, workspace as workspace_resource,
+    AppClient, decode_execute_sql_response, format_batches_json, format_batches_table,
+    format_search_response_json, format_search_response_text, manifest_input_from_proto,
+    workspace as workspace_resource,
 };
 use coral_mcp::{McpSurface, McpSurfaceProvider};
 use dialoguer::console::measure_text_width;
@@ -481,6 +481,12 @@ pub enum CliError {
         /// Normalized source name requested by the user.
         source_name: String,
     },
+    /// A workspace-scoped command ran without a workspace it could target.
+    #[error("{message}")]
+    WorkspaceSelection {
+        /// Guidance naming the action that makes the command runnable.
+        message: String,
+    },
     /// Any non-renderable internal command failure.
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
@@ -503,6 +509,7 @@ impl CliError {
             Self::SourceRemoveNotFound { source_name } => Some(format!(
                 "source '{source_name}' was not found. Run `coral source list` to see installed sources.\n"
             )),
+            Self::WorkspaceSelection { message } => Some(format!("{message}\n")),
             Self::Internal(_) => None,
         }
     }
@@ -530,16 +537,20 @@ impl Command {
     }
 
     fn uses_selected_workspace(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Command::Sql(_)
-                | Command::Search(_)
-                | Command::SearchIndex(_)
-                | Command::Source(_)
-                | Command::Function(_)
-                | Command::Onboard
-                | Command::McpStdio(_)
-        )
+            | Command::Search(_)
+            | Command::SearchIndex(_)
+            | Command::Function(_)
+            | Command::Onboard
+            | Command::McpStdio(_) => true,
+            // Manifest lint validates a file on disk and never reaches a workspace.
+            Command::Source(args) => !matches!(args.command, SourceCommand::Lint { .. }),
+            Command::Workspace(_)
+            | Command::Features(_)
+            | Command::Completion(_)
+            | Command::Server => false,
+        }
     }
 
     fn apply_workspace_flag_presence(&mut self, present: bool) {
@@ -565,6 +576,7 @@ impl coral_app::RunErrorTelemetry for CliError {
             Self::SourceNotFound { .. } | Self::SourceRemoveNotFound { .. } => {
                 Cow::Borrowed("SOURCE_NOT_FOUND")
             }
+            Self::WorkspaceSelection { .. } => Cow::Borrowed("WORKSPACE_SELECTION"),
             Self::Internal(_) => Cow::Borrowed("INTERNAL"),
         }
     }
@@ -578,6 +590,7 @@ impl coral_app::RunErrorTelemetry for CliError {
             Self::SourceNotFound { source_name } | Self::SourceRemoveNotFound { source_name } => {
                 Cow::Owned(format!("source '{source_name}' was not found"))
             }
+            Self::WorkspaceSelection { message } => Cow::Borrowed(message.as_str()),
             Self::Internal(error) => Cow::Owned(error.to_string()),
         }
     }
@@ -663,11 +676,6 @@ pub async fn run_from_env_with_extensions(extensions: CoralExtensions) -> Result
 
     match command.required_runtime() {
         RequiredRuntime::AppClient => {
-            let workspace = if command.uses_selected_workspace() {
-                selected_workspace(workspace_selection.workspace)
-            } else {
-                workspace_resource(DEFAULT_WORKSPACE_ID)
-            };
             let is_mcp_stdio = matches!(&command, Command::McpStdio(_));
             let bootstrap = bootstrap::bootstrap(
                 bootstrap::BootstrapOptions {
@@ -679,25 +687,26 @@ pub async fn run_from_env_with_extensions(extensions: CoralExtensions) -> Result
             .await
             .map_err(anyhow::Error::from)?;
             let app = bootstrap.app.clone();
+            let cli_workspace = workspace_selection.workspace;
             let result = if is_mcp_stdio {
-                run_app_command(
+                run_selected_command(
                     app,
                     command,
                     Some(&ctx),
                     &feature_overrides,
-                    &workspace,
+                    cli_workspace,
                     mcp_surface_provider.as_deref(),
                 )
                 .await
             } else {
                 coral_app::run_with_context(
                     &ctx,
-                    Box::pin(run_app_command(
+                    Box::pin(run_selected_command(
                         app,
                         command,
                         None,
                         &feature_overrides,
-                        &workspace,
+                        cli_workspace,
                         mcp_surface_provider.as_deref(),
                     )),
                 )
@@ -723,25 +732,129 @@ pub async fn run_from_env_with_extensions(extensions: CoralExtensions) -> Result
     }
 }
 
-fn selected_workspace(cli_workspace: Option<String>) -> Workspace {
-    workspace_resource(selected_workspace_name(cli_workspace, env::workspace()))
+/// Resolves the workspace a command targets, then runs it against the app.
+///
+/// Workspace management runs before any workspace exists, so it is dispatched
+/// without resolution; every other app-client command is workspace-scoped and
+/// fails here rather than reaching the server with a guessed name.
+async fn run_selected_command(
+    app: AppClient,
+    command: Command,
+    ctx: Option<&coral_app::RunContext>,
+    feature_overrides: &coral_app::features::FeatureOverrides,
+    cli_workspace: Option<String>,
+    mcp_surface_provider: Option<&dyn McpSurfaceProvider>,
+) -> Result<(), CliError> {
+    if !command.uses_selected_workspace() {
+        return run_unscoped_app_command(&app, command).await;
+    }
+    if matches!(command, Command::Onboard) {
+        // A wizard without a terminal is unrunnable whatever workspace it would
+        // target, so report that before asking which workspace to resolve.
+        source_ops::require_interactive()?;
+    }
+    let workspace = resolve_workspace(&app, cli_workspace).await?;
+    run_app_command(
+        app,
+        command,
+        ctx,
+        feature_overrides,
+        &workspace,
+        mcp_surface_provider,
+    )
+    .await
 }
 
-fn selected_workspace_name(cli_workspace: Option<String>, env_workspace: Option<String>) -> String {
-    cli_workspace
-        .or_else(|| env_workspace.filter(|value| !value.is_empty()))
-        .unwrap_or_else(|| DEFAULT_WORKSPACE_ID.to_string())
+/// Runs the app-client commands that operate outside any workspace: workspace
+/// management, which has to work before one exists, and manifest lint, which
+/// only validates a file on disk.
+async fn run_unscoped_app_command(app: &AppClient, command: Command) -> Result<(), CliError> {
+    match command {
+        Command::Workspace(args) => run_workspace(app, args).await,
+        Command::Source(SourceArgs {
+            command: SourceCommand::Lint { file },
+        }) => {
+            source_ops::load_validated_manifest_file(&file)?;
+            println!("Manifest is valid");
+            Ok(())
+        }
+        _ => unreachable!("workspace-scoped commands resolve a workspace before dispatch"),
+    }
+}
+
+/// Resolves the workspace a scoped command runs against.
+///
+/// The CLI never invents workspace access: without an explicit selector the
+/// caller must hold exactly one membership, and every other outcome is reported
+/// with the action that resolves it instead of substituting a name.
+async fn resolve_workspace(
+    app: &AppClient,
+    cli_workspace: Option<String>,
+) -> Result<Workspace, CliError> {
+    if let Some(name) = explicit_workspace_name(cli_workspace, env::workspace()) {
+        return Ok(workspace_resource(name));
+    }
+    let memberships = app
+        .workspace_client()
+        .list_workspaces(Request::new(ListWorkspacesRequest {}))
+        .await
+        .map_err(anyhow::Error::from)?
+        .into_inner()
+        .memberships;
+    sole_membership_workspace(
+        memberships
+            .into_iter()
+            .map(|membership| {
+                membership
+                    .workspace
+                    .ok_or_else(|| anyhow::anyhow!("list workspaces response missing workspace"))
+                    .map(|workspace| workspace.name)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    )
+}
+
+/// Returns the workspace name the caller selected explicitly, if any.
+fn explicit_workspace_name(
+    cli_workspace: Option<String>,
+    env_workspace: Option<String>,
+) -> Option<String> {
+    cli_workspace.or_else(|| env_workspace.filter(|value| !value.is_empty()))
+}
+
+/// Selects the caller's only workspace, or explains how to make the choice
+/// unambiguous.
+fn sole_membership_workspace(mut names: Vec<String>) -> Result<Workspace, CliError> {
+    if names.len() == 1 {
+        return Ok(workspace_resource(names.remove(0)));
+    }
+    let message = if names.is_empty() {
+        "no workspace is available. Run `coral workspace create NAME` to create one, or select an existing workspace with `--workspace NAME` or `CORAL_WORKSPACE`.".to_string()
+    } else {
+        format!(
+            "multiple workspaces are available ({}). Select one with `--workspace NAME` or `CORAL_WORKSPACE`.",
+            names
+                .iter()
+                .map(|name| name.escape_default().collect::<String>())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Err(CliError::WorkspaceSelection { message })
 }
 
 async fn run_server(
     feature_overrides: coral_app::features::FeatureOverrides,
     extensions: CoralExtensions,
 ) -> Result<(), anyhow::Error> {
-    let server = bootstrap::start_standalone_server(
+    // Boxed to keep this function's own future under clippy's large-future
+    // threshold: the composed server startup is by far the largest state it
+    // holds, so moving it to the heap keeps `run_server` small.
+    let server = Box::pin(bootstrap::start_standalone_server(
         feature_overrides,
         extensions.engine_providers,
         extensions.mcp_surface_provider,
-    )
+    ))
     .await?;
     let endpoint = server.endpoint_uri().to_string();
 
@@ -755,14 +868,23 @@ async fn run_server(
     }
     println!("Coral gRPC server listening on {endpoint}");
     if let Some(address) = server.mcp_http_addr() {
-        let mcp_endpoint = format!("http://{address}/mcp");
+        // Each workspace is served at its own URL under this listener, mounted
+        // under the configured base path — so the template comes from the
+        // running server rather than a hardcoded `/mcp`, which would name a
+        // path that 404s for any other base. A bound MCP HTTP listener always
+        // reports its template, so its absence is a wiring bug rather than a
+        // case to paper over with a fallback literal that could silently drift.
+        let url_path = server
+            .mcp_http_workspace_url_path()
+            .expect("a bound MCP HTTP listener reports its per-workspace URL template");
+        let mcp_endpoint = format!("http://{address}{url_path}");
         if server_requires_security_warning(address) {
             eprintln!(
                 "{}",
                 mcp_http_exposure_warning(&mcp_endpoint, server.mcp_http_authentication_enabled())
             );
         }
-        println!("Coral MCP HTTP server listening on {mcp_endpoint}");
+        println!("Coral MCP HTTP server serving each workspace at {mcp_endpoint}");
     }
     println!("Connect clients with CORAL_ENDPOINT={endpoint}");
     println!("Press Ctrl-C to stop the server.");
@@ -922,100 +1044,138 @@ async fn run_app_command(
     mcp_surface_provider: Option<&dyn McpSurfaceProvider>,
 ) -> Result<(), CliError> {
     match command {
-        Command::Sql(args) => {
-            let response = match app
-                .query_client()
-                .execute_sql(Request::new(ExecuteSqlRequest {
-                    workspace: Some(workspace.clone()),
-                    sql: args.sql,
-                    guide_read_context: None,
-                    task_attribution: None,
-                }))
-                .await
-            {
-                Ok(response) => response.into_inner(),
-                Err(status) => {
-                    return Err(CliError::Query {
-                        error_message: query_error::telemetry_error_message(&status),
-                        error_type: query_error::telemetry_error_type(&status),
-                        rendered_stderr: query_error::render_query_error(&status),
-                    });
-                }
-            };
-            let result = decode_execute_sql_response(&response).map_err(anyhow::Error::from)?;
-            print_batches(result.batches(), args.format)?;
-        }
-        Command::Search(args) => run_search(&app, workspace, args).await?,
-        Command::SearchIndex(args) => run_search_index(&app, workspace, args).await?,
-        Command::Source(args) => run_source(&app, workspace, args).await?,
-        Command::Workspace(args) => run_workspace(&app, args).await?,
-        Command::Function(args) => run_function(&app, workspace, args).await?,
-        Command::Onboard => {
-            onboard::run(&app, workspace).await?;
-        }
+        Command::Sql(args) => run_sql(&app, workspace, args).await,
+        Command::Search(args) => run_search(&app, workspace, args).await,
+        Command::SearchIndex(args) => run_search_index(&app, workspace, args).await,
+        Command::Source(args) => run_source(&app, workspace, args).await,
+        Command::Function(args) => run_function(&app, workspace, args).await,
+        Command::Onboard => onboard::run(&app, workspace).await.map_err(CliError::from),
         Command::McpStdio(_) => {
-            let features = coral_app::features::FeatureStore::discover(None)
-                .and_then(|store| store.load_with_overrides(feature_overrides))
-                .map_err(anyhow::Error::from)?;
-            let source_names = match source_ops::list_sources(&app, workspace).await {
-                Ok(sources) => sources.into_iter().map(|source| source.name).collect(),
-                Err(error) => {
-                    eprintln!(
-                        "warning: failed to load source names for MCP initialize instructions: {error}"
-                    );
-                    Vec::new()
-                }
-            };
-            let (source_names, query_examples) =
-                match coral_app::bootstrap::workspace_mcp_startup_context(
-                    &workspace.name,
-                    source_names.clone(),
-                    MCP_INITIAL_QUERY_EXAMPLE_LIMIT,
-                ) {
-                    Ok(context) => (
-                        context.source_names().to_vec(),
-                        context
-                            .query_history()
-                            .iter()
-                            .map(|entry| {
-                                coral_mcp::McpQueryExample::new(entry.sql())
-                                    .with_sources(entry.sources().iter().cloned())
-                                    .with_row_count(entry.row_count())
-                            })
-                            .collect(),
-                    ),
-                    Err(error) => {
-                        eprintln!(
-                            "warning: failed to load MCP startup context for initialize instructions: {error}"
-                        );
-                        (source_names, Vec::new())
-                    }
-                };
-            Box::pin(coral_mcp::run_stdio_with_client(
-                app,
-                coral_mcp::McpOptions {
-                    feedback_enabled: features.enabled(coral_app::features::Feature::Feedback),
-                    observed_values_search_enabled: features
-                        .enabled(coral_app::features::Feature::ObservedValuesSearch),
-                    trace_parent: ctx.and_then(|ctx| ctx.trace_parent.clone()),
-                    source_names,
-                    query_examples,
-                    workspace: Some(workspace.clone()),
-                    surface: match mcp_surface_provider {
-                        Some(provider) => provider.surface().map_err(anyhow::Error::from_boxed)?,
-                        None => McpSurface::default(),
-                    },
-                },
-            ))
-            .await
-            .map_err(anyhow::Error::from)?;
+            run_mcp_stdio(app, workspace, ctx, feature_overrides, mcp_surface_provider).await
+        }
+        Command::Workspace(_) => {
+            unreachable!("workspace management is routed without a selected workspace")
         }
         Command::Completion(_) | Command::Features(_) | Command::Server => {
             unreachable!("no-runtime commands are routed without an app client")
         }
     }
+}
 
+/// Executes one SQL statement and renders the decoded batches.
+async fn run_sql(app: &AppClient, workspace: &Workspace, args: SqlArgs) -> Result<(), CliError> {
+    let response = app
+        .query_client()
+        .execute_sql(Request::new(ExecuteSqlRequest {
+            workspace: Some(workspace.clone()),
+            sql: args.sql,
+            guide_read_context: None,
+            task_attribution: None,
+        }))
+        .await
+        .map_err(|status| query_failure(&status))?
+        .into_inner();
+    let result = decode_execute_sql_response(&response).map_err(anyhow::Error::from)?;
+    print_batches(result.batches(), args.format)?;
     Ok(())
+}
+
+/// Reports a failed query the way the user and telemetry each need it: the
+/// rendered guidance goes to stderr while the classification travels with the
+/// run, both derived from the one status the server returned.
+fn query_failure(status: &tonic::Status) -> CliError {
+    CliError::Query {
+        error_message: query_error::telemetry_error_message(status),
+        error_type: query_error::telemetry_error_type(status),
+        rendered_stderr: query_error::render_query_error(status),
+    }
+}
+
+/// Serves MCP over stdio for the selected workspace.
+async fn run_mcp_stdio(
+    app: AppClient,
+    workspace: &Workspace,
+    ctx: Option<&coral_app::RunContext>,
+    feature_overrides: &coral_app::features::FeatureOverrides,
+    mcp_surface_provider: Option<&dyn McpSurfaceProvider>,
+) -> Result<(), CliError> {
+    let features = coral_app::features::FeatureStore::discover(None)
+        .and_then(|store| store.load_with_overrides(feature_overrides))
+        .map_err(anyhow::Error::from)?;
+    let source_names = mcp_source_names(&app, workspace).await;
+    let (source_names, query_examples) = mcp_startup_context(&workspace.name, source_names);
+    Box::pin(coral_mcp::run_stdio_with_client(
+        app,
+        coral_mcp::McpOptions {
+            feedback_enabled: features.enabled(coral_app::features::Feature::Feedback),
+            observed_values_search_enabled: features
+                .enabled(coral_app::features::Feature::ObservedValuesSearch),
+            trace_parent: ctx.and_then(|ctx| ctx.trace_parent.clone()),
+            source_names,
+            query_examples,
+            workspace: Some(workspace.clone()),
+            surface: match mcp_surface_provider {
+                Some(provider) => provider.surface().map_err(anyhow::Error::from_boxed)?,
+                None => McpSurface::default(),
+            },
+        },
+    ))
+    .await
+    .map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+/// Names the installed sources for the MCP initialize instructions.
+///
+/// The instructions are advisory, so a listing failure costs them their source
+/// list rather than the whole MCP session.
+async fn mcp_source_names(app: &AppClient, workspace: &Workspace) -> Vec<String> {
+    match source_ops::list_sources(app, workspace).await {
+        Ok(sources) => sources.into_iter().map(|source| source.name).collect(),
+        Err(error) => {
+            eprintln!(
+                "warning: failed to load source names for MCP initialize instructions: {error}"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Loads the source names and query examples the MCP initialize instructions
+/// open with, falling back to the names alone when local history is unreadable.
+fn mcp_startup_context(
+    workspace_name: &str,
+    source_names: Vec<String>,
+) -> (Vec<String>, Vec<coral_mcp::McpQueryExample>) {
+    match coral_app::bootstrap::workspace_mcp_startup_context(
+        workspace_name,
+        source_names.clone(),
+        MCP_INITIAL_QUERY_EXAMPLE_LIMIT,
+    ) {
+        Ok(context) => (
+            context.source_names().to_vec(),
+            context
+                .query_history()
+                .iter()
+                .map(mcp_query_example)
+                .collect(),
+        ),
+        Err(error) => {
+            eprintln!(
+                "warning: failed to load MCP startup context for initialize instructions: {error}"
+            );
+            (source_names, Vec::new())
+        }
+    }
+}
+
+/// Presents one recorded query as an MCP startup example.
+fn mcp_query_example(
+    entry: &coral_app::bootstrap::McpQueryHistoryEntry,
+) -> coral_mcp::McpQueryExample {
+    coral_mcp::McpQueryExample::new(entry.sql())
+        .with_sources(entry.sources().iter().cloned())
+        .with_row_count(entry.row_count())
 }
 
 fn run_features(
@@ -1125,49 +1285,17 @@ async fn run_source(
 ) -> Result<(), CliError> {
     match args.command {
         SourceCommand::Discover => {
-            let sources = source_ops::discover_sources(app, workspace).await?;
-            if sources.is_empty() {
-                println!("No bundled sources available.");
-            } else {
-                let rows = sources.into_iter().map(|source| {
-                    let status = if source.installed {
-                        "installed".to_string()
-                    } else {
-                        "available".to_string()
-                    };
-                    [
-                        source.name,
-                        source_ops::display_version(&source.version),
-                        status,
-                    ]
-                });
-                print_text_table(["Source", "Version", "Status"], rows);
-            }
+            print_bundled_sources(source_ops::discover_sources(app, workspace).await?);
         }
         SourceCommand::List => {
-            let sources = source_ops::list_sources(app, workspace).await?;
-            if sources.is_empty() {
-                println!("No sources configured.");
-            } else {
-                let rows = sources.into_iter().map(|source| {
-                    [
-                        source.name,
-                        source_ops::display_version(&source.version),
-                        source_ops::source_origin_label(source.origin).to_string(),
-                        source_ops::source_credential_storage_label(source.credential_storage)
-                            .to_string(),
-                    ]
-                });
-                print_text_table(["Source", "Version", "Origin", "Secrets"], rows);
-            }
+            print_configured_sources(source_ops::list_sources(app, workspace).await?);
         }
         SourceCommand::Info { name, verbose } => {
             source_ops::print_source_info(app, workspace, &name, verbose).await?;
         }
         SourceCommand::Add(args) => run_source_add(app, workspace, args).await?,
-        SourceCommand::Lint { file } => {
-            source_ops::load_validated_manifest_file(&file)?;
-            println!("Manifest is valid");
+        SourceCommand::Lint { .. } => {
+            unreachable!("manifest lint is routed without a selected workspace")
         }
         SourceCommand::Test { name } => {
             source_ops::test_and_print(
@@ -1184,6 +1312,54 @@ async fn run_source(
         }
     }
     Ok(())
+}
+
+/// Renders the sources Coral bundles, with the install state that says whether
+/// `coral source add` still has work to do for each one.
+fn print_bundled_sources(sources: Vec<SourceInfo>) {
+    if sources.is_empty() {
+        println!("No bundled sources available.");
+        return;
+    }
+    print_text_table(
+        ["Source", "Version", "Status"],
+        sources.into_iter().map(bundled_source_row),
+    );
+}
+
+/// Renders the sources installed in the selected workspace, naming where each
+/// one came from and where its secrets live.
+fn print_configured_sources(sources: Vec<Source>) {
+    if sources.is_empty() {
+        println!("No sources configured.");
+        return;
+    }
+    print_text_table(
+        ["Source", "Version", "Origin", "Secrets"],
+        sources.into_iter().map(configured_source_row),
+    );
+}
+
+fn bundled_source_row(source: SourceInfo) -> [String; 3] {
+    let status = if source.installed {
+        "installed"
+    } else {
+        "available"
+    };
+    [
+        source.name,
+        source_ops::display_version(&source.version),
+        status.to_string(),
+    ]
+}
+
+fn configured_source_row(source: Source) -> [String; 4] {
+    [
+        source.name,
+        source_ops::display_version(&source.version),
+        source_ops::source_origin_label(source.origin).to_string(),
+        source_ops::source_credential_storage_label(source.credential_storage).to_string(),
+    ]
 }
 
 async fn run_search(
@@ -1797,7 +1973,8 @@ mod tests {
 
     use clap::{CommandFactory, Parser};
     use coral_api::v1::{
-        Function, FunctionRuntimeInvalid, FunctionRuntimeReady, TableFunctionResultColumn, function,
+        Function, FunctionRuntimeInvalid, FunctionRuntimeReady, Source, SourceCredentialStorage,
+        SourceInfo, SourceOrigin, TableFunctionResultColumn, function,
     };
 
     use super::{
@@ -2099,31 +2276,91 @@ mod tests {
     }
 
     #[test]
-    fn selected_workspace_preserves_raw_name_for_app_validation() {
-        let workspace = super::selected_workspace(Some(" ../bad ".to_string()));
+    fn workspace_resolution_preserves_raw_explicit_name_for_app_validation() {
+        let name = super::explicit_workspace_name(Some(" ../bad ".to_string()), None);
 
-        assert_eq!(workspace.name, " ../bad ");
+        assert_eq!(name.as_deref(), Some(" ../bad "));
     }
 
     #[test]
-    fn selected_workspace_preserves_former_confirmation_marker() {
-        let workspace = super::selected_workspace_name(
+    fn workspace_resolution_preserves_former_confirmation_marker() {
+        let name = super::explicit_workspace_name(
             Some("__coral_current_workspace_confirmation__".to_string()),
             None,
         );
 
-        assert_eq!(workspace, "__coral_current_workspace_confirmation__");
+        assert_eq!(
+            name.as_deref(),
+            Some("__coral_current_workspace_confirmation__")
+        );
     }
 
     #[test]
-    fn selected_workspace_treats_empty_env_value_as_unset() {
-        let workspace = super::selected_workspace_name(None, Some(String::new()));
+    fn workspace_resolution_prefers_the_flag_over_the_environment() {
+        let name = super::explicit_workspace_name(
+            Some("flag".to_string()),
+            Some("environment".to_string()),
+        );
 
-        assert_eq!(workspace, super::DEFAULT_WORKSPACE_ID);
+        assert_eq!(name.as_deref(), Some("flag"));
     }
 
     #[test]
-    fn only_workspace_scoped_commands_use_selected_workspace() {
+    fn workspace_resolution_uses_a_non_empty_environment_value() {
+        let name = super::explicit_workspace_name(None, Some("environment".to_string()));
+
+        assert_eq!(name.as_deref(), Some("environment"));
+    }
+
+    #[test]
+    fn workspace_resolution_treats_empty_env_value_as_unset() {
+        let name = super::explicit_workspace_name(None, Some(String::new()));
+
+        assert_eq!(
+            name, None,
+            "an empty selector must fall through to memberships"
+        );
+    }
+
+    #[test]
+    fn workspace_resolution_selects_a_sole_membership() {
+        let workspace = super::sole_membership_workspace(vec!["analytics".to_string()])
+            .expect("a single membership resolves without a selector");
+
+        assert_eq!(workspace.name, "analytics");
+    }
+
+    #[test]
+    fn workspace_resolution_without_memberships_explains_how_to_get_one() {
+        let error = super::sole_membership_workspace(Vec::new())
+            .expect_err("no membership must not resolve to a substituted name");
+
+        let rendered = error
+            .rendered_stderr()
+            .expect("workspace guidance is user-facing");
+        assert!(
+            rendered.contains("coral workspace create NAME") && rendered.contains("--workspace"),
+            "unexpected guidance: {rendered}"
+        );
+    }
+
+    #[test]
+    fn workspace_resolution_with_several_memberships_asks_for_an_explicit_name() {
+        let error =
+            super::sole_membership_workspace(vec!["analytics".to_string(), "sales".to_string()])
+                .expect_err("an ambiguous membership set must not be guessed");
+
+        let rendered = error
+            .rendered_stderr()
+            .expect("workspace guidance is user-facing");
+        assert!(
+            rendered.contains("analytics, sales") && rendered.contains("--workspace NAME"),
+            "unexpected guidance: {rendered}"
+        );
+    }
+
+    #[test]
+    fn workspace_resolution_skips_workspace_management_commands() {
         let sql = Cli::try_parse_from(["coral", "sql", "SELECT 1"]).expect("sql parses");
         let search =
             Cli::try_parse_from(["coral", "search", "github", "issues"]).expect("search parses");
@@ -2131,8 +2368,10 @@ mod tests {
         let functions =
             Cli::try_parse_from(["coral", "functions", "list"]).expect("functions parses");
         let onboard = Cli::try_parse_from(["coral", "onboard"]).expect("onboard parses");
-        let workspace =
-            Cli::try_parse_from(["coral", "workspace", "list"]).expect("workspace parses");
+        let list = Cli::try_parse_from(["coral", "workspace", "list"]).expect("workspace parses");
+        let create = Cli::try_parse_from(["coral", "workspace", "create", "analytics"])
+            .expect("workspace create parses");
+        let setup = Cli::try_parse_from(["coral", "features", "list"]).expect("features parses");
         let mcp = Cli::try_parse_from(["coral", "mcp-stdio"]).expect("mcp parses");
 
         assert!(sql.command.uses_selected_workspace());
@@ -2141,7 +2380,112 @@ mod tests {
         assert!(functions.command.uses_selected_workspace());
         assert!(onboard.command.uses_selected_workspace());
         assert!(mcp.command.uses_selected_workspace());
-        assert!(!workspace.command.uses_selected_workspace());
+        assert!(!list.command.uses_selected_workspace());
+        assert!(!create.command.uses_selected_workspace());
+        assert!(!setup.command.uses_selected_workspace());
+    }
+
+    #[test]
+    fn workspace_resolution_skips_manifest_lint_but_not_other_source_commands() {
+        let manifest_lint = Cli::try_parse_from(["coral", "source", "lint", "manifest.yaml"])
+            .expect("source lint parses");
+        let installed_sources =
+            Cli::try_parse_from(["coral", "source", "list"]).expect("source list parses");
+
+        assert!(!manifest_lint.command.uses_selected_workspace());
+        assert!(installed_sources.command.uses_selected_workspace());
+    }
+
+    #[test]
+    fn query_failure_renders_guidance_and_classifies_the_status() {
+        let error = super::query_failure(&tonic::Status::unavailable("connection refused"));
+
+        let super::CliError::Query {
+            rendered_stderr,
+            error_type,
+            error_message,
+        } = &error
+        else {
+            panic!("a query status must stay a renderable query failure: {error:?}");
+        };
+        assert_eq!(rendered_stderr, "Error (unavailable): connection refused\n");
+        assert_eq!(error_message, "connection refused");
+        assert!(
+            !error_type.is_empty(),
+            "telemetry needs a failure class for an undecodable status"
+        );
+    }
+
+    #[test]
+    fn bundled_source_rows_separate_installed_from_available() {
+        let installed = super::bundled_source_row(SourceInfo {
+            name: "github".to_string(),
+            version: "1.2.0".to_string(),
+            installed: true,
+            ..SourceInfo::default()
+        });
+        let available = super::bundled_source_row(SourceInfo {
+            name: "slack".to_string(),
+            version: String::new(),
+            installed: false,
+            ..SourceInfo::default()
+        });
+
+        assert_eq!(
+            installed,
+            [
+                "github".to_string(),
+                "1.2.0".to_string(),
+                "installed".to_string()
+            ]
+        );
+        assert_eq!(
+            available,
+            [
+                "slack".to_string(),
+                "-".to_string(),
+                "available".to_string()
+            ],
+            "an unversioned bundled source still reports as available"
+        );
+    }
+
+    #[test]
+    fn configured_source_rows_label_origin_and_secret_storage() {
+        let row = super::configured_source_row(Source {
+            name: "github".to_string(),
+            version: "1.2.0".to_string(),
+            origin: SourceOrigin::Bundled as i32,
+            credential_storage: SourceCredentialStorage::Keychain as i32,
+            ..Source::default()
+        });
+        let unknown = super::configured_source_row(Source {
+            name: "custom".to_string(),
+            version: String::new(),
+            origin: SourceOrigin::Unspecified as i32,
+            credential_storage: SourceCredentialStorage::Unspecified as i32,
+            ..Source::default()
+        });
+
+        assert_eq!(
+            row,
+            [
+                "github".to_string(),
+                "1.2.0".to_string(),
+                "bundled".to_string(),
+                "keychain".to_string(),
+            ]
+        );
+        assert_eq!(
+            unknown,
+            [
+                "custom".to_string(),
+                "-".to_string(),
+                "unknown".to_string(),
+                "none".to_string(),
+            ],
+            "unset enum values must render as words, not numbers"
+        );
     }
 
     #[test]

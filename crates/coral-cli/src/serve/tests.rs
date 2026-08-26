@@ -25,8 +25,31 @@ const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","param
 const OAUTH_ISSUER: &str = "http://localhost:9080";
 const OAUTH_RESOURCE: &str = "http://localhost:1457";
 const SESSION_ISSUER: &str = "https://auth.example";
-const SESSION_RESOURCE: &str = "https://coral.example/mcp";
+/// The canonical base of the per-workspace MCP resources the session fixtures
+/// serve; [`SESSION_RESOURCE`] is [`TEST_WORKSPACE_NAME`]'s member of that
+/// family — the audience a token must carry to be valid at its URL.
+const SESSION_BASE: &str = "https://coral.example/mcp";
+const SESSION_RESOURCE: &str = "https://coral.example/mcp/workspace/analytics";
 const CORAL_UI_RESOURCE: &str = "https://coral-ui.example";
+const TEST_WORKSPACE_NAME: &str = "analytics";
+const MCP_SESSION_ID: &str = "mcp-session-id";
+
+/// The listener-relative MCP URL of one workspace.
+fn ws_path(name: &str) -> String {
+    format!("/mcp/workspace/{name}")
+}
+
+/// The authenticated MCP surface every session fixture below serves.
+///
+/// The bind and the `public_url` whose per-workspace family decides the
+/// accepted audiences are this constant; which workspace a request is about is
+/// its URL's to say.
+const AUTHENTICATED_MCP_HTTP: &str = r"
+[server.mcp_http]
+enabled = true
+bind = '127.0.0.1:0'
+public_url = 'https://CORAL.example/mcp'
+";
 
 struct TestMcpProvider;
 
@@ -50,6 +73,17 @@ impl McpSurfaceProvider for UnexpectedMcpProvider {
 
 fn write_config(temp: &TempDir, config: &str) {
     std::fs::write(temp.path().join("config.toml"), config).expect("write config");
+}
+
+/// Writes an auth-disabled companion config.
+///
+/// No workspace is named anywhere: the surface serves every existing workspace
+/// at its own URL, so the fixtures scope a session by the URL they dial.
+fn write_auth_disabled_config(temp: &TempDir) {
+    write_config(
+        temp,
+        "[trace_history]\nenabled = false\n\n[server.mcp_http]\nenabled = true\nbind = '127.0.0.1:0'\n",
+    );
 }
 
 fn write_oauth_config(temp: &TempDir, oauth_bind: SocketAddr, mcp_bind: Option<SocketAddr>) {
@@ -149,21 +183,59 @@ async fn initialize_mcp(endpoint: &str, authorization: &str) -> reqwest::Respons
 /// The mirror of [`assert_unauthorized`], and it stops at the handshake because
 /// that is where authentication is decided: everything after it is
 /// workspace-scoped — even `tools/list`, which enumerates a workspace's table
-/// functions — so a caller holding no membership is legitimately refused there
-/// while its audience was accepted here. `coral-app`'s workspace authorization
-/// tests own the boundary behind it.
-async fn assert_mcp_authenticated(endpoint: &str, token: &str) {
-    let accepted = initialize_mcp(endpoint, &format!("Bearer {token}")).await;
+/// functions — so `coral-app`'s workspace authorization tests own the boundary
+/// behind it.
+///
+/// An accepted audience is then refused *membership*: nothing in these
+/// fixtures provisions a directory row for the caller (only a completed login
+/// writes one), so admission's concealed not-found for the URL's workspace is
+/// exactly what proves the token passed authentication and the URL's name
+/// reached admission. The absent challenge is what tells that refusal apart
+/// from a refused audience, which is answered `401` and carries one.
+async fn assert_mcp_authenticated(endpoint: &str, token: &str, workspace: &str) {
+    let guidance = mcp_refusal_guidance(endpoint, token).await;
     assert!(
-        accepted.status().is_success(),
-        "an accepted audience must initialize an MCP session: {}",
-        accepted.status()
+        guidance.contains(&format!("Workspace `{workspace}` was not found")),
+        "an accepted audience must be refused only its membership: {guidance}"
+    );
+}
+
+/// Reads the guidance an accepted audience's refused handshake carries.
+///
+/// Every property that separates this refusal from an authentication one is
+/// asserted here rather than at the call sites, which then differ only in the
+/// guidance they expect: the audience passed authentication, so the answer is
+/// `200` with no challenge, and no session was opened for a caller who was not
+/// admitted to one.
+async fn mcp_refusal_guidance(endpoint: &str, token: &str) -> String {
+    let accepted = initialize_mcp(endpoint, &format!("Bearer {token}")).await;
+    assert_eq!(
+        accepted.status(),
+        reqwest::StatusCode::OK,
+        "an accepted audience must pass authentication and be answered its handshake"
     );
     assert!(accepted.headers().get(WWW_AUTHENTICATE).is_none());
+    assert!(
+        accepted.headers().get(MCP_SESSION_ID).is_none(),
+        "a refused handshake must leave no session behind"
+    );
+    let refusal = accepted
+        .json::<serde_json::Value>()
+        .await
+        .expect("JSON-RPC handshake answer");
+    refusal
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("a refused handshake carries guidance: {refusal}"))
+        .to_string()
 }
 
 async fn assert_unauthorized(base: &str, authorization: &str) {
-    let rejected = initialize_mcp(&format!("{base}/mcp"), authorization).await;
+    let rejected = initialize_mcp(
+        &format!("{base}{}", ws_path(TEST_WORKSPACE_NAME)),
+        authorization,
+    )
+    .await;
     assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
     assert_eq!(
         rejected.headers().get_all(WWW_AUTHENTICATE).iter().count(),
@@ -199,12 +271,12 @@ async fn assert_grpc_rejects_unauthenticated(endpoint: &str) {
 
 /// The ordinary workspace these fixtures name.
 ///
-/// Nothing provisions a workspace any more, so naming one keeps these fixtures
-/// off the `DEFAULT_WORKSPACE_ID` fallback. Most call sites never create it: the
-/// probes below assert on authentication, which is decided before the workspace
-/// is ever looked up.
+/// Nothing provisions a workspace any more, and no helper reconstructs one, so
+/// these fixtures name the workspace they mean. Most call sites never create it:
+/// the probes below assert on authentication, which is decided before the
+/// workspace is ever looked up.
 fn test_workspace() -> Workspace {
-    workspace("analytics")
+    workspace(TEST_WORKSPACE_NAME)
 }
 
 /// Creates [`test_workspace`] over the unauthenticated loopback gRPC endpoint.
@@ -290,16 +362,7 @@ fn signed_session_token(
 }
 
 fn write_session_config(temp: &TempDir, signing_key: &[u8]) {
-    write_session_config_with_mcp(
-        temp,
-        signing_key,
-        r"
-[server.mcp_http]
-enabled = true
-bind = '127.0.0.1:0'
-public_url = 'https://CORAL.example/mcp'
-",
-    );
+    write_session_config_with_mcp(temp, signing_key, AUTHENTICATED_MCP_HTTP);
 }
 
 fn write_coral_ui_only_session_config(temp: &TempDir, signing_key: &[u8]) {
@@ -369,7 +432,7 @@ async fn assert_grpc_authenticated(server: &RunningServer, token: &str) {
 
 async fn assert_authenticated_surfaces(server: &RunningServer, mcp_endpoint: &str, token: &str) {
     assert_grpc_authenticated(server, token).await;
-    assert_mcp_authenticated(mcp_endpoint, token).await;
+    assert_mcp_authenticated(mcp_endpoint, token, TEST_WORKSPACE_NAME).await;
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -457,6 +520,45 @@ fn loopback_grpc_endpoint_maps_wildcards_and_rejects_public_addresses() {
     .expect_err("IPv4-mapped IPv6 address must be rejected");
 }
 
+/// The printed per-workspace URL template follows the served base path, so it
+/// never names a route that would 404 on the listener.
+///
+/// The auth-disabled surface has no public URL and always mounts under `/mcp`;
+/// the authenticated surface mounts under its `public_url`'s path, so a base
+/// with a non-`/mcp` path — the shape older docs recommended — must print that
+/// path rather than a hardcoded one.
+#[test]
+fn mcp_workspace_url_path_follows_the_served_base_path() {
+    let auth_disabled = McpHttpServeConfig::AuthDisabled {
+        bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        expose_non_loopback: false,
+        allowed_hosts: Vec::new(),
+    };
+    assert_eq!(
+        mcp_http_workspace_url_path(&auth_disabled),
+        "/mcp/workspace/{workspace}"
+    );
+
+    let authenticated = |public_url: &str| McpHttpServeConfig::Authenticated {
+        bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        public_url: public_url.to_string(),
+        authorization_server: "https://auth.example".to_string(),
+    };
+    assert_eq!(
+        mcp_http_workspace_url_path(&authenticated("https://mcp.example.com/mcp")),
+        "/mcp/workspace/{workspace}"
+    );
+    assert_eq!(
+        mcp_http_workspace_url_path(&authenticated("https://mcp.example.com")),
+        "/workspace/{workspace}",
+        "a root public_url mounts the family at the origin root"
+    );
+    assert_eq!(
+        mcp_http_workspace_url_path(&authenticated("https://mcp.example.com/base/mcp")),
+        "/base/mcp/workspace/{workspace}"
+    );
+}
+
 #[test]
 fn shutdown_failures_retain_every_component_in_order() {
     let failures = ShutdownFailures::from_results(
@@ -477,21 +579,18 @@ fn shutdown_failures_retain_every_component_in_order() {
     );
 }
 
+/// Also proves the URL's workspace reaches the running MCP surface: the tools
+/// asserted here are workspace-scoped, and nothing but the dialed URL names
+/// the workspace they resolve against.
 #[tokio::test]
 async fn auth_disabled_companion_serves_and_shuts_down() {
     let temp = TempDir::new().expect("temp dir");
-    write_config(
-        &temp,
-        "[trace_history]\nenabled = false\n\n[server.mcp_http]\nenabled = true\nbind = '127.0.0.1:0'\n",
-    );
+    write_auth_disabled_config(&temp);
     let server = start(
         ServerBuilder::configured_standalone_grpc()
             .with_config_dir(temp.path())
             .with_noop_feedback_uploads(),
-        McpOptions {
-            workspace: Some(test_workspace()),
-            ..McpOptions::default()
-        },
+        McpOptions::default(),
         Some(Arc::new(TestMcpProvider)),
     )
     .await
@@ -502,10 +601,11 @@ async fn auth_disabled_companion_serves_and_shuts_down() {
     let mcp_addr = server.mcp_http_addr().expect("MCP HTTP endpoint");
     assert!(server.oauth_addr().is_none());
     // The tools this asserts are workspace-scoped, and nothing provisions a
-    // workspace any more, so the fixture creates the one it scopes MCP to.
+    // workspace any more, so the fixture creates the one the dialed URL names.
+    // Nothing in config selects it: the workspace is named only by the URL path.
     create_test_workspace(server.endpoint_uri()).await;
-    assert_catalog_tool(format!("http://{mcp_addr}/mcp")).await;
-    assert_cli_extension_filter(format!("http://{mcp_addr}/mcp")).await;
+    assert_catalog_tool(format!("http://{mcp_addr}{}", ws_path(TEST_WORKSPACE_NAME))).await;
+    assert_cli_extension_filter(format!("http://{mcp_addr}{}", ws_path(TEST_WORKSPACE_NAME))).await;
     server.shutdown().await.expect("shutdown composite server");
     let grpc_rebound = TcpListener::bind(grpc_addr).expect("gRPC port must be released");
     let mcp_rebound = TcpListener::bind(mcp_addr).expect("MCP port must be released");
@@ -549,10 +649,7 @@ async fn opted_in_auth_disabled_companion_serves_off_loopback() {
         ServerBuilder::configured_standalone_grpc()
             .with_config_dir(temp.path())
             .with_noop_feedback_uploads(),
-        McpOptions {
-            workspace: Some(test_workspace()),
-            ..McpOptions::default()
-        },
+        McpOptions::default(),
         None,
     )
     .await
@@ -566,24 +663,20 @@ async fn opted_in_auth_disabled_companion_serves_off_loopback() {
     // The tools this asserts are workspace-scoped, and nothing provisions a
     // workspace any more, so the fixture creates the one it scopes MCP to.
     create_test_workspace(server.endpoint_uri()).await;
-    assert_catalog_tool(format!("http://{dial}/mcp")).await;
+    assert_catalog_tool(format!("http://{dial}{}", ws_path(TEST_WORKSPACE_NAME))).await;
     server.shutdown().await.expect("shutdown composite server");
 }
 
 #[tokio::test]
 async fn companion_uses_supplied_mcp_options() {
     let temp = TempDir::new().expect("temp dir");
-    write_config(
-        &temp,
-        "[trace_history]\nenabled = false\n\n[server.mcp_http]\nenabled = true\nbind = '127.0.0.1:0'\n",
-    );
+    write_auth_disabled_config(&temp);
     let server = start(
         ServerBuilder::configured_standalone_grpc()
             .with_config_dir(temp.path())
             .with_noop_feedback_uploads(),
         McpOptions {
             feedback_enabled: true,
-            workspace: Some(test_workspace()),
             ..McpOptions::default()
         },
         None,
@@ -594,7 +687,7 @@ async fn companion_uses_supplied_mcp_options() {
     // `tools/list` enumerates the workspace's table functions, so it needs the
     // workspace MCP is scoped to actually exist.
     create_test_workspace(server.endpoint_uri()).await;
-    assert_feedback_tool(format!("http://{mcp_addr}/mcp")).await;
+    assert_feedback_tool(format!("http://{mcp_addr}{}", ws_path(TEST_WORKSPACE_NAME))).await;
     server.shutdown().await.expect("shutdown composite server");
 }
 
@@ -697,28 +790,47 @@ async fn session_authenticated_companion_gates_grpc_and_mcp() {
         .await
         .expect("readiness response");
     assert_eq!(ready.status(), reqwest::StatusCode::NO_CONTENT);
-    let advertised = reqwest::get(format!("{base}/.well-known/oauth-protected-resource/mcp"))
-        .await
-        .expect("metadata response")
-        .json::<serde_json::Value>()
-        .await
-        .expect("metadata document");
+    // Metadata is served per workspace, at the path-inserted well-known URL of
+    // the workspace's own resource; the base's metadata path names no
+    // workspace and is gone.
+    let advertised = reqwest::get(format!(
+        "{base}/.well-known/oauth-protected-resource/mcp/workspace/{TEST_WORKSPACE_NAME}"
+    ))
+    .await
+    .expect("metadata response")
+    .json::<serde_json::Value>()
+    .await
+    .expect("metadata document");
     let resource = advertised
         .get("resource")
         .and_then(serde_json::Value::as_str)
         .expect("advertised resource")
         .to_string();
-    assert_eq!(resource, "https://coral.example/mcp");
+    assert_eq!(resource, SESSION_RESOURCE);
+    let retired_base = reqwest::get(format!("{base}/.well-known/oauth-protected-resource/mcp"))
+        .await
+        .expect("base metadata response");
+    assert_eq!(retired_base.status(), reqwest::StatusCode::NOT_FOUND);
 
     assert_unauthorized(&base, "Bearer wrong-token").await;
 
     let wrong_audience = session_token(signing_key.as_ref(), "https://other.example/mcp");
     assert_unauthorized(&base, &format!("Bearer {wrong_audience}")).await;
 
+    // The base itself is no longer an audience: a token minted for it dies at
+    // every workspace URL, exactly like any other wrong audience.
+    let base_audience = session_token(signing_key.as_ref(), SESSION_BASE);
+    assert_unauthorized(&base, &format!("Bearer {base_audience}")).await;
+
     assert_grpc_rejects_unauthenticated(server.endpoint_uri()).await;
 
     let token = session_token(signing_key.as_ref(), &resource);
-    assert_authenticated_surfaces(&server, &format!("{base}/mcp"), &token).await;
+    assert_authenticated_surfaces(
+        &server,
+        &format!("{base}{}", ws_path(TEST_WORKSPACE_NAME)),
+        &token,
+    )
+    .await;
 
     let coral_ui_token = session_token(signing_key.as_ref(), CORAL_UI_RESOURCE);
     assert_grpc_authenticated(&server, &coral_ui_token).await;
@@ -732,6 +844,7 @@ async fn session_authenticated_companion_gates_grpc_and_mcp() {
         mcp_http,
         grpc_authentication_enabled: _,
         mcp_http_authentication_enabled: _,
+        mcp_http_workspace_url_path: _,
     } = server;
     grpc.shutdown().await.expect("shutdown gRPC server");
     let unready = reqwest::get(format!("{base}/readyz"))
@@ -754,16 +867,92 @@ async fn session_authenticated_companion_gates_grpc_and_mcp() {
         .expect("shutdown OAuth server");
 }
 
-/// MCP HTTP is a public surface, so it admits only its own audience: a token
-/// minted for a sibling surface must not be replayable at it.
+/// The URL's workspace reaches the authenticated MCP surface, and the refusal
+/// is the concealed not-found *for that URL's own name*.
+///
+/// Two handshakes with valid per-workspace tokens differ only in the workspace
+/// their URL (and audience) names; neither is among the caller's memberships
+/// (only a completed login writes a membership row), and the two answers are
+/// identical once the names are substituted — through the running server, not
+/// a mocked directory. Admission never asks whether a name exists globally, so
+/// nothing else about the names could change the answer.
+///
+/// The refusal also says which client decided it. Admission lists memberships
+/// on the caller's own bearer-bound connection; the unauthenticated loopback
+/// client this surface also holds serves `/readyz` only, which is asserted
+/// working right beside the refusals it must have played no part in.
+#[tokio::test]
+async fn session_authenticated_companion_scopes_mcp_to_the_urls_workspace() {
+    let temp = TempDir::new().expect("temp dir");
+    let signing_key =
+        EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
+            .expect("P-256 signing key");
+    write_session_config(&temp, signing_key.as_ref());
+    let server = start(
+        ServerBuilder::configured_standalone_grpc()
+            .with_config_dir(temp.path())
+            .with_noop_feedback_uploads(),
+        McpOptions::default(),
+        None,
+    )
+    .await
+    .expect("start authenticated composite server");
+    let mcp_addr = server.mcp_http_addr().expect("MCP HTTP endpoint");
+    let base = format!("http://{mcp_addr}");
+
+    let ready = reqwest::get(format!("{base}/readyz"))
+        .await
+        .expect("readiness response");
+    assert_eq!(
+        ready.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "the unauthenticated client this surface holds serves readiness"
+    );
+
+    let token = session_token(signing_key.as_ref(), SESSION_RESOURCE);
+    // The same token is accepted on both surfaces, so what MCP answers below is
+    // an admission answer about a workspace rather than one about the token.
+    assert_grpc_authenticated(&server, &token).await;
+
+    let existing =
+        mcp_refusal_guidance(&format!("{base}{}", ws_path(TEST_WORKSPACE_NAME)), &token).await;
+    assert!(
+        existing.contains(&format!("Workspace `{TEST_WORKSPACE_NAME}` was not found")),
+        "the URL's name must reach admission and be the one it answers about: {existing}"
+    );
+
+    let ghost_token = session_token(
+        signing_key.as_ref(),
+        "https://coral.example/mcp/workspace/ghost",
+    );
+    let ghost = mcp_refusal_guidance(&format!("{base}{}", ws_path("ghost")), &ghost_token).await;
+    assert!(
+        ghost.contains("Workspace `ghost` was not found"),
+        "guidance: {ghost}"
+    );
+    assert_eq!(
+        existing.replace(TEST_WORKSPACE_NAME, "{ws}"),
+        ghost.replace("ghost", "{ws}"),
+        "an existing workspace the caller does not hold and one never created \
+         must be refused with the same sentence"
+    );
+
+    server.shutdown().await.expect("shutdown composite server");
+    let mcp_rebound = TcpListener::bind(mcp_addr).expect("MCP port must be released");
+    drop(mcp_rebound);
+}
+
+/// MCP HTTP admits only the exact audience of the workspace URL a request
+/// arrives at: a token minted for a sibling surface, or for a *different
+/// workspace's* URL, must not be replayable there.
 ///
 /// This asserts on the authenticator the running MCP surface is handed, composed
 /// from an on-disk config by the same function `start` calls, and starts the
 /// server that composition configured. The regression it guards is `coral serve`
 /// handing MCP the private API's full audience allowlist, which would let a
-/// token minted for the BFF be presented here.
+/// token minted for the BFF — or any workspace — be presented anywhere.
 #[tokio::test]
-async fn session_auth_composes_an_mcp_only_audience_for_mcp() {
+async fn session_auth_composes_a_route_exact_audience_for_mcp() {
     let temp = TempDir::new().expect("temp dir");
     let signing_key =
         EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &SystemRandom::new())
@@ -785,13 +974,26 @@ async fn session_auth_composes_an_mcp_only_audience_for_mcp() {
     );
 
     mcp_authenticator
-        .principal_for_bearer(&session_token(signing_key.as_ref(), SESSION_RESOURCE))
-        .await
-        .expect("token minted for the MCP surface");
+        .principal_for_bearer_with_audience(
+            &session_token(signing_key.as_ref(), SESSION_RESOURCE),
+            SESSION_RESOURCE,
+        )
+        .expect("token minted for exactly this workspace's URL");
     mcp_authenticator
-        .principal_for_bearer(&session_token(signing_key.as_ref(), CORAL_UI_RESOURCE))
-        .await
+        .principal_for_bearer_with_audience(
+            &session_token(signing_key.as_ref(), CORAL_UI_RESOURCE),
+            SESSION_RESOURCE,
+        )
         .expect_err("MCP must refuse a token minted for a sibling surface");
+    mcp_authenticator
+        .principal_for_bearer_with_audience(
+            &session_token(
+                signing_key.as_ref(),
+                "https://coral.example/mcp/workspace/other",
+            ),
+            SESSION_RESOURCE,
+        )
+        .expect_err("a bearer for one workspace must die at another's URL");
 
     grpc.shutdown()
         .await
@@ -878,8 +1080,9 @@ async fn session_failures_and_restart_are_fail_closed() {
     .await
     .expect("start authenticated composite server");
     let mcp_endpoint = format!(
-        "http://{}/mcp",
-        server.mcp_http_addr().expect("MCP HTTP endpoint")
+        "http://{}{}",
+        server.mcp_http_addr().expect("MCP HTTP endpoint"),
+        ws_path(TEST_WORKSPACE_NAME)
     );
 
     let expired_rejection = assert_bearer_rejected(&server, &mcp_endpoint, &expired).await;
@@ -904,8 +1107,9 @@ async fn session_failures_and_restart_are_fail_closed() {
     .await
     .expect("restart authenticated composite server");
     let restarted_mcp = format!(
-        "http://{}/mcp",
-        restarted.mcp_http_addr().expect("restarted MCP endpoint")
+        "http://{}{}",
+        restarted.mcp_http_addr().expect("restarted MCP endpoint"),
+        ws_path(TEST_WORKSPACE_NAME)
     );
     assert_authenticated_surfaces(&restarted, &restarted_mcp, &valid).await;
     restarted.shutdown().await.expect("restarted shutdown");

@@ -7,6 +7,7 @@ use tonic::metadata::MetadataMap;
 
 use crate::auth::session::SessionTokenVerifier;
 use crate::identity::{BearerAuthenticator, Principal, PrincipalProvider, PrincipalProviderError};
+use crate::workspace_mcp_urls::WorkspaceMcpUrls;
 
 const AUTHORIZATION_METADATA: &str = "authorization";
 const UNAUTHENTICATED_MESSAGE: &str = "authentication required";
@@ -29,7 +30,67 @@ const UNAUTHENTICATED_MESSAGE: &str = "authentication required";
 #[derive(Clone)]
 pub struct SessionPrincipalProvider {
     verifier: SessionTokenVerifier,
-    accepted_audiences: Arc<[String]>,
+    audiences: AudiencePolicy,
+}
+
+/// Which minted audiences a surface's provider admits.
+#[derive(Clone)]
+enum AudiencePolicy {
+    /// An enumerated allowlist, the shape every surface had before
+    /// per-workspace MCP resources existed.
+    Exact(Arc<[String]>),
+    /// An enumerated allowlist plus every canonical per-workspace MCP
+    /// resource under one base URL. The family cannot be enumerated — its
+    /// members come and go with workspaces — so membership is decided by
+    /// parsing the audience against the one URL template.
+    ExactPlusWorkspaceFamily {
+        exact: Arc<[String]>,
+        family: Arc<WorkspaceMcpUrls>,
+    },
+}
+
+impl AudiencePolicy {
+    fn accepts(&self, audience: &str) -> bool {
+        match self {
+            Self::Exact(exact) => exact.iter().any(|accepted| accepted == audience),
+            Self::ExactPlusWorkspaceFamily { exact, family } => {
+                exact.iter().any(|accepted| accepted == audience)
+                    || family.parse_resource(audience).is_some()
+            }
+        }
+    }
+
+    /// The enumerated allowlist this policy consults, family aside.
+    fn exact(&self) -> &[String] {
+        match self {
+            Self::Exact(exact) | Self::ExactPlusWorkspaceFamily { exact, .. } => exact,
+        }
+    }
+
+    /// Rejects a malformed accepted-audiences allowlist as a misconfiguration.
+    ///
+    /// This is the guard [`SessionTokenVerifier::validate_access_token`] applies
+    /// to an enumerated list, lifted here so both policies route through the
+    /// predicate path yet a whitespace-padded entry still fails loudly rather
+    /// than silently admitting a token minted for that exact padded audience.
+    /// Every enumerated entry must be non-empty and free of surrounding
+    /// whitespace; a pure [`Self::Exact`] policy, which accepts nothing but its
+    /// list, must additionally have at least one entry, while the
+    /// workspace-family policy has no such minimum — the family covers
+    /// acceptance when the exact list is empty.
+    fn ensure_well_formed(&self) -> Result<(), ()> {
+        let exact = self.exact();
+        if matches!(self, Self::Exact(_)) && exact.is_empty() {
+            return Err(());
+        }
+        if exact
+            .iter()
+            .any(|audience| audience.is_empty() || audience.trim() != audience.as_str())
+        {
+            return Err(());
+        }
+        Ok(())
+    }
 }
 
 impl SessionPrincipalProvider {
@@ -39,22 +100,66 @@ impl SessionPrincipalProvider {
     ) -> Self {
         Self {
             verifier,
-            accepted_audiences: accepted_audiences.into_iter().collect(),
+            audiences: AudiencePolicy::Exact(accepted_audiences.into_iter().collect()),
+        }
+    }
+
+    /// Builds a provider admitting `accepted_audiences` plus every
+    /// per-workspace MCP resource in `family`.
+    pub(crate) fn with_workspace_family(
+        verifier: SessionTokenVerifier,
+        accepted_audiences: impl IntoIterator<Item = String>,
+        family: Arc<WorkspaceMcpUrls>,
+    ) -> Self {
+        Self {
+            verifier,
+            audiences: AudiencePolicy::ExactPlusWorkspaceFamily {
+                exact: accepted_audiences.into_iter().collect(),
+                family,
+            },
         }
     }
 
     fn principal_for_token(&self, token: &str) -> Result<Principal, PrincipalProviderError> {
+        // Both policies route through the predicate path; the allowlist's
+        // empty-and-whitespace config guard, once specific to the enumerated
+        // entry point, now runs here so a misconfigured allowlist fails loudly
+        // under either policy rather than only the enumerated one.
+        self.audiences
+            .ensure_well_formed()
+            .map_err(|()| unauthenticated())?;
+        self.principal_where(token, &|audience| self.audiences.accepts(audience))
+    }
+
+    /// Authenticates a bearer token minted for exactly `audience`.
+    ///
+    /// This is the per-route check for surfaces whose resource identity varies
+    /// by request — a per-workspace MCP URL admits only tokens minted for that
+    /// exact URL, so the expected audience arrives with the call instead of
+    /// living in the provider's own policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same generic authentication failure as every other path.
+    pub fn principal_for_bearer_with_audience(
+        &self,
+        token: &str,
+        audience: &str,
+    ) -> Result<Principal, PrincipalProviderError> {
+        self.principal_where(token, &|minted| minted == audience)
+    }
+
+    fn principal_where(
+        &self,
+        token: &str,
+        audience_ok: &dyn Fn(&str) -> bool,
+    ) -> Result<Principal, PrincipalProviderError> {
         if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
             return Err(unauthenticated());
         }
-        let accepted = self
-            .accepted_audiences
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
         let session = self
             .verifier
-            .validate_access_token(token, &accepted)
+            .validate_access_token_where(token, audience_ok)
             .map_err(|_error| unauthenticated())?;
         // The token's subject is Coral's internal `user_id`, so the request
         // principal is that id verbatim — no upstream issuer, subject, or
@@ -339,6 +444,54 @@ mod tests {
                 .await
                 .expect_err("any other audience");
         }
+    }
+
+    /// The workspace-family policy admits a token minted for a workspace
+    /// resource even when its enumerated exact list is empty — the family
+    /// covers acceptance. A whitespace-padded exact entry, by contrast, is a
+    /// misconfiguration that fails loudly under this policy just as it does
+    /// under a pure allowlist, rather than being silently consulted through the
+    /// predicate path.
+    #[tokio::test]
+    async fn the_workspace_family_policy_guards_its_exact_list() {
+        use std::sync::Arc;
+
+        use crate::oauth_resource::CanonicalOauthUrl;
+        use crate::workspace_mcp_urls::{McpWorkspaceSegment, WorkspaceMcpUrls};
+
+        let signing_key = test_signing_key();
+        let config = session(&signing_key);
+        let base = CanonicalOauthUrl::parse("https://coral.example/mcp").expect("canonical base");
+        let family = Arc::new(WorkspaceMcpUrls::new(base));
+        let workspace_resource =
+            family.resource(&McpWorkspaceSegment::parse("team").expect("segment"));
+        let token = config
+            .issue_access_token_as(USER_ID, CLIENT_ID, &workspace_resource, PrincipalKind::User)
+            .expect("workspace token")
+            .access_token;
+
+        // Empty exact list, family present: the family admits the workspace token.
+        let family_only = super::SessionPrincipalProvider::with_workspace_family(
+            config.verifier(),
+            Vec::<String>::new(),
+            family.clone(),
+        );
+        family_only
+            .principal_for_bearer(&token)
+            .await
+            .expect("the family admits its own workspace resource");
+
+        // A whitespace-padded exact entry is a misconfiguration: every token is
+        // refused, including the otherwise-valid workspace token.
+        let padded = super::SessionPrincipalProvider::with_workspace_family(
+            config.verifier(),
+            [" https://coral.example/other ".to_string()],
+            family,
+        );
+        padded
+            .principal_for_bearer(&token)
+            .await
+            .expect_err("a whitespace-padded allowlist entry must fail loudly");
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ use crate::auth::{AuthSettings, CoralAuthorizationServer, ResolvedAuthSettings};
 use crate::oauth_resource::CanonicalOauthUrl;
 use crate::request_auth::SessionPrincipalProvider;
 use crate::state::AppStateLayout;
+use crate::workspace_mcp_urls::WorkspaceMcpUrls;
 
 #[derive(Debug, Default, Deserialize)]
 struct GrpcConfigFile {
@@ -104,13 +105,28 @@ impl LoadedServerConfig {
             Some(auth_settings.authorization_server().issuer()),
         )?;
         let mcp_http = self.resolve_mcp_http(Some(&authorization_server))?;
-        let public_audiences = public_surface_audiences(mcp_http.as_ref(), &allowed_audiences)?;
+        let mcp_workspace_urls = match &mcp_http {
+            Some(McpHttpServeConfig::Authenticated { public_url, .. }) => {
+                // The variant carries the canonical identifier, and parsing is
+                // idempotent on canonical output, so this cannot fail — but a
+                // panic here would turn a config bug into a crash, so it maps
+                // to the same configuration error every other bad URL gets.
+                let base = CanonicalOauthUrl::parse(public_url).map_err(|error| {
+                    AppError::FailedPrecondition(format!("server.mcp_http.public_url {error}"))
+                })?;
+                Some(WorkspaceMcpUrls::new(base))
+            }
+            _ => None,
+        };
+        let public_audiences =
+            public_surface_audiences(mcp_workspace_urls.as_ref(), &allowed_audiences)?;
         Ok(ServeSettings {
             mcp_http,
             session_auth: Some(SessionAuthSettings {
                 settings: auth_settings,
                 session_tokens: session,
                 public_audiences,
+                mcp_workspace_urls,
             }),
         })
     }
@@ -299,7 +315,12 @@ pub enum McpHttpServeConfig {
     Authenticated {
         /// Address for the MCP HTTP listener.
         bind_addr: SocketAddr,
-        /// Canonical public MCP URL advertised to clients and used as JWT audience.
+        /// Canonical public base of the per-workspace MCP URLs.
+        ///
+        /// Each workspace is served at `<public_url>/workspace/<name>`, and
+        /// that full per-workspace URL — never this base — is the OAuth
+        /// resource and JWT audience of the sessions it admits. The URL names
+        /// the workspace, so no workspace is configured here.
         public_url: String,
         /// OAuth authorization server advertised to MCP clients.
         authorization_server: String,
@@ -358,13 +379,24 @@ pub struct SessionAuthSettings {
     pub(super) settings: ResolvedAuthSettings,
     pub(super) session_tokens: SessionTokenIssuer,
     pub(super) public_audiences: Vec<String>,
+    pub(super) mcp_workspace_urls: Option<WorkspaceMcpUrls>,
 }
 
 impl SessionAuthSettings {
-    /// The instance's public surfaces, canonicalized.
+    /// The instance's explicitly registered public audiences, canonicalized.
+    ///
+    /// When MCP HTTP is served, its audiences are the per-workspace resource
+    /// family under [`Self::mcp_workspace_urls`] — a set that cannot be
+    /// enumerated here, so it is deliberately not in this list.
     #[must_use]
     pub fn public_audiences(&self) -> &[String] {
         &self.public_audiences
+    }
+
+    /// The per-workspace MCP resource family, when MCP HTTP is served.
+    #[must_use]
+    pub fn mcp_workspace_urls(&self) -> Option<&WorkspaceMcpUrls> {
+        self.mcp_workspace_urls.as_ref()
     }
 
     /// Builds a provider admitting session tokens for exactly `audiences`.
@@ -383,10 +415,45 @@ impl SessionAuthSettings {
         ))
     }
 
+    /// Builds the private gRPC API's provider.
+    ///
+    /// The private API is reached through the public surfaces that front it,
+    /// so it admits every explicitly registered audience plus, when MCP HTTP
+    /// is served, every per-workspace MCP resource — bearer-forwarded backend
+    /// calls arrive under exactly those audiences.
+    #[must_use]
+    pub fn private_api_provider(&self) -> Arc<SessionPrincipalProvider> {
+        match &self.mcp_workspace_urls {
+            Some(urls) => Arc::new(SessionPrincipalProvider::with_workspace_family(
+                self.session_tokens.verifier(),
+                self.public_audiences.clone(),
+                Arc::new(urls.clone()),
+            )),
+            None => self.principal_provider(self.public_audiences.clone()),
+        }
+    }
+
+    /// Builds the authenticator the MCP HTTP surface checks bearers with.
+    ///
+    /// The MCP surface's audience varies by route — each workspace URL is its
+    /// own resource — so this provider is used exclusively through
+    /// [`SessionPrincipalProvider::principal_for_bearer_with_audience`], with
+    /// the expected audience supplied per request. It carries no standing
+    /// allowlist of its own.
+    #[must_use]
+    pub fn mcp_route_authenticator(&self) -> Arc<SessionPrincipalProvider> {
+        Arc::new(SessionPrincipalProvider::new(
+            self.session_tokens.verifier(),
+            [],
+        ))
+    }
+
     /// Consumes these settings into the authorization server for the instance.
     ///
-    /// Every public surface is registered as an authorization resource clients
-    /// may request a token for.
+    /// Every explicitly registered public audience becomes an authorization
+    /// resource clients may request a token for, and the per-workspace MCP
+    /// family — when MCP HTTP is served — is registered as a template rather
+    /// than an enumeration.
     ///
     /// The server returned here has no database attached and so fails every
     /// login closed. `ServerBuilder::with_session_auth` is the path that
@@ -404,32 +471,35 @@ impl SessionAuthSettings {
                 .with_authorization_resource(audience)
                 .map_err(AppError::FailedPrecondition)?;
         }
+        if let Some(urls) = self.mcp_workspace_urls {
+            server = server.with_workspace_resource_family(urls);
+        }
         Ok(server)
     }
 }
 
-/// Collects the resource identifiers that front the instance's private API.
+/// Collects the explicitly registered resource identifiers that front the
+/// instance's private API, beside the per-workspace MCP family.
 ///
 /// Each identifier is both the audience of tokens minted for a public surface
-/// and the authorization resource clients name when requesting one. Some are
-/// derived from a surface Coral serves, while others are explicitly registered
-/// for external fronting surfaces such as a hosted UI BFF.
+/// and the authorization resource clients name when requesting one. The MCP
+/// surface's audiences are not here: they are the per-workspace resources
+/// under the configured public base, which cannot be enumerated and whose base
+/// is itself not an audience.
 ///
 /// The gRPC API has no resource identity of its own and instead accepts every
-/// identifier returned here. At least one is therefore required: with none, no
-/// token can be minted for anything and every login would fail at authorization.
+/// identifier returned here plus the MCP family. At least one public surface
+/// is therefore required: with none, no token can be minted for anything and
+/// every login would fail at authorization.
 ///
 /// An identifier names a surface, not an actor: either kind of caller can arrive
 /// through any of them, so nothing here says what kind a caller is. Actor kind
 /// comes from the authenticated principal instead.
 fn public_surface_audiences(
-    mcp_http: Option<&McpHttpServeConfig>,
+    mcp_workspace_urls: Option<&WorkspaceMcpUrls>,
     allowed_audiences: &[String],
 ) -> Result<Vec<String>, AppError> {
-    let mut audiences = match mcp_http {
-        Some(McpHttpServeConfig::Authenticated { public_url, .. }) => vec![public_url.clone()],
-        _ => Vec::new(),
-    };
+    let mut audiences = Vec::new();
     for (index, configured) in allowed_audiences.iter().enumerate() {
         let label = format!("auth.allowed_audiences[{index}]");
         let audience = required_oauth_url(&label, Some(configured))?;
@@ -438,9 +508,21 @@ fn public_surface_audiences(
                 "{label} duplicates another configured public surface audience"
             )));
         }
+        // The MCP base is deliberately not an audience of its own — it is not
+        // an MCP endpoint any more — so an explicit entry naming it would
+        // resurrect exactly the audience the per-workspace family replaced.
+        // Both spellings are rejected: a trailing-slash `public_url` leaves the
+        // canonical base and the normalized base identifier differing by one
+        // slash, and either would otherwise slip through as a gRPC audience.
+        if mcp_workspace_urls.is_some_and(|urls| urls.is_base_audience(&audience)) {
+            return Err(AppError::FailedPrecondition(format!(
+                "{label} duplicates server.mcp_http.public_url, which is the base of the \
+                 per-workspace MCP resources and not an audience of its own"
+            )));
+        }
         audiences.push(audience);
     }
-    if audiences.is_empty() {
+    if audiences.is_empty() && mcp_workspace_urls.is_none() {
         return Err(AppError::FailedPrecondition(
             "configured [auth] requires at least one public surface: an enabled server.mcp_http with a public_url, or a non-empty auth.allowed_audiences"
                 .to_string(),
@@ -631,6 +713,7 @@ redirect_uri = 'https://auth.example.test/auth/oidc/callback'
             bind_addr,
             expose_non_loopback,
             allowed_hosts,
+            ..
         }) = McpHttpServeConfig::load(&layout).expect("MCP HTTP config")
         else {
             panic!("opted-in non-loopback MCP must stay auth-disabled");
@@ -775,14 +858,56 @@ redirect_uri = 'https://auth.example.test/auth/oidc/callback'
         // providers and the authorization server from it is the composition
         // root's job, covered in `bootstrap::server`.
         let session_auth = companions.session_auth.expect("session auth");
-        // Both surfaces front the private API, so both audiences are admitted;
-        // neither says anything about what kind of actor arrives through it.
+        // The MCP surface's audiences are the per-workspace family under its
+        // base, not an enumerable entry, so the explicit audience list carries
+        // only the configured extras.
         assert_eq!(
             session_auth.public_audiences,
-            [
-                "https://mcp.example.test".to_string(),
-                "https://coral-ui.example.test".to_string(),
-            ]
+            ["https://coral-ui.example.test".to_string()]
+        );
+        assert_eq!(
+            session_auth
+                .mcp_workspace_urls
+                .as_ref()
+                .expect("MCP workspace family")
+                .base()
+                .identifier(),
+            "https://mcp.example.test"
+        );
+    }
+
+    /// With MCP HTTP as the only public surface, the workspace family alone
+    /// satisfies the at-least-one-surface requirement, and the base URL is not
+    /// registered as an exact audience of its own.
+    #[test]
+    fn authenticated_mcp_only_config_serves_only_the_workspace_family() {
+        let temp = TempDir::new().expect("temp dir");
+        let layout = AppStateLayout::discover(Some(temp.path().join("config"))).expect("layout");
+        write_authenticated_config(
+            &layout,
+            "[server.mcp_http]\nenabled = true\nbind = '127.0.0.1:0'\npublic_url = 'https://mcp.example.test/'\n",
+        );
+
+        let companions = LoadedServerConfig::load(&layout)
+            .expect("load")
+            .companion_settings()
+            .expect("MCP-only companions");
+        let session_auth = companions.session_auth.expect("session auth");
+        assert!(session_auth.public_audiences.is_empty());
+        assert!(session_auth.mcp_workspace_urls.is_some());
+
+        let authorization_server = session_auth
+            .into_authorization_server()
+            .expect("authorization server");
+        assert!(
+            authorization_server.authorization_resources().is_empty(),
+            "the family is a template, not an enumerated resource — and the \
+             base is not a resource at all"
+        );
+        assert!(
+            authorization_server.serves_workspace_resource_family(),
+            "the family must be registered even though it enumerates to nothing, \
+             or every real MCP login is refused invalid_target"
         );
     }
 
@@ -827,7 +952,17 @@ redirect_uri = 'https://auth.example.test/auth/oidc/callback'
             (
                 "[server.mcp_http]\nenabled = true\npublic_url = 'https://MCP.example.test/'\n",
                 "allowed_audiences = ['https://mcp.example.test']",
-                "auth.allowed_audiences[0] duplicates another configured public surface audience",
+                "auth.allowed_audiences[0] duplicates server.mcp_http.public_url",
+            ),
+            // A non-root base with a trailing slash keeps that slash through
+            // canonicalization, so the normalized base identifier every
+            // per-workspace resource extends differs from the canonical base by
+            // one slash. Naming that normalized form must be rejected too, or it
+            // resurrects the base as a private-gRPC audience.
+            (
+                "[server.mcp_http]\nenabled = true\npublic_url = 'https://coral.example/mcp/'\n",
+                "allowed_audiences = ['https://coral.example/mcp']",
+                "auth.allowed_audiences[0] duplicates server.mcp_http.public_url",
             ),
             (
                 "",

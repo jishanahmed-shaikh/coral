@@ -3,8 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use coral_app::{
-    AuthServerError, BearerAuthenticator, CoralAuthorizationServer, McpHttpServeConfig,
-    RunningCoralAuthorizationServer, SessionAuthSettings,
+    AuthServerError, CanonicalOauthUrl, CoralAuthorizationServer, McpHttpServeConfig,
+    RunningCoralAuthorizationServer, SessionAuthSettings, SessionPrincipalProvider,
+    WorkspaceMcpUrls,
 };
 use coral_client::{
     AppClient, BearerToken, ClientError,
@@ -126,6 +127,7 @@ pub(crate) struct RunningServer {
     mcp_http: Option<RunningMcpHttpServer>,
     grpc_authentication_enabled: bool,
     mcp_http_authentication_enabled: bool,
+    mcp_http_workspace_url_path: Option<String>,
 }
 
 impl RunningServer {
@@ -135,6 +137,17 @@ impl RunningServer {
 
     pub(crate) fn mcp_http_addr(&self) -> Option<SocketAddr> {
         self.mcp_http.as_ref().map(RunningMcpHttpServer::local_addr)
+    }
+
+    /// The listener-relative per-workspace URL template, when MCP HTTP serves.
+    ///
+    /// The authenticated surface mounts the workspace family under the path of
+    /// its `public_url`, so a root public URL serves `/workspace/{workspace}`
+    /// and the usual `/mcp` base serves `/mcp/workspace/{workspace}`. The
+    /// auth-disabled surface has no public URL and always uses `/mcp`. Printing
+    /// a hardcoded path would name one that 404s for any other base.
+    pub(crate) fn mcp_http_workspace_url_path(&self) -> Option<&str> {
+        self.mcp_http_workspace_url_path.as_deref()
     }
 
     pub(crate) fn grpc_authentication_enabled(&self) -> bool {
@@ -163,6 +176,7 @@ impl RunningServer {
             mcp_http,
             grpc_authentication_enabled: _,
             mcp_http_authentication_enabled: _,
+            mcp_http_workspace_url_path: _,
         } = self;
         shutdown_components(grpc, oauth, mcp_http)
             .await
@@ -176,6 +190,17 @@ impl RunningServer {
 /// what else runs beside it, and wiring the session policies each surface
 /// enforces, happens here — where the transports' lifecycles are already owned.
 pub(crate) async fn start(
+    builder: ServerBuilder,
+    mcp_options: McpOptions,
+    mcp_surface_provider: Option<Arc<dyn McpSurfaceProvider>>,
+) -> Result<RunningServer, ServeError> {
+    // Boxed so every caller stays under clippy's large-future threshold: the
+    // composed startup is by far the largest state this future would hold, so
+    // one box here spares a Box::pin at every call site.
+    Box::pin(start_inner(builder, mcp_options, mcp_surface_provider)).await
+}
+
+async fn start_inner(
     builder: ServerBuilder,
     mut mcp_options: McpOptions,
     mcp_surface_provider: Option<Arc<dyn McpSurfaceProvider>>,
@@ -197,6 +222,7 @@ pub(crate) async fn start(
             )))
         })?;
     }
+    let mcp_http_workspace_url_path = mcp_config.as_ref().map(mcp_http_workspace_url_path);
     let (builder, mcp_principal_provider) =
         compose_session_policies(builder, session_auth, mcp_config.as_ref());
     // App startup owns the state database, so it also builds the authorization
@@ -241,29 +267,52 @@ pub(crate) async fn start(
         mcp_http,
         grpc_authentication_enabled,
         mcp_http_authentication_enabled,
+        mcp_http_workspace_url_path,
     })
+}
+
+/// The listener-relative per-workspace URL template a resolved MCP config serves.
+///
+/// The authenticated surface mounts the workspace family under its
+/// `public_url`'s path (a root URL → `/workspace/{workspace}`, `…/mcp` →
+/// `/mcp/workspace/{workspace}`); the auth-disabled surface has no public URL
+/// and always mounts under `/mcp`. The `public_url` was canonicalized during
+/// resolution, so parsing it here is idempotent — a failure would only mean the
+/// resolver changed, and the loopback template is a safe fallback for a print.
+fn mcp_http_workspace_url_path(config: &McpHttpServeConfig) -> String {
+    let base_path = match config {
+        McpHttpServeConfig::AuthDisabled { .. } => "/mcp".to_string(),
+        McpHttpServeConfig::Authenticated { public_url, .. } => {
+            CanonicalOauthUrl::parse(public_url).map_or_else(
+                |_| "/mcp".to_string(),
+                |base| WorkspaceMcpUrls::new(base).base_path().to_string(),
+            )
+        }
+    };
+    format!("{base_path}/workspace/{{workspace}}")
 }
 
 /// Installs the session policy each served surface enforces.
 ///
 /// The two policies differ by design. The gRPC API is private — reached through
 /// the public surfaces in front of it — so it admits a token minted for any of
-/// them; handing the settings back to the builder is what installs that policy,
-/// alongside the authorization server app startup builds from them. MCP HTTP is
-/// a public surface and admits only its own audience, which is what stops a
-/// token minted for a sibling surface being replayed at it.
+/// them (including every per-workspace MCP resource); handing the settings back
+/// to the builder is what installs that policy, alongside the authorization
+/// server app startup builds from them. MCP HTTP admits only the exact audience
+/// of the workspace URL a request arrives at, so its authenticator takes the
+/// expected audience per call — which is what stops a bearer minted for one
+/// workspace being replayed at another's URL.
 fn compose_session_policies(
     builder: ServerBuilder,
     session_auth: Option<SessionAuthSettings>,
     mcp_config: Option<&McpHttpServeConfig>,
-) -> (ServerBuilder, Option<Arc<dyn BearerAuthenticator>>) {
+) -> (ServerBuilder, Option<Arc<SessionPrincipalProvider>>) {
     let Some(session_auth) = session_auth else {
         return (builder, None);
     };
     let mcp_authenticator = match mcp_config {
-        Some(McpHttpServeConfig::Authenticated { public_url, .. }) => {
-            Some(session_auth.principal_provider([public_url.clone()])
-                as Arc<dyn BearerAuthenticator>)
+        Some(McpHttpServeConfig::Authenticated { .. }) => {
+            Some(session_auth.mcp_route_authenticator())
         }
         _ => None,
     };
@@ -298,7 +347,7 @@ async fn shutdown_components(
 
 async fn start_mcp_http(
     settings: Option<McpHttpServeConfig>,
-    mcp_principal_provider: Option<Arc<dyn BearerAuthenticator>>,
+    mcp_principal_provider: Option<Arc<SessionPrincipalProvider>>,
     grpc_addr: SocketAddr,
     mcp_options: McpOptions,
 ) -> Result<Option<RunningMcpHttpServer>, McpStartError> {
@@ -335,15 +384,20 @@ async fn start_mcp_http(
                 AuthenticatedMcpHttpConfig::new(bind_addr, public_url, authorization_server)?;
             let session_endpoint = grpc_endpoint_uri.clone();
             // One unauthenticated client, connected once and reused, drives every
-            // readiness probe; the gRPC health service answers without a bearer.
+            // readiness probe and nothing else. Deciding admission with it would
+            // list one deployment-wide set of workspaces for every caller, so the
+            // per-caller concealment admission exists to provide would be gone;
+            // the runtime's per-token client below is what admission reads.
             let readiness_client = AppClient::connect(&grpc_endpoint_uri).await?;
+            // The workspace comes from each request's URL, so no workspace is
+            // composed into the surface's options — and the bearer check takes
+            // the route's exact resource as the expected audience per call.
             let runtime = AuthenticatedMcpHttpRuntime::new(
-                move |token| {
+                move |token, audience| {
                     let authenticator = Arc::clone(&authenticator);
                     async move {
                         authenticator
-                            .principal_for_bearer(&token)
-                            .await
+                            .principal_for_bearer_with_audience(&token, &audience)
                             .map(|_principal| ())
                             .map_err(|_error| ())
                     }
@@ -377,6 +431,13 @@ async fn start_mcp_http(
 /// server-side instead whether this instance can reach the database it serves
 /// out of, under its readiness service name so the aggregate liveness check
 /// stays a constant.
+///
+/// Twin of `ReadinessProbe::from_app` in `coral-mcp/src/http.rs`, which maps
+/// server readiness onto `/readyz` for the loopback surface. The mapping — ready,
+/// not-ready as `Unavailable`, the status code otherwise — is duplicated on
+/// purpose: only the surface-specific reasoning around it differs, and no shared
+/// helper reconstructs workspace access for a caller. Change one mapping and the
+/// other needs the same change, or the two `/readyz` surfaces drift apart.
 async fn probe_serving_health(client: &AppClient) -> Result<(), Code> {
     match client.check_engine_ready().await {
         Ok(true) => Ok(()),
