@@ -13,15 +13,17 @@ use super::manager::{TaskManager, TaskManagerError};
 use super::store::{TaskCompletion, TaskOutcome as DomainTaskOutcome, TaskStart, TaskStoreError};
 use crate::bootstrap::app_status;
 use crate::transport::{grpc_span, instrument_grpc, request_context, workspace_name_from_proto};
+use crate::workspaces::authorization::{WorkspaceAction, WorkspaceAuthorizer};
 
 #[derive(Clone)]
 pub(crate) struct TaskService {
     task: TaskManager,
+    authorizer: WorkspaceAuthorizer,
 }
 
 impl TaskService {
-    pub(crate) fn new(task: TaskManager) -> Self {
-        Self { task }
+    pub(crate) const fn new(task: TaskManager, authorizer: WorkspaceAuthorizer) -> Self {
+        Self { task, authorizer }
     }
 }
 
@@ -34,9 +36,17 @@ impl TaskServiceApi for TaskService {
         let span = grpc_span(&request);
         let created_by = request_context(&request)?.principal().clone();
         let task = self.task.clone();
+        let authorizer = self.authorizer.clone();
         instrument_grpc(span, async move {
             let request = request.into_inner();
             let workspace = workspace_name_from_proto(request.workspace.as_ref())?;
+            // A task row is workspace-owned state, so a caller who may not
+            // reach the workspace must not create one — nor learn from a
+            // validation error that the workspace is there to create it in.
+            authorizer
+                .authorize(&created_by, &workspace, WorkspaceAction::Read)
+                .await
+                .map_err(app_status)?;
             let start = task
                 .start_task(workspace, created_by, request.intent)
                 .await
@@ -53,10 +63,16 @@ impl TaskServiceApi for TaskService {
         request: Request<EndTaskRequest>,
     ) -> Result<Response<EndTaskResponse>, Status> {
         let span = grpc_span(&request);
+        let principal = request_context(&request)?.principal().clone();
         let task = self.task.clone();
+        let authorizer = self.authorizer.clone();
         instrument_grpc(span, async move {
             let request = request.into_inner();
             let workspace = workspace_name_from_proto(request.workspace.as_ref())?;
+            authorizer
+                .authorize(&principal, &workspace, WorkspaceAction::Read)
+                .await
+                .map_err(app_status)?;
             let task_id = TaskId::parse(&request.task_id).map_err(app_status)?;
             let outcome = task_outcome_from_proto(request.task_status).map_err(app_status)?;
             let completion = task
@@ -138,16 +154,31 @@ mod tests {
     use tonic::{Code, Request};
 
     use super::{TaskService, TaskServiceApi};
-    use crate::identity::{Principal, PrincipalKind};
+    use crate::identity::Principal;
     use crate::request_context::RequestContext;
     use crate::state::db::{CoralDb, DatabaseConfig, ResolvedDatabaseConfig, run_state_migrations};
     use crate::state::{AppStateLayout, ConfigStore};
     use crate::task::manager::TaskManager;
     use crate::task::store::TaskStore;
+    use crate::test_support::seed_principal;
+    use crate::workspaces::authorization::WorkspaceAuthorizer;
+    use crate::workspaces::{MemberRole, WorkspaceName};
+
+    /// This suite's login issuer. Each suite provisions under its own, so a
+    /// subject seeded here is a different person from the same subject
+    /// seeded elsewhere.
+    const ISSUER: &str = "https://issuer.test/task-authorization";
 
     const UNKNOWN_TASK_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     async fn service() -> (TempDir, TaskService) {
+        let (dir, db) = task_database().await;
+        let task = TaskManager::new(TaskStore::new(Arc::clone(&db)));
+        let service = TaskService::new(task, WorkspaceAuthorizer::trusting_local_principal(db));
+        (dir, service)
+    }
+
+    async fn task_database() -> (TempDir, Arc<CoralDb>) {
         let dir = TempDir::new().expect("temp dir");
         let layout = AppStateLayout::discover(Some(dir.path().join("coral-config")))
             .expect("layout should resolve");
@@ -165,9 +196,7 @@ mod tests {
         run_state_migrations(&db, &config_store, &layout)
             .await
             .expect("import default workspace");
-        let task = TaskManager::new(TaskStore::new(db));
-        let service = TaskService::new(task);
-        (dir, service)
+        (dir, db)
     }
 
     fn workspace(name: &str) -> Workspace {
@@ -205,11 +234,18 @@ mod tests {
         uuid::Uuid::parse_str(&task.task_id).expect("task id is a UUID");
     }
 
+    /// The lifecycle runs under a real workspace membership rather than the
+    /// built-in local principal, so it also stands as the member half of the
+    /// read-access rule these RPCs answer to.
     #[tokio::test]
     async fn end_task_returns_success_status() {
-        let (_dir, service) = service().await;
-        let principal = Principal::parse("product:principal:saul", PrincipalKind::User)
-            .expect("user principal");
+        let (_dir, db) = task_database().await;
+        let _owner = seed_principal(&db, ISSUER, "owner", Some(MemberRole::Owner)).await;
+        let principal = seed_principal(&db, ISSUER, "member", Some(MemberRole::Member)).await;
+        let service = TaskService::new(
+            TaskManager::new(TaskStore::new(Arc::clone(&db))),
+            WorkspaceAuthorizer::new(db),
+        );
 
         let task = service
             .start_task(request_for_principal(
@@ -231,7 +267,7 @@ mod tests {
                     task_id: task.task_id.clone(),
                     task_status: TaskStatus::Success as i32,
                 },
-                principal,
+                principal.clone(),
             ))
             .await
             .expect("end task")
@@ -242,11 +278,14 @@ mod tests {
         assert_eq!(task_end.task_status, TaskStatus::Success as i32);
 
         let status = service
-            .end_task(request(EndTaskRequest {
-                workspace: Some(workspace("default")),
-                task_id: task.task_id,
-                task_status: TaskStatus::Failure as i32,
-            }))
+            .end_task(request_for_principal(
+                EndTaskRequest {
+                    workspace: Some(workspace("default")),
+                    task_id: task.task_id,
+                    task_status: TaskStatus::Failure as i32,
+                },
+                principal,
+            ))
             .await
             .expect_err("terminal task must not change status");
         assert_eq!(status.code(), Code::FailedPrecondition);
@@ -312,6 +351,73 @@ mod tests {
             .expect_err("malformed task id must be rejected");
 
         assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    /// Task rows are workspace-owned state, so a caller who may not reach the
+    /// workspace neither creates one nor ends one. The blank intent and the
+    /// malformed task id are the probe: reaching the task work at all would
+    /// answer `InvalidArgument` instead of the ordinary workspace miss.
+    #[tokio::test]
+    async fn task_lifecycle_deny_before_read_work_changes_no_task() {
+        let (_dir, db) = task_database().await;
+        let tasks = TaskManager::new(TaskStore::new(Arc::clone(&db)));
+        // The workspace needs an owner before any membership in it grants
+        // anything, so one is seeded beside the member under test.
+        let _owner = seed_principal(&db, ISSUER, "owner", Some(MemberRole::Owner)).await;
+        let member = seed_principal(&db, ISSUER, "member", Some(MemberRole::Member)).await;
+        let outsider = seed_principal(&db, ISSUER, "outsider", None).await;
+        let service = TaskService::new(tasks.clone(), WorkspaceAuthorizer::new(db));
+        let active = service
+            .start_task(request_for_principal(
+                StartTaskRequest {
+                    workspace: Some(workspace("default")),
+                    intent: "Find renewal risk".to_string(),
+                },
+                member.clone(),
+            ))
+            .await
+            .expect("a member starts a task")
+            .into_inner()
+            .task
+            .expect("task");
+        let task_id = crate::task::id::TaskId::parse(&active.task_id).expect("task id");
+
+        for (name, blank_intent) in [("default", " "), ("absent", " ")] {
+            let status = service
+                .start_task(request_for_principal(
+                    StartTaskRequest {
+                        workspace: Some(workspace(name)),
+                        intent: blank_intent.to_string(),
+                    },
+                    outsider.clone(),
+                ))
+                .await
+                .expect_err("a non-member starts nothing");
+            assert_eq!(status.code(), Code::NotFound);
+        }
+        for task in [active.task_id.as_str(), "not-a-uuid"] {
+            let status = service
+                .end_task(request_for_principal(
+                    EndTaskRequest {
+                        workspace: Some(workspace("default")),
+                        task_id: task.to_string(),
+                        task_status: TaskStatus::Success as i32,
+                    },
+                    outsider.clone(),
+                ))
+                .await
+                .expect_err("a non-member ends nothing");
+            assert_eq!(status.code(), Code::NotFound);
+        }
+
+        assert_eq!(
+            tasks
+                .validate_attribution(&WorkspaceName::default(), Some(task_id))
+                .await
+                .expect("the task is untouched"),
+            Some(task_id),
+            "the denied EndTask must leave the task active"
+        );
     }
 
     #[tokio::test]

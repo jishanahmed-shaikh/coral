@@ -42,6 +42,7 @@
 )]
 
 mod auth;
+mod authorization_matrix;
 /// Bootstrap entrypoints and local server assembly.
 pub mod bootstrap;
 mod catalog;
@@ -67,6 +68,8 @@ mod task;
 pub mod telemetry;
 #[cfg(feature = "test-session-tokens")]
 pub mod test_session_tokens;
+#[cfg(test)]
+mod test_support;
 mod transport;
 mod users;
 mod workspaces;

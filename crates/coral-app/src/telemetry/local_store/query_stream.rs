@@ -11,8 +11,8 @@ use classification::{
 };
 
 use super::{
-    StoredTraceOperationKind, StoredTraceStatus, TraceListSpanRecord, TraceSpanRecord, TraceStore,
-    TraceStoreError, TraceSummaryRecord, attr_string, attr_u64, parse_attributes,
+    StoredTraceOperationKind, StoredTraceStatus, TraceListSpanRecord, TraceScope, TraceSpanRecord,
+    TraceStore, TraceStoreError, TraceSummaryRecord, attr_string, attr_u64, parse_attributes,
     read_list_spans_file, status_from_attributes, usize_to_u32,
 };
 use coral_telemetry::WORKSPACE_SPAN_ATTRIBUTE;
@@ -23,8 +23,11 @@ pub(super) fn list(
     store: &TraceStore,
     limit: usize,
     offset: usize,
-    workspace_name: Option<&str>,
+    scope: &TraceScope,
 ) -> Result<Vec<TraceSummaryRecord>, TraceStoreError> {
+    if scope.admits_nothing() {
+        return Ok(Vec::new());
+    }
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -32,7 +35,7 @@ pub(super) fn list(
     store.prune_expired()?;
     let files = store.jsonl_files_by_modified()?;
     let required_entry_count = offset.saturating_add(limit);
-    let mut projector = QueryStreamProjector::new(required_entry_count, workspace_name);
+    let mut projector = QueryStreamProjector::new(required_entry_count, scope);
     let mut scanned_all_files = true;
     let mut remaining_files = files.as_slice();
     while let Some(newest_bucket_file) = remaining_files.last() {
@@ -84,14 +87,11 @@ fn sort_and_deduplicate_query_stream_summaries(summaries: &mut Vec<TraceSummaryR
     summaries.retain(|summary| seen_trace_ids.insert(summary.trace_id.clone()));
 }
 
-pub(super) fn summary(
-    spans: &[TraceSpanRecord],
-    workspace_name: Option<&str>,
-) -> Option<TraceSummaryRecord> {
-    summaries(spans, workspace_name).into_iter().next()
+pub(super) fn summary(spans: &[TraceSpanRecord], scope: &TraceScope) -> Option<TraceSummaryRecord> {
+    summaries(spans, scope).into_iter().next()
 }
 
-fn summaries(spans: &[TraceSpanRecord], workspace_name: Option<&str>) -> Vec<TraceSummaryRecord> {
+fn summaries(spans: &[TraceSpanRecord], scope: &TraceScope) -> Vec<TraceSummaryRecord> {
     let records = spans
         .iter()
         .map(|span| TraceListSpanRecord {
@@ -107,7 +107,7 @@ fn summaries(spans: &[TraceSpanRecord], workspace_name: Option<&str>) -> Vec<Tra
         })
         .collect::<Vec<_>>();
     let required_entry_count = records.len();
-    let mut projector = QueryStreamProjector::new(required_entry_count, workspace_name);
+    let mut projector = QueryStreamProjector::new(required_entry_count, scope);
     projector.record_file(records);
     projector.finish();
     projector.into_page(0, required_entry_count)
@@ -254,9 +254,25 @@ impl StreamingQueryStreamAggregate {
         }
     }
 
-    fn record_span(&mut self, span: &ProjectedQueryStreamSpan, depth: usize) {
-        self.span_count = self.span_count.saturating_add(1);
+    fn record_span(&mut self, span: &ProjectedQueryStreamSpan, depth: usize, scope: &TraceScope) {
+        // Evidence is recorded for every span, including excluded ones: a
+        // second workspace is what makes the evidence a `Conflict`, and that
+        // conclusion is only reachable by seeing the span that conflicts.
         self.workspace_evidence.record(span.workspace.as_deref());
+
+        // Everything below is what the caller is told about this operation —
+        // the count that reports a span existed at all, the operation this
+        // summary names, and the query text it carries. A span positively
+        // attributed to a workspace this scope excludes contributes none of
+        // it, or an operation admitted by its own root would report a
+        // descendant's SQL and count the span that carried it. A span with no
+        // workspace of its own is not excluded: it belongs to whatever
+        // operation owns it.
+        if !scope.may_admit(span.workspace.as_deref()) {
+            return;
+        }
+        self.span_count = self.span_count.saturating_add(1);
+
         let Some(metadata) = span.metadata.as_ref() else {
             return;
         };
@@ -304,11 +320,8 @@ impl StreamingQueryStreamAggregate {
             .or_else(|| self.workspace_evidence.unique())
     }
 
-    fn may_match_workspace(&self, workspace_name: Option<&str>) -> bool {
-        workspace_name.is_none_or(|workspace_name| {
-            self.workspace()
-                .is_none_or(|operation_workspace| operation_workspace == workspace_name)
-        })
+    fn may_be_in_scope(&self, scope: &TraceScope) -> bool {
+        scope.may_admit(self.workspace())
     }
 
     fn into_summary(self) -> TraceSummaryRecord {
@@ -361,7 +374,7 @@ impl StreamingQueryStreamAggregate {
 /// that would later need to be replaced by its outer operation.
 struct QueryStreamProjector {
     required_entry_count: usize,
-    workspace_name: Option<String>,
+    scope: TraceScope,
     nodes: HashMap<QueryStreamSpanKey, QueryStreamNodeState>,
     node_starts: BTreeMap<i64, Vec<QueryStreamSpanKey>>,
     aggregates: HashMap<u64, StreamingQueryStreamAggregate>,
@@ -371,10 +384,10 @@ struct QueryStreamProjector {
 }
 
 impl QueryStreamProjector {
-    fn new(required_entry_count: usize, workspace_name: Option<&str>) -> Self {
+    fn new(required_entry_count: usize, scope: &TraceScope) -> Self {
         Self {
             required_entry_count,
-            workspace_name: workspace_name.map(str::to_string),
+            scope: scope.clone(),
             nodes: HashMap::new(),
             node_starts: BTreeMap::new(),
             aggregates: HashMap::new(),
@@ -479,10 +492,11 @@ impl QueryStreamProjector {
             .or_default()
             .push(key.clone());
         self.nodes.insert(key, node);
-        if let Some((owner, depth)) = owner.zip(owner_depth)
-            && let Some(aggregate) = self.aggregates.get_mut(&owner)
-        {
-            aggregate.record_span(span, depth);
+        if let Some((owner, depth)) = owner.zip(owner_depth) {
+            let scope = &self.scope;
+            if let Some(aggregate) = self.aggregates.get_mut(&owner) {
+                aggregate.record_span(span, depth, scope);
+            }
         }
     }
 
@@ -511,11 +525,7 @@ impl QueryStreamProjector {
         let Some(aggregate) = self.aggregates.remove(&operation_id) else {
             return;
         };
-        if self
-            .workspace_name
-            .as_deref()
-            .is_none_or(|workspace_name| aggregate.workspace() == Some(workspace_name))
-        {
+        if self.scope.admits(aggregate.workspace()) {
             self.finalized.push(aggregate.into_summary());
         }
     }
@@ -536,7 +546,7 @@ impl QueryStreamProjector {
             && self
                 .aggregates
                 .values()
-                .filter(|aggregate| aggregate.may_match_workspace(self.workspace_name.as_deref()))
+                .filter(|aggregate| aggregate.may_be_in_scope(&self.scope))
                 .all(|aggregate| aggregate.entry.end_time_unix_nanos < boundary.end_time_unix_nanos)
     }
 

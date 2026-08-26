@@ -460,3 +460,55 @@ fn tool_operation_name_policy_bounds_identifiers() {
         UNKNOWN_TOOL_OPERATION_NAME
     );
 }
+
+/// An operation admitted by its own root must not carry a descendant's query
+/// text across a workspace boundary.
+///
+/// The root settles which workspace the operation belongs to, so alpha's owner
+/// is entitled to the operation itself. The text is a separate question: a
+/// descendant attributed to beta carries beta's SQL, and enriching alpha's
+/// summary with it would hand beta's query text to a caller who may not read
+/// beta at all.
+#[test]
+fn query_stream_summary_never_enriches_across_a_workspace_boundary() {
+    let alpha_root = span("mixed-stream", "alpha-root")
+        .named("coral.mcp.call_tool")
+        .remote_root()
+        .entry("tool", "sql", "alpha")
+        .attrs(json!({"mcp.method": "tools/call", "mcp.tool.name": "sql"}))
+        .times(10, 40)
+        .build();
+    // Attributed to beta and carrying beta's SQL, but owned by alpha's root.
+    let beta_child = span("mixed-stream", "beta-child")
+        .child_of(&alpha_root)
+        .entry("query", "sql", "beta")
+        .attrs(json!({"sql": "SELECT beta_secret", "row_count": 3}))
+        .times(20, 30)
+        .build();
+
+    let records = [alpha_root, beta_child];
+
+    let alpha = project(&records, Some("alpha"));
+    let summary = alpha
+        .first()
+        .expect("alpha owns the operation its root began");
+    // Asserted as an absence rather than "not beta's text": a projection that
+    // mangled the leak instead of withholding it would satisfy the weaker
+    // claim. Alpha's root carries no query text of its own, so the only
+    // correct summary carries none.
+    assert!(
+        summary.query.is_empty(),
+        "alpha's root carries no query text of its own, so its summary must carry none: {:?}",
+        summary.query,
+    );
+    assert_eq!(
+        summary.span_count, 1,
+        "beta's span must not be counted into an alpha-scoped summary either"
+    );
+
+    // The host reads across workspaces, so the enrichment it sees is the proof
+    // that the text was withheld above rather than never recorded at all.
+    let host = project(&records, None);
+    let host_summary = host.first().expect("the host reads the same operation");
+    assert_eq!(host_summary.query, "SELECT beta_secret");
+}

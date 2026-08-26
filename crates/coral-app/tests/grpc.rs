@@ -14,6 +14,10 @@ mod function_lifecycle_tests;
 #[path = "grpc/gui_onboarding_tests.rs"]
 mod gui_onboarding_tests;
 #[path = "grpc/harness.rs"]
+#[expect(
+    dead_code,
+    reason = "The shared harness serves several integration binaries; this one does not dial the services that need a raw credential."
+)]
 mod harness;
 #[path = "grpc/health_service_tests.rs"]
 mod health_service_tests;
@@ -29,5 +33,7 @@ mod server_lifecycle_tests;
 mod session_auth;
 #[path = "grpc/source_lifecycle_tests.rs"]
 mod source_lifecycle_tests;
+#[path = "grpc/workspace_access_read_tests.rs"]
+mod workspace_access_read_tests;
 #[path = "grpc/workspace_lifecycle_tests.rs"]
 mod workspace_lifecycle_tests;

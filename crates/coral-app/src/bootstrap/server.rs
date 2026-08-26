@@ -447,8 +447,12 @@ impl ServerBuilder {
             CatalogDiscovery::new(query_manager.clone()),
             workspace_lifecycle_lock,
         );
-        let trace_components = trace_components_for_store(active_trace_store);
         let workspace_authorizer = deployment_authorizer(&coral_db, local_principal);
+        let trace_components = trace_components_for_store(
+            active_trace_store,
+            workspace_manager.clone(),
+            workspace_authorizer.clone(),
+        );
         let mut server = start_server(
             ServerDependencies {
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&coral_db)),
@@ -552,14 +556,17 @@ fn init_server_telemetry(
 
 fn trace_components_for_store(
     active_trace_store: Option<crate::telemetry::InstalledLocalTraceStore>,
+    workspaces: WorkspaceManager,
+    workspace_authorizer: WorkspaceAuthorizer,
 ) -> TraceServerComponents {
     active_trace_store.map_or_else(TraceServerComponents::default, |store| {
         TraceServerComponents {
             local_trace_store_dir: Some(store.dir.clone()),
-            service: Some(TraceService::new(TraceManager::new(
-                store.dir,
-                store.retention,
-            ))),
+            service: Some(TraceService::new(
+                TraceManager::new(store.dir, store.retention),
+                workspaces,
+                workspace_authorizer,
+            )),
         }
     })
 }
@@ -776,16 +783,24 @@ fn application_routes(
         None => (source, query),
     };
     let health_queries = query.clone();
-    let source_service = SourceService::new(source, query.clone(), workspace.clone());
-    let workspace_service = WorkspaceService::new(workspace, workspace_authorizer);
+    let source_service = SourceService::new(
+        source,
+        query.clone(),
+        workspace.clone(),
+        workspace_authorizer.clone(),
+    );
+    let workspace_service = WorkspaceService::new(workspace, workspace_authorizer.clone());
     let user_service = UserService::new(users);
-    let catalog_service = CatalogService::new(query.clone(), task.clone());
-    let function_service = FunctionService::new(query.clone());
-    let query_service = QueryService::new(query, task.clone());
-    let search_service = SearchService::new(search, task.clone());
-    let feedback_service = FeedbackService::new(feedback, task.clone());
-    let feature_service = FeatureService::new(feature_store, active_features);
-    let task_service = TaskService::new(task);
+    let catalog_service =
+        CatalogService::new(query.clone(), task.clone(), workspace_authorizer.clone());
+    let function_service = FunctionService::new(query.clone(), workspace_authorizer.clone());
+    let query_service = QueryService::new(query, task.clone(), workspace_authorizer.clone());
+    let search_service = SearchService::new(search, task.clone(), workspace_authorizer.clone());
+    let feedback_service =
+        FeedbackService::new(feedback, task.clone(), workspace_authorizer.clone());
+    let feature_service =
+        FeatureService::new(feature_store, active_features, workspace_authorizer.clone());
+    let task_service = TaskService::new(task, workspace_authorizer);
     let gui_onboarding_service = GuiOnboardingService::new(gui_onboarding);
     let mut routes = Routes::default()
         .add_service(GuiOnboardingServiceServer::new(gui_onboarding_service))
@@ -1034,6 +1049,12 @@ enabled = false
 
     fn test_user_manager(db: &Arc<CoralDb>) -> UserManager {
         UserManager::new(Arc::clone(db), WorkspaceAuthorizer::new(Arc::clone(db)))
+    }
+
+    /// The policy these fixtures run under: they serve `LocalPrincipalProvider`,
+    /// which only a single-user deployment admits.
+    fn local_authorizer(db: &Arc<CoralDb>) -> WorkspaceAuthorizer {
+        WorkspaceAuthorizer::trusting_local_principal(Arc::clone(db))
     }
 
     #[tokio::test]
@@ -1823,17 +1844,18 @@ backend = "unsupported"
             CatalogDiscovery::new(query_manager.clone()),
             lifecycle_lock,
         );
-        let trace_service = TraceService::new(TraceManager::new(
-            temp.path().join("trace-store"),
-            Duration::from_mins(1),
-        ));
+        let trace_service = TraceService::new(
+            TraceManager::new(temp.path().join("trace-store"), Duration::from_mins(1)),
+            workspace_manager.clone(),
+            local_authorizer(&db),
+        );
         let server = start_server(
             ServerDependencies {
                 gui_onboarding: GuiOnboardingManager::new(Arc::clone(&db)),
                 source: source_manager,
                 workspace: workspace_manager,
                 users: test_user_manager(&db),
-                workspace_authorizer: WorkspaceAuthorizer::new(Arc::clone(&db)),
+                workspace_authorizer: local_authorizer(&db),
                 query: query_manager,
                 search: search_manager,
                 search_observations: Some(search_observations),
@@ -1992,7 +2014,7 @@ backend = "unsupported"
                 source: source_manager,
                 workspace: workspace_manager,
                 users: test_user_manager(&db),
-                workspace_authorizer: WorkspaceAuthorizer::new(Arc::clone(&db)),
+                workspace_authorizer: local_authorizer(&db),
                 query: query_manager,
                 search: search_manager,
                 search_observations: Some(search_observations),
@@ -2126,7 +2148,7 @@ tables:
                 source: source_manager,
                 workspace: workspace_manager,
                 users: test_user_manager(&db),
-                workspace_authorizer: WorkspaceAuthorizer::new(Arc::clone(&db)),
+                workspace_authorizer: local_authorizer(&db),
                 query: query_manager,
                 search: search_manager,
                 search_observations: Some(search_observations),
@@ -2260,7 +2282,7 @@ tables:
                 source: source_manager,
                 workspace: workspace_manager,
                 users: test_user_manager(&db),
-                workspace_authorizer: WorkspaceAuthorizer::new(Arc::clone(&db)),
+                workspace_authorizer: local_authorizer(&db),
                 query: query_manager,
                 search: search_manager,
                 search_observations: Some(search_observations),

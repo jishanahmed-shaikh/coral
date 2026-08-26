@@ -18,18 +18,6 @@ use crate::workspaces::{MemberRole, WorkspaceName};
 /// reach it. Every RPC classifies into one of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkspaceAction {
-    /// Every workspace-scoped RPC that exists today manages, so only
-    /// [`MemberRole::allows`] and its tests name this arm so far. The read
-    /// paths that classify into it arrive with the read-path authorization
-    /// work; the arm is declared here because the role table it feeds is
-    /// already complete.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the read paths that classify into it land after the manage RPCs"
-        )
-    )]
     Read,
     Manage,
 }
@@ -142,9 +130,12 @@ impl WorkspaceAuthorizer {
         }
 
         // The control-plane restriction is evaluated before any role, so a
-        // workspace role can never promote an agent credential: the same
-        // person's browser token manages the workspace and their MCP token
-        // does not.
+        // workspace role can never promote an agent credential. No issuance
+        // path a running server exposes mints one yet — the login token
+        // endpoint hard-codes the user kind, so an MCP client's token carries
+        // the signed-in person's full authority and never trips this gate.
+        // It is the enforcement agent-issued credentials land on once the
+        // server can mint them.
         if principal.kind() == PrincipalKind::Agent && action == WorkspaceAction::Manage {
             return Err(AppError::PermissionDenied(format!(
                 "agent credentials cannot manage workspace '{workspace}'"
@@ -193,6 +184,29 @@ impl WorkspaceAuthorizer {
     /// deployment that does not admit it.
     pub(crate) fn admit(&self, principal: &Principal) -> Result<(), AppError> {
         self.decide_for_local_principal(principal).unwrap_or(Ok(()))
+    }
+
+    /// Decides whether `principal` may reach host-global state.
+    ///
+    /// Host-global state configures the machine this server runs on rather
+    /// than any one workspace, so there is no workspace whose role could
+    /// entitle a caller to it and a shared deployment has no superuser to
+    /// entrust it to. Only the built-in local principal reaches it, and — as
+    /// everywhere else here — only where the deployment admits that principal
+    /// at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::PermissionDenied`] for every caller but the
+    /// built-in local principal, and for that principal on a deployment that
+    /// does not admit it.
+    pub(crate) fn authorize_host_global(&self, principal: &Principal) -> Result<(), AppError> {
+        if !principal.is_local() {
+            return Err(AppError::PermissionDenied(
+                "host-global state is configured on the host that runs this server".to_string(),
+            ));
+        }
+        self.admit(principal)
     }
 
     /// Decides whether `principal` may create a workspace at all.
@@ -384,6 +398,40 @@ mod tests {
             ),
             "the deployment decision still comes first"
         );
+    }
+
+    /// Host-global state is the one decision with neither a workspace nor a
+    /// role behind it, so the unmigrated database proves the same thing here
+    /// as above: the answer is reached without a membership row existing
+    /// anywhere to reach it from.
+    #[tokio::test]
+    async fn host_global_state_reaches_only_a_local_principal_the_deployment_admits() {
+        let (_temp, db) = unmigrated_database().await;
+        let someone = Principal::parse("someone", PrincipalKind::User).expect("user");
+
+        WorkspaceAuthorizer::trusting_local_principal(Arc::clone(&db))
+            .authorize_host_global(&Principal::local())
+            .expect("the deployment that admits the local principal admits it to host state");
+        assert!(
+            matches!(
+                WorkspaceAuthorizer::new(Arc::clone(&db))
+                    .authorize_host_global(&Principal::local()),
+                Err(AppError::PermissionDenied(_))
+            ),
+            "a shared deployment has no superuser, not even the built-in one"
+        );
+        for authorizer in [
+            WorkspaceAuthorizer::trusting_local_principal(Arc::clone(&db)),
+            WorkspaceAuthorizer::new(db),
+        ] {
+            assert!(
+                matches!(
+                    authorizer.authorize_host_global(&someone),
+                    Err(AppError::PermissionDenied(_))
+                ),
+                "no workspace role can entitle a federated caller to host state"
+            );
+        }
     }
 
     /// The directory returns the same identities the roster does, and the
