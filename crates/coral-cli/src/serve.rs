@@ -13,7 +13,7 @@ use coral_client::{
     },
 };
 use coral_mcp::{
-    McpOptions,
+    McpOptions, McpSurfaceProvider, McpSurfaceProviderError,
     http::{
         AuthenticatedMcpHttpConfig, AuthenticatedMcpHttpRuntime, McpHttpConfig, McpHttpError,
         RunningMcpHttpServer, start_auth_disabled, start_authenticated,
@@ -112,6 +112,8 @@ enum McpStartError {
     UnsafeGrpcAddress(SocketAddr),
     #[error("authenticated MCP HTTP requires a session authenticator")]
     MissingSessionProvider,
+    #[error("failed to build MCP surface: {0}")]
+    SurfaceProvider(#[source] McpSurfaceProviderError),
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error(transparent)]
@@ -175,7 +177,8 @@ impl RunningServer {
 /// enforces, happens here — where the transports' lifecycles are already owned.
 pub(crate) async fn start(
     builder: ServerBuilder,
-    mcp_options: McpOptions,
+    mut mcp_options: McpOptions,
+    mcp_surface_provider: Option<Arc<dyn McpSurfaceProvider>>,
 ) -> Result<RunningServer, ServeError> {
     let mut settings = builder
         .serve_settings()
@@ -185,6 +188,15 @@ pub(crate) async fn start(
     let grpc_authentication_enabled = session_auth.is_some();
     let mcp_http_authentication_enabled =
         matches!(mcp_config, Some(McpHttpServeConfig::Authenticated { .. }));
+    if mcp_config.is_some()
+        && let Some(provider) = mcp_surface_provider
+    {
+        mcp_options.surface = provider.surface().map_err(|error| {
+            ServeError(ServeErrorKind::McpStart(McpStartError::SurfaceProvider(
+                error,
+            )))
+        })?;
+    }
     let (builder, mcp_principal_provider) =
         compose_session_policies(builder, session_auth.as_ref(), mcp_config.as_ref());
     // Built after the providers, which only borrow the settings; this consumes them.
@@ -211,17 +223,23 @@ pub(crate) async fn start(
             return Err(ServeError(error));
         }
     };
-    let mcp_http =
-        match start_mcp_http(mcp_config, mcp_principal_provider, grpc_addr, mcp_options).await {
-            Ok(server) => server,
-            Err(mcp) => {
-                let error = match shutdown_components(grpc, oauth, None).await {
-                    Ok(()) => ServeErrorKind::McpStart(mcp),
-                    Err(cleanup) => ServeErrorKind::McpStartCleanup { mcp, cleanup },
-                };
-                return Err(ServeError(error));
-            }
-        };
+    let mcp_http = match Box::pin(start_mcp_http(
+        mcp_config,
+        mcp_principal_provider,
+        grpc_addr,
+        mcp_options,
+    ))
+    .await
+    {
+        Ok(server) => server,
+        Err(mcp) => {
+            let error = match shutdown_components(grpc, oauth, None).await {
+                Ok(()) => ServeErrorKind::McpStart(mcp),
+                Err(cleanup) => ServeErrorKind::McpStartCleanup { mcp, cleanup },
+            };
+            return Err(ServeError(error));
+        }
+    };
     Ok(RunningServer {
         grpc,
         oauth,

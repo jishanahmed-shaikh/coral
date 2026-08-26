@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{
     Arg, ArgAction, ArgGroup, ArgMatches, Args, CommandFactory, Error as ClapError, FromArgMatches,
@@ -35,12 +36,13 @@ use coral_api::v1::{
     SearchProvider, SearchRequest, Workspace, function, search_clear_target,
     search_maintenance_result,
 };
-use coral_app::bootstrap::is_loopback_ip;
+use coral_app::{EngineExtensionsProvider, bootstrap::is_loopback_ip};
 use coral_client::{
     AppClient, DEFAULT_WORKSPACE_ID, decode_execute_sql_response, format_batches_json,
     format_batches_table, format_search_response_json, format_search_response_text,
     manifest_input_from_proto, workspace as workspace_resource,
 };
+use coral_mcp::{McpSurface, McpSurfaceProvider};
 use dialoguer::console::measure_text_width;
 use tonic::Request;
 
@@ -606,6 +608,43 @@ where
 /// Returns an error if runtime startup, command execution, or output
 /// formatting fails.
 pub async fn run_from_env() -> Result<(), CliError> {
+    Box::pin(run_from_env_with_extensions(CoralExtensions::default())).await
+}
+
+/// Typed extensions supplied by a sibling Coral host binary.
+#[derive(Default)]
+pub struct CoralExtensions {
+    engine_providers: Vec<Arc<dyn EngineExtensionsProvider>>,
+    mcp_surface_provider: Option<Arc<dyn McpSurfaceProvider>>,
+}
+
+impl CoralExtensions {
+    /// Adds an app-owned engine extension provider.
+    #[must_use]
+    pub fn add_engine_extensions_provider(
+        mut self,
+        provider: Arc<dyn EngineExtensionsProvider>,
+    ) -> Self {
+        self.engine_providers.push(provider);
+        self
+    }
+
+    /// Sets the host-owned MCP surface provider.
+    #[must_use]
+    pub fn with_mcp_surface_provider(mut self, provider: Arc<dyn McpSurfaceProvider>) -> Self {
+        self.mcp_surface_provider = Some(provider);
+        self
+    }
+}
+
+/// Parses CLI arguments and runs the selected command with host-supplied
+/// Coral extensions.
+///
+/// # Errors
+///
+/// Returns an error if runtime startup, command execution, or output
+/// formatting fails.
+pub async fn run_from_env_with_extensions(extensions: CoralExtensions) -> Result<(), CliError> {
     let Cli {
         feature_overrides,
         workspace_selection,
@@ -617,6 +656,10 @@ pub async fn run_from_env() -> Result<(), CliError> {
     let ctx = coral_app::RunContext {
         trace_parent: env::trace_parent(),
     };
+    let CoralExtensions {
+        engine_providers,
+        mcp_surface_provider,
+    } = extensions;
 
     match command.required_runtime() {
         RequiredRuntime::AppClient => {
@@ -626,15 +669,26 @@ pub async fn run_from_env() -> Result<(), CliError> {
                 workspace_resource(DEFAULT_WORKSPACE_ID)
             };
             let is_mcp_stdio = matches!(&command, Command::McpStdio(_));
-            let bootstrap = bootstrap::bootstrap(bootstrap::BootstrapOptions {
-                enable_stderr_logs: command.enables_stderr_logs(),
-                feature_overrides: feature_overrides.clone(),
-            })
+            let bootstrap = bootstrap::bootstrap(
+                bootstrap::BootstrapOptions {
+                    enable_stderr_logs: command.enables_stderr_logs(),
+                    feature_overrides: feature_overrides.clone(),
+                },
+                engine_providers,
+            )
             .await
             .map_err(anyhow::Error::from)?;
             let app = bootstrap.app.clone();
             let result = if is_mcp_stdio {
-                run_app_command(app, command, Some(&ctx), &feature_overrides, &workspace).await
+                run_app_command(
+                    app,
+                    command,
+                    Some(&ctx),
+                    &feature_overrides,
+                    &workspace,
+                    mcp_surface_provider.as_deref(),
+                )
+                .await
             } else {
                 coral_app::run_with_context(
                     &ctx,
@@ -644,6 +698,7 @@ pub async fn run_from_env() -> Result<(), CliError> {
                         None,
                         &feature_overrides,
                         &workspace,
+                        mcp_surface_provider.as_deref(),
                     )),
                 )
                 .await
@@ -654,7 +709,14 @@ pub async fn run_from_env() -> Result<(), CliError> {
         RequiredRuntime::None => {
             coral_app::run_with_context(
                 &ctx,
-                Box::pin(run_no_runtime_command(command, &feature_overrides)),
+                Box::pin(run_no_runtime_command(
+                    command,
+                    &feature_overrides,
+                    CoralExtensions {
+                        engine_providers,
+                        mcp_surface_provider,
+                    },
+                )),
             )
             .await
         }
@@ -673,8 +735,14 @@ fn selected_workspace_name(cli_workspace: Option<String>, env_workspace: Option<
 
 async fn run_server(
     feature_overrides: coral_app::features::FeatureOverrides,
+    extensions: CoralExtensions,
 ) -> Result<(), anyhow::Error> {
-    let server = bootstrap::start_standalone_server(feature_overrides).await?;
+    let server = bootstrap::start_standalone_server(
+        feature_overrides,
+        extensions.engine_providers,
+        extensions.mcp_surface_provider,
+    )
+    .await?;
     let endpoint = server.endpoint_uri().to_string();
 
     // An endpoint that does not parse back to an address is treated as exposed:
@@ -819,6 +887,7 @@ async fn wait_for_server_shutdown_signal() -> Result<(), std::io::Error> {
 async fn run_no_runtime_command(
     command: Command,
     feature_overrides: &coral_app::features::FeatureOverrides,
+    extensions: CoralExtensions,
 ) -> Result<(), CliError> {
     match command {
         Command::Completion(args) => {
@@ -828,7 +897,7 @@ async fn run_no_runtime_command(
             Ok(())
         }
         Command::Features(args) => run_features(args, feature_overrides).map_err(Into::into),
-        Command::Server => Box::pin(run_server(feature_overrides.clone()))
+        Command::Server => Box::pin(run_server(feature_overrides.clone(), extensions))
             .await
             .map_err(Into::into),
         Command::Sql(_)
@@ -850,6 +919,7 @@ async fn run_app_command(
     ctx: Option<&coral_app::RunContext>,
     feature_overrides: &coral_app::features::FeatureOverrides,
     workspace: &Workspace,
+    mcp_surface_provider: Option<&dyn McpSurfaceProvider>,
 ) -> Result<(), CliError> {
     match command {
         Command::Sql(args) => {
@@ -931,6 +1001,10 @@ async fn run_app_command(
                     source_names,
                     query_examples,
                     workspace: Some(workspace.clone()),
+                    surface: match mcp_surface_provider {
+                        Some(provider) => provider.surface().map_err(anyhow::Error::from_boxed)?,
+                        None => McpSurface::default(),
+                    },
                 },
             ))
             .await

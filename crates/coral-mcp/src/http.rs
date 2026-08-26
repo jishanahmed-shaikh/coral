@@ -519,6 +519,9 @@ fn is_loopback(ip: IpAddr) -> bool {
 /// MCP HTTP startup or shutdown failure.
 #[derive(Debug, thiserror::Error)]
 pub enum McpHttpError {
+    /// Static MCP extension composition was invalid.
+    #[error(transparent)]
+    Surface(#[from] crate::McpSurfaceError),
     /// Auth-disabled serving is restricted to the local machine unless the
     /// operator consented via [`McpHttpConfig::allow_unauthenticated_non_loopback`].
     #[error("auth-disabled MCP HTTP bind must be loopback, got {0}")]
@@ -632,6 +635,7 @@ pub async fn start_auth_disabled(
     app: AppClient,
     options: McpOptions,
 ) -> Result<RunningMcpHttpServer, McpHttpError> {
+    options.surface.validate(options.feedback_enabled)?;
     let listener = TcpListener::bind(config.bind_addr())
         .await
         .map_err(|source| McpHttpError::Bind {
@@ -662,6 +666,10 @@ pub async fn start_authenticated(
     config: AuthenticatedMcpHttpConfig,
     runtime: AuthenticatedMcpHttpRuntime,
 ) -> Result<RunningMcpHttpServer, McpHttpError> {
+    runtime
+        .options
+        .surface
+        .validate(runtime.options.feedback_enabled)?;
     let listener = TcpListener::bind(config.bind_addr)
         .await
         .map_err(|source| McpHttpError::Bind {

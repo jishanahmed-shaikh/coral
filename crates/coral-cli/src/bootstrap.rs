@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use coral_app::{
-    AwsEngineExtensionsProvider,
+    AwsEngineExtensionsProvider, EngineExtensionsProvider,
     features::{Feature, FeatureOverrides, FeatureStore},
 };
 use coral_client::{
     AppClient, ClientError,
     local::{LocalServerError, RunningServer as AppRunningServer, ServerBuilder},
 };
-use coral_mcp::McpOptions;
+use coral_mcp::{McpOptions, McpSurfaceProvider};
 
 pub(crate) struct Bootstrap {
     pub(crate) app: AppClient,
@@ -39,7 +39,10 @@ pub(crate) enum BootstrapError {
     Serve(#[from] crate::serve::ServeError),
 }
 
-pub(crate) async fn bootstrap(options: BootstrapOptions) -> Result<Bootstrap, BootstrapError> {
+pub(crate) async fn bootstrap(
+    options: BootstrapOptions,
+    engine_extensions_providers: Vec<Arc<dyn EngineExtensionsProvider>>,
+) -> Result<Bootstrap, BootstrapError> {
     if let Some(endpoint) = bootstrap_endpoint() {
         return Ok(Bootstrap {
             app: AppClient::connect(&endpoint).await?,
@@ -47,9 +50,10 @@ pub(crate) async fn bootstrap(options: BootstrapOptions) -> Result<Bootstrap, Bo
         });
     }
 
-    let server = configure_server_builder(ServerBuilder::new(), options)
-        .start()
-        .await?;
+    let server =
+        configure_server_builder(ServerBuilder::new(), options, engine_extensions_providers)
+            .start()
+            .await?;
     let app = AppClient::connect(server.endpoint_uri()).await?;
     Ok(Bootstrap {
         app,
@@ -59,6 +63,8 @@ pub(crate) async fn bootstrap(options: BootstrapOptions) -> Result<Bootstrap, Bo
 
 pub(crate) async fn start_standalone_server(
     feature_overrides: FeatureOverrides,
+    engine_extensions_providers: Vec<Arc<dyn EngineExtensionsProvider>>,
+    mcp_surface_provider: Option<Arc<dyn McpSurfaceProvider>>,
 ) -> Result<crate::serve::RunningServer, BootstrapError> {
     let features = FeatureStore::discover(None)?.load_with_overrides(&feature_overrides)?;
     let mcp_options = McpOptions {
@@ -72,17 +78,27 @@ pub(crate) async fn start_standalone_server(
             feature_overrides,
             ..BootstrapOptions::default()
         },
+        engine_extensions_providers,
     );
-    crate::serve::start(builder, mcp_options)
+    crate::serve::start(builder, mcp_options, mcp_surface_provider)
         .await
         .map_err(Into::into)
 }
 
-fn configure_server_builder(builder: ServerBuilder, options: BootstrapOptions) -> ServerBuilder {
-    builder
+fn configure_server_builder(
+    builder: ServerBuilder,
+    options: BootstrapOptions,
+    engine_extensions_providers: Vec<Arc<dyn EngineExtensionsProvider>>,
+) -> ServerBuilder {
+    let builder = builder
         .with_stderr_logs(options.enable_stderr_logs)
         .with_feature_overrides(options.feature_overrides)
-        .add_engine_extensions_provider(Arc::new(AwsEngineExtensionsProvider))
+        .add_engine_extensions_provider(Arc::new(AwsEngineExtensionsProvider));
+    engine_extensions_providers
+        .into_iter()
+        .fold(builder, |builder, provider| {
+            builder.add_engine_extensions_provider(provider)
+        })
 }
 
 #[cfg(feature = "cli-test-server")]
@@ -93,4 +109,67 @@ fn bootstrap_endpoint() -> Option<String> {
 #[cfg(not(feature = "cli-test-server"))]
 fn bootstrap_endpoint() -> Option<String> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use coral_api::v1::ExecuteSqlRequest;
+    use coral_app::{EngineExtensions, QuerySource};
+    use coral_client::default_workspace;
+    use tempfile::TempDir;
+    use tonic::Request;
+
+    use super::*;
+
+    struct RecordingProvider {
+        name: &'static str,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl EngineExtensionsProvider for RecordingProvider {
+        fn extensions_for(&self, _selected_sources: &[QuerySource]) -> EngineExtensions {
+            self.calls.lock().expect("calls lock").push(self.name);
+            EngineExtensions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_builder_runs_host_engine_providers_in_order() {
+        let temp = TempDir::new().expect("temp dir");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let providers = ["first", "second"]
+            .map(|name| {
+                Arc::new(RecordingProvider {
+                    name,
+                    calls: Arc::clone(&calls),
+                }) as Arc<dyn EngineExtensionsProvider>
+            })
+            .into();
+        let server = configure_server_builder(
+            ServerBuilder::new().with_config_dir(temp.path()),
+            BootstrapOptions::default(),
+            providers,
+        )
+        .start()
+        .await
+        .expect("start server");
+        let app = AppClient::connect(server.endpoint_uri())
+            .await
+            .expect("connect client");
+
+        app.query_client()
+            .execute_sql(Request::new(ExecuteSqlRequest {
+                workspace: Some(default_workspace()),
+                sql: "SELECT 1".to_string(),
+                guide_read_context: None,
+                task_attribution: None,
+            }))
+            .await
+            .expect("execute query");
+
+        assert_eq!(*calls.lock().expect("calls lock"), ["first", "second"]);
+        server.shutdown().await.expect("stop server");
+    }
 }

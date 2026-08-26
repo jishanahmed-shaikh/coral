@@ -8,8 +8,8 @@ use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use axum::{Router, response::Response};
 use coral_client::{AppClient, local::ServerBuilder};
-use futures::poll;
-use rmcp::ServiceExt as _;
+use futures::{future::BoxFuture, poll};
+use rmcp::handler::server::router::tool::IntoToolRoute;
 use rmcp::model::{CallToolRequestParams, ClientJsonRpcMessage};
 use rmcp::transport::{
     StreamableHttpClientTransport,
@@ -19,12 +19,13 @@ use rmcp::transport::{
         local::{SessionConfig, create_local_session},
     },
 };
+use rmcp::{ErrorData, Json, ServiceExt as _};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tower::ServiceExt as _;
 
-use crate::McpOptions;
+use crate::{McpOptions, McpSurface, McpToolContext};
 
 use super::{
     AUTHENTICATED_SESSION_IDLE_TIMEOUT, AuthenticatedMcpHttpConfig, AuthenticatedMcpHttpRuntime,
@@ -37,6 +38,28 @@ use super::{
 
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
 const PING: &str = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+
+#[rmcp::tool(description = "Return the workspace bound to this MCP session")]
+fn extension_workspace(
+    context: &McpToolContext,
+) -> BoxFuture<'_, Result<Json<serde_json::Value>, ErrorData>> {
+    Box::pin(async move {
+        Ok(Json(serde_json::json!({
+            "workspace": context.workspace().name,
+            "core_tool_count": context.core_tools().definitions().await?.len(),
+        })))
+    })
+}
+
+fn extension_options() -> McpOptions {
+    McpOptions {
+        surface: McpSurface::extend([
+            (extension_workspace_tool_attr(), extension_workspace).into_tool_route()
+        ])
+        .expect("build MCP surface"),
+        ..McpOptions::default()
+    }
+}
 
 fn raw_mcp_request(body: impl Into<Body>) -> Request<Body> {
     Request::builder()
@@ -1092,7 +1115,7 @@ async fn dropping_authenticated_server_closes_sessions_and_releases_state() {
     let runtime = AuthenticatedMcpHttpRuntime::new(
         |_| async { Ok::<_, ()>(()) },
         move |_| std::future::ready(Ok::<_, ()>(app.clone())),
-        McpOptions::default(),
+        extension_options(),
         || async { Ok::<_, tonic::Code>(()) },
     );
     let server = start_authenticated(
@@ -1109,6 +1132,16 @@ async fn dropping_authenticated_server_closes_sessions_and_releases_state() {
         .auth_header("token-a"),
     );
     let client = ().serve(transport).await.expect("initialize MCP client");
+    let extension = client
+        .call_tool(CallToolRequestParams::new("extension_workspace"))
+        .await
+        .expect("call authenticated extension tool")
+        .structured_content
+        .expect("extension structured content");
+    assert_eq!(
+        extension.get("workspace"),
+        Some(&serde_json::json!("default"))
+    );
     let sessions = authenticated_sessions(&server);
     let state = Arc::downgrade(&server.state);
     assert_eq!(sessions.upgrade().expect("sessions").len().await, 1);
@@ -1125,4 +1158,76 @@ async fn dropping_authenticated_server_closes_sessions_and_releases_state() {
 
     let _cancel_result = client.cancel().await;
     app_server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_extension_uses_its_session_app_client() {
+    let (_live_temp, live_server, live_app) = local_app().await;
+    let (_stopped_temp, stopped_server, stopped_app) = local_app().await;
+    stopped_server
+        .shutdown()
+        .await
+        .expect("stop second app server");
+
+    let runtime = AuthenticatedMcpHttpRuntime::new(
+        |_| async { Ok::<_, ()>(()) },
+        move |token| {
+            let app = if token == "token-a" {
+                live_app.clone()
+            } else {
+                stopped_app.clone()
+            };
+            std::future::ready(Ok::<_, ()>(app))
+        },
+        extension_options(),
+        || async { Ok::<_, tonic::Code>(()) },
+    );
+    let server = start_authenticated(
+        authenticated_config_at("127.0.0.1:0".parse().unwrap()),
+        runtime,
+    )
+    .await
+    .expect("start authenticated MCP HTTP server");
+    let endpoint = format!("http://{}/mcp", server.local_addr());
+
+    let live_client = ()
+        .serve(StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(endpoint.clone()).auth_header("token-a"),
+        ))
+        .await
+        .expect("initialize live MCP session");
+    let stopped_client = ()
+        .serve(StreamableHttpClientTransport::from_config(
+            StreamableHttpClientTransportConfig::with_uri(endpoint).auth_header("token-b"),
+        ))
+        .await
+        .expect("initialize stopped MCP session");
+
+    let live_result = live_client
+        .call_tool(CallToolRequestParams::new("extension_workspace"))
+        .await
+        .expect("live session extension call")
+        .structured_content
+        .expect("live session structured result");
+    assert!(
+        live_result
+            .get("core_tool_count")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0)
+    );
+    stopped_client
+        .call_tool(CallToolRequestParams::new("extension_workspace"))
+        .await
+        .expect_err("stopped session must use its unavailable app client");
+
+    live_client.cancel().await.expect("cancel live MCP client");
+    stopped_client
+        .cancel()
+        .await
+        .expect("cancel stopped MCP client");
+    server.shutdown().await.expect("shutdown MCP HTTP server");
+    live_server
+        .shutdown()
+        .await
+        .expect("shutdown live app server");
 }

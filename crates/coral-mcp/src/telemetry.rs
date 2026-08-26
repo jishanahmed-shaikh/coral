@@ -6,7 +6,10 @@ use coral_api::grpc_response_status_code;
 use coral_client::{DecodedStatusError, decode_status_error};
 use coral_telemetry::record_failure;
 use opentelemetry::trace::Status as OtelStatus;
-use rmcp::{ErrorData, model::ErrorCode};
+use rmcp::{
+    ErrorData,
+    model::{CallToolResult, ErrorCode},
+};
 use tracing::{Instrument as _, field};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
@@ -51,12 +54,17 @@ pub(crate) fn list_tools_span(trace_parent: Option<&str>) -> tracing::Span {
 }
 
 pub(crate) fn call_tool_span(
+    requested_tool_name: &str,
     tool_name: Option<ToolName>,
     workspace: &str,
     trace_parent: Option<&str>,
 ) -> tracing::Span {
     let operation_kind = query_stream_kind_for_tool(tool_name);
-    let tool_name = tool_name.map_or(UNKNOWN_TOOL_NAME, ToolName::as_str);
+    let tool_name = if requested_tool_name.is_empty() {
+        UNKNOWN_TOOL_NAME
+    } else {
+        requested_tool_name
+    };
     let span = tracing::info_span!(
         target: "coral_mcp::server",
         "coral.mcp.call_tool",
@@ -137,6 +145,16 @@ pub(crate) fn record_protocol_result<T>(span: &tracing::Span, result: &Result<T,
     }
 }
 
+pub(crate) fn record_tool_result(span: &tracing::Span, result: &Result<CallToolResult, ErrorData>) {
+    match result {
+        Ok(result) if result.is_error == Some(true) => {
+            record_failure(span, "MCP_TOOL_ERROR", MCP_TOOL_ERROR_MESSAGE);
+        }
+        Ok(_) => record_success(span),
+        Err(error) => record_protocol_error(span, error),
+    }
+}
+
 pub(crate) fn record_protocol_error(span: &tracing::Span, error: &ErrorData) {
     record_failure(span, mcp_error_type(error.code), MCP_PROTOCOL_ERROR_MESSAGE);
 }
@@ -193,7 +211,7 @@ mod tests {
 
     use super::{
         MCP_TOOL_ERROR_MESSAGE, UNKNOWN_TOOL_NAME, call_tool_span, list_resources_span,
-        list_tools_span, read_resource_span, record_tonic_status,
+        list_tools_span, read_resource_span, record_tonic_status, record_tool_result,
     };
     use crate::surface::ToolName;
 
@@ -202,7 +220,7 @@ mod tests {
         let (exporter, provider, subscriber) = telemetry_fixture();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let span = call_tool_span(Some(ToolName::ListCatalog), "alpha", None);
+        let span = call_tool_span("list_catalog", Some(ToolName::ListCatalog), "alpha", None);
         span.in_scope(|| {});
         drop(span);
 
@@ -249,13 +267,14 @@ mod tests {
         let (exporter, provider, subscriber) = telemetry_fixture();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        for tool_name in [
-            Some(ToolName::Sql),
-            Some(ToolName::Search),
-            Some(ToolName::ListCatalog),
-            None,
+        for (requested_tool_name, tool_name) in [
+            ("sql", Some(ToolName::Sql)),
+            ("search", Some(ToolName::Search)),
+            ("list_catalog", Some(ToolName::ListCatalog)),
+            (UNKNOWN_TOOL_NAME, None),
+            ("extension_tool", None),
         ] {
-            let span = call_tool_span(tool_name, "alpha", None);
+            let span = call_tool_span(requested_tool_name, tool_name, "alpha", None);
             span.in_scope(|| {});
         }
 
@@ -266,6 +285,7 @@ mod tests {
             ("search", coral_telemetry::QUERY_STREAM_KIND_SEARCH),
             ("list_catalog", coral_telemetry::QUERY_STREAM_KIND_TOOL),
             (UNKNOWN_TOOL_NAME, coral_telemetry::QUERY_STREAM_KIND_TOOL),
+            ("extension_tool", coral_telemetry::QUERY_STREAM_KIND_TOOL),
         ];
         for (tool_name, expected_kind) in expected {
             let tool_call = spans
@@ -287,6 +307,10 @@ mod tests {
                 string_attribute(tool_call, "mcp.method").as_deref(),
                 Some("tools/call")
             );
+            assert_eq!(
+                string_attribute(tool_call, "mcp.tool.name").as_deref(),
+                Some(tool_name)
+            );
         }
 
         provider.shutdown().expect("provider shutdown");
@@ -298,7 +322,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(subscriber);
         let sentinel = "SENSITIVE_TONIC_ERROR_MARKER";
 
-        let span = call_tool_span(Some(ToolName::ListCatalog), "default", None);
+        let span = call_tool_span("list_catalog", Some(ToolName::ListCatalog), "default", None);
         record_tonic_status(
             &span,
             &tonic::Status::invalid_argument(format!("invalid kind: {sentinel}")),
@@ -327,6 +351,35 @@ mod tests {
     }
 
     #[test]
+    fn structured_extension_error_marks_the_tool_span_as_failed() {
+        let (exporter, provider, subscriber) = telemetry_fixture();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let span = call_tool_span("extension_tool", None, "default", None);
+        record_tool_result(
+            &span,
+            &Ok(rmcp::model::CallToolResult::structured_error(
+                serde_json::json!({"message": "failed"}),
+            )),
+        );
+        drop(span);
+
+        provider.force_flush().expect("flush spans");
+        let spans = exporter.get_finished_spans().expect("finished spans");
+        let tool_call = spans
+            .iter()
+            .find(|span| span.name == "coral.mcp.call_tool")
+            .expect("tool call span");
+        assert_eq!(
+            string_attribute(tool_call, "error.type"),
+            Some("MCP_TOOL_ERROR".to_string())
+        );
+        assert_eq!(tool_call.status, OtelStatus::error(MCP_TOOL_ERROR_MESSAGE));
+
+        provider.shutdown().expect("provider shutdown");
+    }
+
+    #[test]
     fn structured_tonic_error_keeps_only_its_categorical_reason() {
         let (exporter, provider, subscriber) = telemetry_fixture();
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -345,7 +398,7 @@ mod tests {
             ))],
         );
 
-        let span = call_tool_span(Some(ToolName::ListCatalog), "default", None);
+        let span = call_tool_span("list_catalog", Some(ToolName::ListCatalog), "default", None);
         record_tonic_status(&span, &status);
         drop(span);
 

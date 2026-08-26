@@ -12,11 +12,13 @@ use coral_client::{
     AppClient, SourceClient, default_workspace,
     local::{RunningServer, ServerBuilder},
 };
+use futures::future::BoxFuture;
 use jsonschema::Validator;
 use opentelemetry::trace::{SpanId, SpanKind, TracerProvider as _};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use rmcp::{
-    RoleClient, ServerHandler, ServiceExt,
+    ErrorData, Json, RoleClient, ServerHandler, ServiceExt,
+    handler::server::router::tool::IntoToolRoute,
     model::{CallToolRequestParams, CallToolResult, ReadResourceRequestParams, Tool},
     service::RunningService,
 };
@@ -28,11 +30,89 @@ use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt as _;
 
 use crate::{
-    CoralMcpServerFactory, McpOptions,
+    CoralMcpServerFactory, McpOptions, McpSurface, McpSurfaceError, McpToolContext, McpToolRoute,
     telemetry::{MCP_PROTOCOL_ERROR_MESSAGE, UNKNOWN_TOOL_NAME},
 };
 
 type McpServerTask = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
+
+#[rmcp::tool(description = "Prove that an extension can use its session-bound core Coral tools")]
+fn core_probe(context: &McpToolContext) -> BoxFuture<'_, Result<Json<Value>, ErrorData>> {
+    Box::pin(async move {
+        let inner_tools = context.core_tools().retain(["start_task", "sql"]);
+        let core_tool_names = inner_tools
+            .definitions()
+            .await?
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        let started = inner_tools
+            .call(
+                CallToolRequestParams::new("start_task").with_arguments(raw_json_object(&json!({
+                    "intent": "Test the session-bound core tool set"
+                }))),
+            )
+            .await?
+            .structured_content
+            .ok_or_else(|| ErrorData::internal_error("start_task returned no content", None))?;
+        let task_id = started["task_id"]
+            .as_str()
+            .ok_or_else(|| ErrorData::internal_error("start_task returned no task id", None))?;
+        let query = inner_tools
+            .call(
+                CallToolRequestParams::new("sql").with_arguments(task_arguments(
+                    task_id,
+                    &json!({"queries": ["select 7 as value"]}),
+                )),
+            )
+            .await?
+            .structured_content
+            .ok_or_else(|| ErrorData::internal_error("sql returned no content", None))?;
+        let query_value = query["results"][0]["rows"][0]["value"]
+            .as_str()
+            .ok_or_else(|| ErrorData::internal_error("sql returned no value", None))?
+            .to_string();
+        Ok(Json(json!({
+            "core_tool_names": core_tool_names,
+            "query_value": query_value,
+        })))
+    })
+}
+
+fn core_probe_surface() -> McpSurface {
+    McpSurface::replace(
+        [core_probe_route("core_probe")],
+        std::iter::empty::<String>(),
+        Some("Use `core_probe` for Coral work.".to_string()),
+    )
+    .expect("build MCP surface")
+}
+
+fn core_probe_route(name: &'static str) -> McpToolRoute {
+    let mut tool = core_probe_tool_attr();
+    tool.name = name.into();
+    (tool, core_probe).into_tool_route()
+}
+
+#[test]
+fn mcp_surface_rejects_invalid_names_and_duplicates() {
+    assert!(matches!(
+        McpSurface::extend([core_probe_route("sql")]),
+        Err(McpSurfaceError::ReservedToolName(name)) if name == "sql"
+    ));
+    assert!(matches!(
+        McpSurface::extend([core_probe_route("extra"), core_probe_route("extra")]),
+        Err(McpSurfaceError::DuplicateToolName(name)) if name == "extra"
+    ));
+    assert!(matches!(
+        McpSurface::replace(
+            std::iter::empty::<McpToolRoute>(),
+            ["not_a_core_tool"],
+            None,
+        ),
+        Err(McpSurfaceError::UnknownCoreToolName(name)) if name == "not_a_core_tool"
+    ));
+}
 
 fn span_string_attribute(span: &SpanData, name: &str) -> Option<String> {
     span.attributes
@@ -347,6 +427,61 @@ async fn start_mcp_session(
     });
     let client = ().serve(client_transport).await.expect("start rmcp client");
     (client, mcp_server_task)
+}
+
+#[tokio::test]
+async fn extension_surface_filters_public_tools_but_keeps_session_core_tools() {
+    let temp = TempDir::new().expect("temp dir");
+    let session = start_session_with_options(
+        &temp,
+        McpOptions {
+            surface: core_probe_surface(),
+            ..McpOptions::default()
+        },
+    )
+    .await;
+
+    let tools = session.client.list_all_tools().await.expect("list tools");
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>(),
+        vec!["core_probe"]
+    );
+    let hidden = session
+        .client
+        .call_tool(CallToolRequestParams::new("sql"))
+        .await
+        .expect_err("hidden core tool should not be callable");
+    assert!(hidden.to_string().contains("tool 'sql' not found"));
+
+    assert_eq!(
+        session
+            .client
+            .peer_info()
+            .expect("initialize result")
+            .instructions
+            .as_deref(),
+        Some("Use `core_probe` for Coral work.")
+    );
+
+    let result = session
+        .client
+        .call_tool(CallToolRequestParams::new("core_probe"))
+        .await
+        .expect("call extension tool")
+        .structured_content
+        .expect("extension structured result");
+    assert_eq!(result["query_value"], "7");
+    let core_names = result["core_tool_names"]
+        .as_array()
+        .expect("core tool names");
+    assert!(core_names.iter().any(|name| name == "start_task"));
+    assert!(core_names.iter().any(|name| name == "sql"));
+    assert!(!core_names.iter().any(|name| name == "core_probe"));
+
+    session.shutdown().await;
 }
 
 async fn shutdown_mcp_session(client: RunningService<RoleClient, ()>, task: McpServerTask) {
