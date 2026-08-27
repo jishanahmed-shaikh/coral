@@ -10,7 +10,7 @@ import type { DesktopUpdateState, DesktopUpdateStateListener } from '../shared/t
 // Shown wherever a build cannot update itself; see desktopUpdatesSupported in
 // auto-update.ts for the packages that can.
 export const UNSUPPORTED_UPDATE_DETAIL =
-  'Coral checks for updates from the released macOS app and the Linux AppImage only.'
+  'Coral checks for updates from the released macOS app, the Windows installer, and the Linux AppImage only.'
 
 // The image file AppImageUpdater replaces on install. electron-updater only
 // checks that APPIMAGE is set before offering an update, then demands an
@@ -37,6 +37,65 @@ export function relaunchImagePath(
     return installedPath
   }
   return appImagePath(env)
+}
+
+// Windows needs an explicit silent install: the default replays the assisted
+// installer's whole wizard, directory picker included, on every update.
+// `isForceRunAfter` has to ride along, because the non-silent path reads
+// `autoRunAppAfterInstall` instead.
+//
+// macOS and the AppImage take the no-argument call. Forcing a run there would
+// launch the new AppImage while this process still holds the single-instance
+// lock; auto-update.ts schedules that relaunch after the exit instead.
+export function installArgs(platform: NodeJS.Platform): [] | [boolean, boolean] {
+  return platform === 'win32' ? [true, true] : []
+}
+
+// What NsisUpdater.doInstall() passes for the installArgs('win32') call above: a
+// silent update that relaunches the app itself. Spelled out because auto-update.ts
+// spawns the installer directly; see watchNsisInstaller.
+export const NSIS_INSTALL_ARGS = ['--updated', '/S', '--force-run']
+
+export interface InstallerProcessLike {
+  on(event: 'error', listener: (error: Error) => void): unknown
+  on(event: 'exit', listener: (code: number | null, signal: string | null) => void): unknown
+}
+
+export interface NsisInstallerHandlers {
+  // The installer could not be started at all. Nothing has happened yet, so the
+  // caller can still fall back to electron-updater's own hand-off.
+  onUnstarted: () => void
+  // The installer ran and exited while this process was still alive, which means
+  // it never installed: an installer that commits kills this process before it
+  // extracts. The caller reports this as an update failure.
+  onExitedWithoutInstalling: (detail: string) => void
+}
+
+// Turns a spawned NSIS installer into a pass/fail signal. NsisUpdater.doInstall()
+// spawns detached and unreferenced and returns true on a pid, so an installer
+// that runs but never installs is invisible to electron-updater — it emits no
+// error and reports no completion, while BaseUpdater.quitAndInstall() quits the
+// app regardless. The installer is its own discriminator: the NSIS app-running
+// check force-kills this process before extracting, and UAC.nsh's RunElevated
+// makes the outer process wait on the elevated fork and adopt its exit code, so
+// an exit seen from here is an install that did not happen.
+export function watchNsisInstaller(
+  child: InstallerProcessLike,
+  handlers: NsisInstallerHandlers,
+): void {
+  let settled = false
+
+  child.on('error', () => {
+    if (settled) return
+    settled = true
+    handlers.onUnstarted()
+  })
+
+  child.on('exit', (code, signal) => {
+    if (settled) return
+    settled = true
+    handlers.onExitedWithoutInstalling(signal ?? `code ${code}`)
+  })
 }
 
 export const STARTUP_UPDATE_CHECK_DELAY_MS = 5000
@@ -69,7 +128,6 @@ export interface UpdaterLike {
   on(event: 'error', listener: (error: Error) => void): unknown
   checkForUpdates(): Promise<UpdateCheckResultLike | null>
   downloadUpdate(): Promise<unknown>
-  quitAndInstall(): void
 }
 
 export interface DesktopUpdaterDeps {
@@ -81,6 +139,10 @@ export interface DesktopUpdaterDeps {
   showNotification: (title: string, body: string) => void
   recordUpdateIntent: (targetVersion: string) => void
   clearUpdateIntent: () => void
+  // Hands the staged update to the installer and quits. Injected rather than
+  // called on `updater` directly, because the arguments are platform-specific;
+  // auto-update.ts owns that choice.
+  startInstall: () => void
   onInstallFailure: (error: Error) => void
 }
 
@@ -402,7 +464,7 @@ export function createDesktopUpdater(deps: DesktopUpdaterDeps): DesktopUpdater {
 
     installing = true
     try {
-      updater.quitAndInstall()
+      deps.startInstall()
       return true
     } catch (error) {
       installing = false

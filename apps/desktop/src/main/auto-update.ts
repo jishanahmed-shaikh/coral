@@ -1,14 +1,18 @@
 import { Notification, app, autoUpdater as nativeAutoUpdater, dialog } from 'electron'
+import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
-import type { AppImageUpdater, AppUpdater, MacUpdater } from 'electron-updater'
+import type { AppImageUpdater, AppUpdater, MacUpdater, NsisUpdater } from 'electron-updater'
 
 import type { DesktopUpdateState, DesktopUpdateStateListener } from '../shared/types'
 import {
   appImagePath,
   createDesktopUpdater,
+  installArgs,
+  NSIS_INSTALL_ARGS,
   relaunchImagePath,
   UNSUPPORTED_UPDATE_DETAIL,
+  watchNsisInstaller,
   type DesktopUpdater,
 } from './auto-update-core'
 import {
@@ -32,10 +36,11 @@ const isReleaseBuild =
 // Updates need a release build of a package that can replace itself in place.
 // Squirrel.Mac refuses to install into an unsigned app, so unsigned QA and local
 // builds are out; on Linux dpkg owns an installed deb, so only the AppImage
-// qualifies. Everything else gets no polling and no menu item.
+// qualifies. Windows needs no equivalent probe, because nsis is the only target
+// packaged there. Everything else gets no polling and no menu item.
 export function desktopUpdatesSupported(): boolean {
   if (!isReleaseBuild || !app.isPackaged) return false
-  if (process.platform === 'darwin') return true
+  if (process.platform === 'darwin' || process.platform === 'win32') return true
   return process.platform === 'linux' && appImagePath(process.env) !== null
 }
 
@@ -67,11 +72,71 @@ function scheduleAppImageRelaunch(): void {
 // inside the AppImage would download the .deb and shell out to dpkg, leaving the
 // running image untouched. Picking the class here cannot be raced by packaging.
 function createPlatformUpdater(): AppUpdater {
-  const { AppImageUpdater: AppImage, MacUpdater: Mac } = require('electron-updater') as {
+  const {
+    AppImageUpdater: AppImage,
+    MacUpdater: Mac,
+    NsisUpdater: Nsis,
+  } = require('electron-updater') as {
     AppImageUpdater: new () => AppImageUpdater
     MacUpdater: new () => MacUpdater
+    NsisUpdater: new () => NsisUpdater
   }
-  return process.platform === 'darwin' ? new Mac() : new AppImage()
+  if (process.platform === 'darwin') return new Mac()
+  if (process.platform === 'win32') return new Nsis()
+  return new AppImage()
+}
+
+// Captured from `update-downloaded` on Windows only; see startWatchedNsisInstall.
+let downloadedInstallerPath: string | null = null
+
+// Spawns the Windows installer in place of electron-updater's own hand-off, so
+// that watchNsisInstaller() can see it exit. NsisUpdater.doInstall() spawns
+// detached and unreferenced and returns true on a pid, which leaves a real abort
+// path silent: a per-machine install run unelevated re-launches itself through
+// UAC and quits on 1223 (declined), and `allowElevation: false` does not prevent
+// one, because it only disables the all-users radio for non-admin users.
+// quitAndInstall() has written the hand-off marker by then and quits the app
+// regardless, so nothing clears it and every relaunch of the old build stands
+// down until the marker expires.
+//
+// Reporting through `error` is the channel electron-updater's own dispatchError()
+// uses, so the existing failure path clears the marker and quits normally,
+// leaving the old build launchable straight away.
+function startWatchedNsisInstall(autoUpdater: AppUpdater, installerPath: string): void {
+  // Anything this layer cannot start degrades to electron-updater's hand-off,
+  // which keeps its elevate.exe and shell.openPath fallbacks.
+  const fallBackToUpdater = () => autoUpdater.quitAndInstall(...installArgs('win32'))
+
+  let child
+  try {
+    child = spawn(installerPath, NSIS_INSTALL_ARGS, { detached: true, stdio: 'ignore' })
+  } catch {
+    fallBackToUpdater()
+    return
+  }
+
+  // Deliberately not unref()'d: the handle has to stay live long enough to see
+  // the exit. `detached` is what lets the installer outlive this process on the
+  // path where it kills it.
+  watchNsisInstaller(child, {
+    onUnstarted: fallBackToUpdater,
+    onExitedWithoutInstalling: (detail) => {
+      autoUpdater.emit(
+        'error',
+        new Error(
+          `The Windows installer exited without installing the update (${detail}). It may have been blocked, or a permission prompt declined.`,
+        ),
+      )
+    },
+  })
+}
+
+function startPlatformInstall(autoUpdater: AppUpdater): void {
+  if (process.platform === 'win32' && downloadedInstallerPath) {
+    startWatchedNsisInstall(autoUpdater, downloadedInstallerPath)
+    return
+  }
+  autoUpdater.quitAndInstall(...installArgs(process.platform))
 }
 
 let updater: DesktopUpdater | null = null
@@ -94,6 +159,16 @@ function desktopUpdater(): DesktopUpdater {
       autoUpdater.autoRunAppAfterInstall = false
       autoUpdater.on('appimage-filename-updated', (path) => {
         installedAppImagePath = path
+      })
+    }
+    // The `nsis` target, not `nsis-web`: there is no separate package to fetch,
+    // and NsisUpdater warns on every download until this is set.
+    if (process.platform === 'win32') {
+      autoUpdater.disableWebInstaller = true
+      // startWatchedNsisInstall() spawns this itself; NsisUpdater keeps the path
+      // on a private helper, but the download event carries it.
+      autoUpdater.on('update-downloaded', (info) => {
+        downloadedInstallerPath = info.downloadedFile
       })
     }
     updater = createDesktopUpdater({
@@ -126,6 +201,7 @@ function desktopUpdater(): DesktopUpdater {
       clearUpdateIntent: () => {
         clearUpdateIntent(updateIntentPath())
       },
+      startInstall: () => startPlatformInstall(autoUpdater),
       // Core clears the marker before this callback; the lifecycle handler then
       // allows a normal quit from the already-stopped state.
       onInstallFailure: () => installFailureHandler(),
@@ -154,8 +230,9 @@ export function installAutoUpdater({
   if (!desktopUpdatesSupported()) return
 
   installFailureHandler = onInstallFailure
-  // electron-updater emits this on the native updater only after the install
-  // step succeeds, so a failed install schedules no relaunch.
+  // electron-updater emits this only once the install step has handed off, so a
+  // failed hand-off schedules no relaunch. An installer that fails after the
+  // hand-off reports it through `error`, which the core turns into a failure.
   nativeAutoUpdater.once('before-quit-for-update', () => {
     scheduleAppImageRelaunch()
     allowUpdateQuit()

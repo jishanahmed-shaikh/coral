@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -5,7 +6,10 @@ import {
   STARTUP_UPDATE_CHECK_DELAY_MS,
   appImagePath,
   createDesktopUpdater,
+  installArgs,
+  NSIS_INSTALL_ARGS,
   relaunchImagePath,
+  watchNsisInstaller,
   type DesktopUpdaterDeps,
   type UpdateCheckResultLike,
   type UpdaterLike,
@@ -27,7 +31,6 @@ function createFakeUpdater() {
     },
     checkForUpdates: vi.fn(async (): Promise<UpdateCheckResultLike | null> => null),
     downloadUpdate: vi.fn(async (): Promise<void> => {}),
-    quitAndInstall: vi.fn(),
     emit(event: string, ...args: unknown[]) {
       for (const listener of listeners.get(event) ?? []) listener(...args)
     },
@@ -72,6 +75,7 @@ function createDeps(updater: UpdaterLike): DesktopUpdaterDeps & {
     },
     recordUpdateIntent: vi.fn(),
     clearUpdateIntent: vi.fn(),
+    startInstall: vi.fn(),
     onInstallFailure: vi.fn(),
     notifications,
     infoDialogs,
@@ -165,6 +169,75 @@ describe('relaunchImagePath', () => {
 
   it('reports nothing when neither path is usable', () => {
     expect(relaunchImagePath({}, null)).toBe(null)
+  })
+})
+
+describe('watchNsisInstaller', () => {
+  function fakeInstaller() {
+    const emitter = new EventEmitter()
+    return {
+      emitter,
+      handlers: { onUnstarted: vi.fn(), onExitedWithoutInstalling: vi.fn() },
+    }
+  }
+
+  it('carries the arguments NsisUpdater would have passed for a silent install', () => {
+    expect(NSIS_INSTALL_ARGS).toEqual(['--updated', '/S', '--force-run'])
+    expect(installArgs('win32')).toEqual([true, true])
+  })
+
+  it('reports an installer that exits while this process is still alive', () => {
+    const { emitter, handlers } = fakeInstaller()
+    watchNsisInstaller(emitter, handlers)
+
+    emitter.emit('exit', 1223, null)
+
+    expect(handlers.onExitedWithoutInstalling).toHaveBeenCalledWith('code 1223')
+    expect(handlers.onUnstarted).not.toHaveBeenCalled()
+  })
+
+  it('names the signal when the installer was killed rather than exited', () => {
+    const { emitter, handlers } = fakeInstaller()
+    watchNsisInstaller(emitter, handlers)
+
+    emitter.emit('exit', null, 'SIGTERM')
+
+    expect(handlers.onExitedWithoutInstalling).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('reports an installer that never started so the caller can fall back', () => {
+    const { emitter, handlers } = fakeInstaller()
+    watchNsisInstaller(emitter, handlers)
+
+    emitter.emit('error', new Error('EACCES'))
+
+    expect(handlers.onUnstarted).toHaveBeenCalledTimes(1)
+    expect(handlers.onExitedWithoutInstalling).not.toHaveBeenCalled()
+  })
+
+  // A failed spawn emits `error` and then `exit`; only the first is the outcome.
+  it('settles once', () => {
+    const { emitter, handlers } = fakeInstaller()
+    watchNsisInstaller(emitter, handlers)
+
+    emitter.emit('error', new Error('EACCES'))
+    emitter.emit('exit', 1, null)
+
+    expect(handlers.onUnstarted).toHaveBeenCalledTimes(1)
+    expect(handlers.onExitedWithoutInstalling).not.toHaveBeenCalled()
+  })
+})
+
+describe('installArgs', () => {
+  it('asks NSIS for a silent install that relaunches the app', () => {
+    expect(installArgs('win32')).toEqual([true, true])
+  })
+
+  // Forcing a run here would start the new AppImage before this process exits.
+  it('leaves the Squirrel and AppImage hand-offs on their defaults', () => {
+    for (const platform of ['darwin', 'linux'] as const) {
+      expect(installArgs(platform)).toEqual([])
+    }
   })
 })
 
@@ -425,8 +498,8 @@ describe('explicit install hand-off', () => {
     vi.mocked(deps.recordUpdateIntent).mockImplementation((version) => {
       events.push(`intent:write:${version}`)
     })
-    updater.quitAndInstall.mockImplementation(() => {
-      events.push('updater:quitAndInstall')
+    vi.mocked(deps.startInstall).mockImplementation(() => {
+      events.push('updater:startInstall')
     })
     const desktopUpdater = createDesktopUpdater(deps)
     desktopUpdater.install()
@@ -435,14 +508,14 @@ describe('explicit install hand-off', () => {
     const started = desktopUpdater.download()
     expect(desktopUpdater.quitAndInstall()).toBe(false)
     expect(deps.recordUpdateIntent).not.toHaveBeenCalled()
-    expect(updater.quitAndInstall).not.toHaveBeenCalled()
+    expect(deps.startInstall).not.toHaveBeenCalled()
 
     download.resolve()
     await started
     expect(desktopUpdater.quitAndInstall()).toBe(true)
     expect(desktopUpdater.quitAndInstall()).toBe(true)
-    expect(updater.quitAndInstall).toHaveBeenCalledOnce()
-    expect(events).toEqual(['intent:write:1.2.4', 'updater:quitAndInstall'])
+    expect(deps.startInstall).toHaveBeenCalledOnce()
+    expect(events).toEqual(['intent:write:1.2.4', 'updater:startInstall'])
   })
 
   it('clears intent before finishing quit on an updater failure', async () => {
@@ -480,7 +553,7 @@ describe('explicit install hand-off', () => {
     await desktopUpdater.download()
 
     expect(desktopUpdater.quitAndInstall()).toBe(false)
-    expect(updater.quitAndInstall).not.toHaveBeenCalled()
+    expect(deps.startInstall).not.toHaveBeenCalled()
   })
 
   it('does not treat an updater error before hand-off as an install failure', () => {
